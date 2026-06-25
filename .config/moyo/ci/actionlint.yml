@@ -1,0 +1,5 @@
+# Canonical actionlint wrapper config for MoyoDB.
+# actionlint itself intentionally has a tiny config surface; this file is consumed
+# by .config/moyo/ci/run-actionlint.mjs so CI and local runs use one policy file.
+shellcheck: true
+ignore: []

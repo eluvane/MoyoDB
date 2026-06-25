@@ -1,0 +1,45 @@
+{
+  "$schema": "https://raw.githubusercontent.com/DavidAnson/markdownlint-cli2/main/schema/markdownlint-cli2-config-schema.json",
+  "config": {
+    "default": true,
+    "MD003": {
+      "style": "atx"
+    },
+    "MD007": {
+      "indent": 2
+    },
+    "MD013": false,
+    "MD024": {
+      "siblings_only": true
+    },
+    "MD026": {
+      "punctuation": ".,;:!\u3002\uff0c\uff1b\uff1a\uff01"
+    },
+    "MD029": {
+      "style": "ordered"
+    },
+    "MD033": {
+      "allowed_elements": ["br", "details", "summary", "p", "img"]
+    },
+    "MD041": false,
+    "MD046": {
+      "style": "fenced"
+    }
+  },
+  "globs": [
+    "**/*.md",
+    "!node_modules/**",
+    "!**/node_modules/**",
+    "!target/**",
+    "!**/target/**",
+    "!**/.lake/**",
+    "!packages/sdk/dist/**",
+    "!packages/sdk/public/engine/**",
+    "!packages/sdk/playwright-report/**",
+    "!packages/sdk/test-results/**",
+    "!.benchmark/current/**",
+    "!.benchmark/previous/**",
+    "!.benchmark/comparison/**",
+    "!.benchmark/smoke/**"
+  ]
+}

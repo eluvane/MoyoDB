@@ -1,0 +1,87 @@
+name: MoyoDB benchmarks
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * 1'
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: '22'
+  RUST_TOOLCHAIN: '1.91.0'
+
+jobs:
+  benchmark:
+    name: MoyoDB benchmark baseline
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install Node dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefer-online --registry=https://registry.npmjs.org/
+      - name: Install wasm-pack
+        run: cargo install --locked wasm-pack --version 0.15.0
+      - name: Install Playwright browsers
+        run: npm exec --workspace @moyodb/sdk -- playwright install --with-deps
+      - name: Run benchmarks and collect baseline
+        run: npm run bench:collect -- --out-dir .benchmark/current
+      - name: Publish baseline artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: benchmark-baseline
+          path: .benchmark/current
+          retention-days: 90
+      - name: Append baseline summary
+        run: cat .benchmark/current/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Find previous successful benchmark run
+        id: previous-run
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'benchmarks.yml',
+              branch: context.ref.replace('refs/heads/', ''),
+              status: 'success',
+              per_page: 20,
+            });
+            const previous = runs.data.workflow_runs.find((run) => run.id !== context.runId);
+            core.setOutput('run-id', previous ? String(previous.id) : '');
+      - name: Download previous baseline artifact
+        if: steps.previous-run.outputs.run-id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: benchmark-baseline
+          path: .benchmark/previous
+          run-id: ${{ steps.previous-run.outputs.run-id }}
+          github-token: ${{ github.token }}
+      - name: Compare against previous baseline
+        run: npm run bench:compare -- --previous .benchmark/previous/baseline.json --current .benchmark/current/baseline.json --out-dir .benchmark/comparison
+      - name: Publish comparison artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: benchmark-comparison
+          path: .benchmark/comparison
+          retention-days: 90
+      - name: Append comparison summary
+        run: cat .benchmark/comparison/summary.md >> "$GITHUB_STEP_SUMMARY"

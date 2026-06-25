@@ -1,0 +1,24 @@
+comment-summary-in-pr: always
+fail-on-severity: moderate
+fail-on-scopes:
+  - runtime
+allow-licenses:
+  - Apache-2.0
+  - BSD-2-Clause
+  - BSD-3-Clause
+  - ISC
+  - MIT
+  - MPL-2.0
+  - Unicode-3.0
+  - Zlib
+deny-licenses:
+  - AGPL-1.0
+  - AGPL-3.0
+  - GPL-1.0
+  - GPL-2.0
+  - GPL-3.0
+  - LGPL-2.0
+  - LGPL-2.1
+  - LGPL-3.0
+license-check: true
+vulnerability-check: true

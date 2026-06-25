@@ -1,0 +1,44 @@
+# This ignore file is nested under .config/moyo/formatters, so repository-root
+# paths are written with ../../../ prefixes for Prettier's ignore-path resolver.
+../../../node_modules/
+../../../target/
+../../../**/target/
+../../../.lake/
+../../../**/.lake/
+../../../packages/sdk/dist/
+../../../packages/sdk/public/engine/
+../../../packages/sdk/playwright-report/
+../../../packages/sdk/test-results/
+../../../packages/sdk/bench/results/
+../../../.benchmark/current/
+../../../.benchmark/previous/
+../../../.benchmark/comparison/
+../../../.benchmark/smoke/
+../../../coverage/
+../../../*.wasm
+../../../*.lock
+../../../Cargo.lock
+../../../proofs/artifacts/**
+../../../*.toml
+
+# Keep unprefixed copies for tools that read the file as repo-root globs.
+node_modules/
+target/
+**/target/
+.lake/
+**/.lake/
+packages/sdk/dist/
+packages/sdk/public/engine/
+packages/sdk/playwright-report/
+packages/sdk/test-results/
+packages/sdk/bench/results/
+.benchmark/current/
+.benchmark/previous/
+.benchmark/comparison/
+.benchmark/smoke/
+coverage/
+*.wasm
+*.lock
+Cargo.lock
+proofs/artifacts/**
+*.toml

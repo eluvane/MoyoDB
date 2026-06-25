@@ -1,0 +1,22 @@
+{
+  "$schema": "https://unpkg.com/knip@latest/schema.json",
+  "ignoreBinaries": ["lake", "python", "gitleaks", "semgrep", "wasm-pack", "playwright", "osv-scanner"],
+  "ignoreDependencies": ["actionlint"],
+  "ignoreIssues": {
+    "packages/sdk/src/compression.ts": ["exports"],
+    "packages/sdk/src/worker-protocol.ts": ["exports"],
+    "packages/sdk/src/change-events.ts": ["types"],
+    "packages/sdk/src/registry.ts": ["types"],
+    "packages/sdk/src/worker-api.ts": ["types"]
+  },
+  "workspaces": {
+    ".": {
+      "entry": ["package.json", ".config/moyo/**/*.mjs"],
+      "project": [".config/moyo/**/*.mjs"]
+    },
+    "packages/sdk": {
+      "entry": ["tests/**/*.ts", "bench/**/*.ts", "scripts/**/*.mjs"],
+      "project": ["src/**/*.ts", "tests/**/*.ts", "bench/**/*.ts", "scripts/**/*.mjs", "*.ts"]
+    }
+  }
+}

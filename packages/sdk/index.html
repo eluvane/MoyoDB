@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>MoyoDB technical demo</title>
+        <style>
+            body {
+                font-family: system-ui, sans-serif;
+                line-height: 1.45;
+                margin: 2rem;
+                max-width: 980px;
+            }
+            button {
+                font: inherit;
+                margin: 0.25rem 0.4rem 0.25rem 0;
+            }
+            pre {
+                background: #111827;
+                color: #e5e7eb;
+                overflow: auto;
+                padding: 1rem;
+                white-space: pre-wrap;
+            }
+            .warning {
+                color: #92400e;
+                background: #fef3c7;
+                padding: 0.75rem;
+            }
+        </style>
+    </head>
+    <body>
+        <main>
+            <h1>MoyoDB technical demo</h1>
+            <p>Experimental Rust/WASM browser-local storage engine using a dedicated worker and OPFS.</p>
+            <p class="warning">
+                Benchmark results vary by browser/device. Use the raw JSON export and compare only matching workloads,
+                batch sizes, and transaction boundaries.
+            </p>
+            <section>
+                <h2>Environment</h2>
+                <pre id="environment">loading...</pre>
+            </section>
+            <section>
+                <h2>Actions</h2>
+                <button id="open-db">Create/open database</button>
+                <button id="put-get">Put/get</button>
+                <button id="range-scan">Range scan</button>
+                <button id="bulk-insert">Bulk insert 10k</button>
+                <button id="bulk-insert-idb">Bulk insert IndexedDB 10k</button>
+                <button id="compare-idb">Compare with IndexedDB baseline</button>
+                <button id="clear-storage">Clear demo storage</button>
+                <button id="export-json" disabled>Export raw benchmark JSON</button>
+            </section>
+            <pre id="output"></pre>
+        </main>
+        <script type="module" src="/src/demo.ts"></script>
+    </body>
+</html>

@@ -1,0 +1,52 @@
+{
+  "scenarios": [
+    {
+      "name": "two_sequential_write_txs",
+      "steps": [
+        {
+          "op": "createStore",
+          "store": "kv"
+        },
+        {
+          "op": "write",
+          "store": "kv",
+          "key_hex": "61",
+          "value_hex": "31"
+        },
+        {
+          "op": "write",
+          "store": "kv",
+          "key_hex": "62",
+          "value_hex": "32"
+        }
+      ],
+      "expected": {
+        "61": "31",
+        "62": "32"
+      }
+    },
+    {
+      "name": "readonly_snapshot_before_second_commit",
+      "expected": {
+        "snapshot_before_second": {
+          "61": "31"
+        },
+        "final": {
+          "61": "31",
+          "62": "32"
+        }
+      }
+    },
+    {
+      "name": "later_write_overwrites_key",
+      "expected": {
+        "first": {
+          "61": "31"
+        },
+        "final": {
+          "61": "32"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "project": "MoyoDB",
+  "generatedOutputRoot": ".benchmark",
+  "thresholds": {
+    "throughputRegressionPct": 5,
+    "latencyRegressionPct": 5,
+    "tailLatencyRegressionPct": 8
+  },
+  "comparisonRules": [
+    "Compare only rows with the same suite, engine, workload, browser profile and persistence mode.",
+    "Do not compare native Rust Criterion timings to browser SDK/WASM/OPFS timings.",
+    "Treat first-run comparisons without a previous artifact as informational only."
+  ]
+}

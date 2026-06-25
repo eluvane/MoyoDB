@@ -1,0 +1,16 @@
+{
+  "rules": {
+    "require-name": "error",
+    "require-version": "error",
+    "require-description": "error",
+    "require-license": "error",
+    "require-scripts": "error",
+    "require-repository": "warning",
+    "require-keywords": "warning",
+    "require-engines": "warning",
+    "valid-values-license": ["error", ["MIT OR Apache-2.0"]],
+    "prefer-alphabetical-dependencies": "error",
+    "prefer-alphabetical-devDependencies": "error",
+    "no-duplicate-properties": "error"
+  }
+}

@@ -1,0 +1,51 @@
+[package]
+name = "moyodb-engine"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Experimental Rust/WASM transactional key-value storage engine for browser apps."
+repository = "https://github.com/moyodb/moyodb"
+readme = "../../README.md"
+
+[lib]
+name = "moyodb_engine"
+crate-type = [ "cdylib", "rlib" ]
+
+[features]
+default = [  ]
+
+[package.metadata.cargo-machete]
+ignored = [ "serde_bytes" ]
+
+[lints]
+workspace = true
+
+[dependencies]
+crc32fast = { workspace = true }
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+zerocopy = { workspace = true }
+wasm-bindgen = { version = "0.2.100", features = [ "serde-serialize" ] }
+wasm-bindgen-futures = "0.4.50"
+js-sys = "0.3.77"
+serde-wasm-bindgen = "0.6.5"
+
+[dev-dependencies]
+criterion = { version = "0.5.1", features = [ "html_reports" ] }
+
+[[bench]]
+name = "btree"
+harness = false
+
+[[bench]]
+name = "wal"
+harness = false
+
+[[bench]]
+name = "recovery"
+harness = false
+[[bench]]
+name = "commit"
+harness = false
