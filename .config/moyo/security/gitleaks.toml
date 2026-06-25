@@ -1,0 +1,16 @@
+title = "MoyoDB gitleaks policy"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Repository examples and generated non-secret artifacts."
+paths = [
+  '''^proofs/artifacts/.*\.json$''',
+  '''^packages/sdk/dist/''',
+  '''^packages/sdk/public/engine/''',
+  '''^packages/sdk/playwright-report/''',
+  '''^packages/sdk/test-results/''',
+  '''^target/''',
+  '''^node_modules/''',
+]

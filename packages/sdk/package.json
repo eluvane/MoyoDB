@@ -1,0 +1,71 @@
+{
+  "name": "@moyodb/sdk",
+  "version": "0.1.0-alpha.1",
+  "private": false,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build:wasm": "npm run build:wasm:release",
+    "build:wasm:release": "wasm-pack build ../../crates/engine --release --target web --out-dir ../../packages/sdk/public/engine --out-name moyodb_engine",
+    "build:wasm:dev": "wasm-pack build ../../crates/engine --dev --target web --out-dir ../../packages/sdk/public/engine --out-name moyodb_engine",
+    "build": "npm run build:wasm:release && vite build && npm run build:types && npm run prepare:dist",
+    "dev": "npm run build:wasm:release && vite --host 127.0.0.1 --port 4173",
+    "dev:test": "npm run build:wasm:release && vite --host 127.0.0.1 --port 4173",
+    "test:e2e": "npm run build:wasm:release && playwright test",
+    "build:types": "tsc -p tsconfig.build.json",
+    "bench:browser": "node scripts/run-playwright-env.mjs bench:browser",
+    "bench:indexeddb": "node scripts/run-playwright-env.mjs bench:indexeddb",
+    "bench:opfs": "node scripts/run-playwright-env.mjs bench:opfs",
+    "bench:report": "node bench/generate-report.mjs",
+    "test:soak": "node scripts/run-playwright-env.mjs test:soak",
+    "test:browser:soak": "npm run test:soak",
+    "prepare:dist": "node scripts/prepare-dist.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.61.1",
+    "typescript": "6.0.3",
+    "vite": "7.3.6"
+  },
+  "description": "Experimental Rust/WASM transactional key-value storage engine SDK for browser apps, backed by OPFS.",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/moyodb/moyodb.git"
+  },
+  "keywords": [
+    "moyodb",
+    "rust",
+    "wasm",
+    "webassembly",
+    "database",
+    "storage-engine",
+    "browser",
+    "opfs",
+    "local-first",
+    "key-value",
+    "typescript",
+    "transactions",
+    "wal",
+    "web-worker"
+  ],
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/moyodb-sdk.js"
+    }
+  },
+  "types": "./dist/index.d.ts",
+  "homepage": "https://github.com/moyodb/moyodb#readme",
+  "bugs": {
+    "url": "https://github.com/moyodb/moyodb/issues"
+  },
+  "engines": {
+    "node": ">=22.0.0",
+    "npm": ">=10.0.0"
+  }
+}

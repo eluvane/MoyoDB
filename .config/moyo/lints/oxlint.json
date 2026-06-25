@@ -1,0 +1,45 @@
+{
+  "$schema": "https://raw.githubusercontent.com/oxc-project/oxc/main/npm/oxlint/configuration_schema.json",
+  "categories": {
+    "correctness": "deny",
+    "suspicious": "deny",
+    "perf": "warn",
+    "style": "allow",
+    "pedantic": "allow",
+    "restriction": "allow"
+  },
+  "rules": {
+    "eqeqeq": "error",
+    "no-console": "warn",
+    "no-debugger": "error",
+    "no-duplicate-imports": "error",
+    "no-floating-promises": "error",
+    "no-process-exit": "warn",
+    "no-shadow": "warn",
+    "no-unused-vars": "warn",
+    "prefer-const": "warn",
+    "unicorn/prefer-add-event-listener": "warn",
+    "unicorn/require-post-message-target-origin": "warn",
+    "eslint/no-underscore-dangle": "warn",
+    "unicorn/no-new-array": "warn",
+    "eslint/no-unused-vars": "warn",
+    "unicorn/no-process-exit": "warn",
+    "unicorn/no-array-sort": "warn",
+    "unicorn/consistent-function-scoping": "warn",
+    "eslint/prefer-const": "warn"
+  },
+  "ignorePatterns": [
+    "node_modules/**",
+    "dist/**",
+    "target/**",
+    "proofs/moyodb_proofs/.lake/**",
+    "packages/sdk/public/engine/**",
+    "packages/sdk/dist/**",
+    "package-lock.json",
+    ".benchmark/current/**",
+    ".benchmark/previous/**",
+    ".benchmark/comparison/**",
+    ".benchmark/smoke/**",
+    ".bench/**"
+  ]
+}

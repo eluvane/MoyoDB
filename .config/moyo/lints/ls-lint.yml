@@ -1,0 +1,72 @@
+ls:
+  .dir: 'regex:[a-z0-9_.-]+ | regex:MoyoDbProofs'
+  .js: kebab-case
+  .mjs: kebab-case
+  .cjs: kebab-case
+  .ts: kebab-case
+  .json: kebab-case
+  .jsonc: kebab-case
+  .toml: 'kebab-case | regex:Cargo'
+  .yml: kebab-case
+  .yaml: kebab-case
+  .md: 'regex:README | regex:[A-Z0-9][A-Z0-9_-]* | kebab-case'
+  .html: kebab-case
+  .rs: snake_case
+  .lean: 'regex:[A-Z][A-Za-z0-9]*'
+  .lock: kebab-case
+
+  .github/workflows:
+    .yml: kebab-case
+
+  docs:
+    .md: 'regex:[A-Z0-9][A-Z0-9_-]* | regex:README'
+
+  crates/engine/src:
+    .rs: snake_case
+  crates/engine/tests:
+    .rs: snake_case
+  crates/engine/benches:
+    .rs: snake_case
+  crates/engine/js:
+    .js: snake_case
+
+  packages/sdk/src:
+    .ts: kebab-case
+  packages/sdk/tests:
+    .ts: kebab-case
+  packages/sdk/bench:
+    .ts: kebab-case
+    .mjs: kebab-case
+    .html: kebab-case
+    .md: 'regex:README | kebab-case'
+  packages/sdk/scripts:
+    .mjs: kebab-case
+
+  proofs/moyodb_proofs:
+    .lean: 'regex:[A-Z][A-Za-z0-9]* | regex:lakefile'
+  proofs/moyodb_proofs/MoyoDbProofs:
+    .dir: 'regex:[A-Z][A-Za-z0-9]*'
+    .lean: 'regex:[A-Z][A-Za-z0-9]*'
+  proofs/moyodb_proofs/MoyoDbProofs/*:
+    .lean: 'regex:[A-Z][A-Za-z0-9]*'
+  proofs/artifacts:
+    .json: snake_case
+
+ignore:
+  - node_modules
+  - '**/node_modules'
+  - .gitignore
+  - target
+  - '**/target'
+  - '**/.lake'
+  - packages/sdk/dist
+  - packages/sdk/public/engine
+  - packages/sdk/playwright-report
+  - packages/sdk/test-results
+  - packages/sdk/bench/results
+  - .benchmark/current
+  - .benchmark/previous
+  - .benchmark/comparison
+  - .benchmark/smoke
+  - Cargo.lock
+  - package-lock.json

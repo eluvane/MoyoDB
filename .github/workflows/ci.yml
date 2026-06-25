@@ -1,0 +1,328 @@
+name: MoyoDB ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      full_quality:
+        description: 'Run opt-in long checks such as browser soak tests.'
+        required: false
+        default: false
+        type: boolean
+      run_soak:
+        description: 'Run browser soak/model tests.'
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: '0 3 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  NODE_VERSION: '22'
+  RUST_TOOLCHAIN: '1.91.0'
+
+jobs:
+  format:
+    name: MoyoDB formatting
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install Node dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefer-online --registry=https://registry.npmjs.org/
+      - uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          components: rustfmt
+      - name: Check repository formatting
+        run: npm run format:check
+
+  lint-typescript:
+    name: MoyoDB TypeScript lints
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install Node dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefer-online --registry=https://registry.npmjs.org/
+      - name: Run TypeScript/JavaScript gates
+        run: npm run lint:typescript
+
+  lint-rust:
+    name: MoyoDB Rust lints
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Rust lint tooling
+        run: cargo install --locked cargo-machete --version 0.9.2
+      - name: Run Rust lint gate
+        run: npm run lint:rust
+      - name: Check Rust workspace and all targets
+        run: cargo check --workspace --all-targets
+
+  lint-lean:
+    name: MoyoDB Lean proof layer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install Node dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefer-online --registry=https://registry.npmjs.org/
+      - name: Check Lean source hygiene before elaboration
+        run: node .config/moyo/quality/check-lean-hygiene.mjs
+      - name: Build Lean proofs
+        uses: leanprover/lean-action@v1.5.0
+        with:
+          auto-config: false
+          lake-package-directory: proofs/moyodb_proofs
+          use-github-cache: false
+          use-mathlib-cache: false
+          build: true
+          build-args: '--wfail MoyoDbProofs'
+          lint: true
+          test: false
+          leanchecker: false
+      - name: Run Lake built-in lint and leanchecker explicitly
+        working-directory: proofs/moyodb_proofs
+        run: |
+          set -euo pipefail
+          lake lint --builtin-lint
+          lake env leanchecker --fresh MoyoDbProofs
+      - name: Export proof artifacts
+        working-directory: proofs/moyodb_proofs
+        run: lake exe export_artifacts
+      - name: Verify exported proof artifacts are committed
+        run: git diff --exit-code -- proofs/artifacts
+      - name: Upload proof artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: proof-artifacts
+          path: proofs/artifacts
+          if-no-files-found: error
+
+  lint-repo:
+    name: MoyoDB repository policy lints
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14.6'
+      - name: Install Node dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefer-online --registry=https://registry.npmjs.org/
+      - name: Install YAML linter
+        run: python -m pip install --user yamllint==1.38.0
+      - name: Put user Python scripts on PATH
+        run: echo "${HOME}/.local/bin" >> "$GITHUB_PATH"
+      - name: Run repository metadata and config gates
+        run: npm run lint:repo
+
+  quality:
+    name: MoyoDB structural quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install Node dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefer-online --registry=https://registry.npmjs.org/
+      - name: Run unused-code and dependency-consistency gates
+        run: npm run quality
+
+  security:
+    name: MoyoDB dependency and secret security
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Node dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefer-online --registry=https://registry.npmjs.org/
+      - name: Install Rust and Python security tooling
+        run: |
+          set -euo pipefail
+          cargo install --locked cargo-deny --version 0.19.8
+          python -m pip install --user 'setuptools<81' semgrep==1.102.0
+          echo "${HOME}/.local/bin" >> "$GITHUB_PATH"
+      - name: npm audit high-severity gate
+        run: npm run security:npm-audit
+      - name: Cargo dependency, advisory, ban, and license policy
+        run: npm run security:cargo-deny
+      - name: Semgrep local rules
+        run: npm run security:semgrep
+      - name: Gitleaks secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: detect --no-git --source . --config .config/moyo/security/gitleaks.toml --redact --verbose
+      - name: GitHub dependency review
+        if: github.event_name == 'pull_request'
+        uses: actions/dependency-review-action@v5
+        with:
+          config-file: .config/moyo/ci/dependency-review-config.yml
+
+  test:
+    name: MoyoDB tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install Node dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefer-online --registry=https://registry.npmjs.org/
+      - name: Install wasm-pack
+        run: cargo install --locked wasm-pack --version 0.15.0
+      - name: Install Playwright browsers
+        run: npm exec --workspace @moyodb/sdk -- playwright install --with-deps
+      - name: Run Rust tests
+        run: npm run test:rust
+      - name: Run SDK browser tests
+        run: npm run test:sdk
+      - name: Run opt-in soak tests
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.full_quality || inputs.run_soak))
+        run: npm run test:browser:soak --workspace @moyodb/sdk
+
+  build:
+    name: MoyoDB build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    needs:
+      - format
+      - lint-typescript
+      - lint-rust
+      - lint-lean
+      - lint-repo
+      - quality
+      - security
+      - test
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install Node dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefer-online --registry=https://registry.npmjs.org/
+      - name: Install wasm-pack
+        run: cargo install --locked wasm-pack --version 0.15.0
+      - name: Build SDK/WASM package
+        run: npm run build
+      - name: Verify WASM artifacts are present for SDK/browser path
+        run: |
+          set -euo pipefail
+          test -s packages/sdk/public/engine/moyodb_engine.js
+          test -s packages/sdk/public/engine/moyodb_engine_bg.wasm
+          test -s packages/sdk/public/engine/moyodb_engine.d.ts
+          test -s packages/sdk/public/engine/moyodb_engine_bg.wasm.d.ts
+          test -s packages/sdk/public/engine/package.json
+      - name: Upload SDK build artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: sdk-dist
+          path: packages/sdk/dist
+          if-no-files-found: error
+      - name: Upload WASM artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: wasm-release-artifacts
+          path: packages/sdk/public/engine
+          if-no-files-found: error
+
+  benchmark-compile:
+    name: MoyoDB benchmark compile
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Compile Criterion benchmarks
+        run: npm run bench:rust:compile

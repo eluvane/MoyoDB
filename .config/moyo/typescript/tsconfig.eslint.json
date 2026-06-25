@@ -1,0 +1,22 @@
+{
+  "extends": "../../../packages/sdk/tsconfig.json",
+  "compilerOptions": {
+    "allowJs": false,
+    "checkJs": false,
+    "noEmit": true
+  },
+  "include": [
+    "../../../packages/sdk/src/**/*.ts",
+    "../../../packages/sdk/tests/**/*.ts",
+    "../../../packages/sdk/bench/**/*.ts",
+    "../../../packages/sdk/scripts/**/*.mjs",
+    "../../../packages/sdk/*.ts"
+  ],
+  "exclude": [
+    "../../../node_modules",
+    "../../../packages/sdk/dist",
+    "../../../packages/sdk/public/engine",
+    "../../../target",
+    "../../../proofs/moyodb_proofs/.lake"
+  ]
+}

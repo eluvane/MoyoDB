@@ -1,0 +1,1346 @@
+{
+  "schemaVersion": 1,
+  "project": "MoyoDB",
+  "generatedAt": "2026-06-25T19:03:04.806Z",
+  "profile": "smoke",
+  "browser": {
+    "name": "HeadlessChrome",
+    "version": "149",
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+    "platform": "Windows"
+  },
+  "environment": {
+    "browser": {
+      "name": "HeadlessChrome",
+      "version": "149",
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+      "platform": "Windows"
+    },
+    "timestamp": "2026-06-25T19:03:04.806Z",
+    "headless": "unknown",
+    "os": "Windows",
+    "secureContext": true,
+    "webdriver": true,
+    "sdkBuildMode": "unknown",
+    "wasmBuildMode": "not introspected at runtime; use npm run build:wasm:release before publishing benchmark numbers",
+    "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+    "opfsSupported": true,
+    "syncAccessHandleSupported": true,
+    "locksSupported": true,
+    "broadcastChannelSupported": true,
+    "workerSupported": true,
+    "persistentContext": false
+  },
+  "results": [
+    {
+      "engine": "moyodb",
+      "workloadName": "noop_js_loop_1m",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 1000000,
+      "keySize": 0,
+      "valueSize": 0,
+      "batchSize": 0,
+      "transactionBoundaries": "pure JavaScript loop; no storage",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Diagnostic: isolates JS loop overhead.",
+      "status": "ok",
+      "warmupSamples": [
+        3.100000023841858
+      ],
+      "rawSamples": [
+        0.29999998211860657,
+        0.19999998807907104,
+        0.30000001192092896
+      ],
+      "stats": {
+        "min": 0.19999998807907104,
+        "max": 0.30000001192092896,
+        "mean": 0.2666666607062022,
+        "p50": 0.29999998211860657,
+        "p95": 0.30000001192092896,
+        "p99": 0.30000001192092896
+      }
+    },
+    {
+      "engine": "indexeddb",
+      "workloadName": "noop_js_loop_1m",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 1000000,
+      "keySize": 0,
+      "valueSize": 0,
+      "batchSize": 0,
+      "transactionBoundaries": "pure JavaScript loop; no storage",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Diagnostic: isolates JS loop overhead. Not applicable to indexeddb.",
+      "status": "skipped",
+      "warmupSamples": [],
+      "rawSamples": []
+    },
+    {
+      "engine": "moyodb",
+      "workloadName": "noop_worker_roundtrip_10k",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 10000,
+      "keySize": 0,
+      "valueSize": 0,
+      "batchSize": 1,
+      "transactionBoundaries": "10,000 sequential postMessage echo roundtrips",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Diagnostic: legacy raw Worker echo latency without SDK, WASM, or OPFS.",
+      "status": "ok",
+      "warmupSamples": [
+        187.5
+      ],
+      "rawSamples": [
+        183.19999998807907,
+        180.80000001192093,
+        191.69999998807907
+      ],
+      "stats": {
+        "min": 180.80000001192093,
+        "max": 191.69999998807907,
+        "mean": 185.23333332935968,
+        "p50": 183.19999998807907,
+        "p95": 191.69999998807907,
+        "p99": 191.69999998807907
+      }
+    },
+    {
+      "engine": "indexeddb",
+      "workloadName": "noop_worker_roundtrip_10k",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 10000,
+      "keySize": 0,
+      "valueSize": 0,
+      "batchSize": 1,
+      "transactionBoundaries": "10,000 sequential postMessage echo roundtrips",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Diagnostic: legacy raw Worker echo latency without SDK, WASM, or OPFS. Not applicable to indexeddb.",
+      "status": "skipped",
+      "warmupSamples": [],
+      "rawSamples": []
+    },
+    {
+      "engine": "moyodb",
+      "workloadName": "worker_roundtrip_noop",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 10000,
+      "keySize": 0,
+      "valueSize": 0,
+      "batchSize": 1,
+      "transactionBoundaries": "10,000 sequential protocol-shaped Worker roundtrips with no payload",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Diagnostic: isolates Worker request/response latency without SDK, WASM, OPFS, or data generation.",
+      "status": "ok",
+      "warmupSamples": [
+        185
+      ],
+      "rawSamples": [
+        181.40000000596046,
+        188.59999999403954,
+        177.59999999403954
+      ],
+      "stats": {
+        "min": 177.59999999403954,
+        "max": 188.59999999403954,
+        "mean": 182.5333333313465,
+        "p50": 181.40000000596046,
+        "p95": 188.59999999403954,
+        "p99": 188.59999999403954
+      }
+    },
+    {
+      "engine": "indexeddb",
+      "workloadName": "worker_roundtrip_noop",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 10000,
+      "keySize": 0,
+      "valueSize": 0,
+      "batchSize": 1,
+      "transactionBoundaries": "10,000 sequential protocol-shaped Worker roundtrips with no payload",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Diagnostic: isolates Worker request/response latency without SDK, WASM, OPFS, or data generation. Not applicable to indexeddb.",
+      "status": "skipped",
+      "warmupSamples": [],
+      "rawSamples": []
+    },
+    {
+      "engine": "moyodb",
+      "workloadName": "worker_roundtrip_small_payload",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 10000,
+      "keySize": 0,
+      "valueSize": 32,
+      "batchSize": 1,
+      "transactionBoundaries": "10,000 sequential Worker roundtrips with a 32-byte Uint8Array payload",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Diagnostic: isolates structured clone overhead for a tiny binary payload.",
+      "status": "ok",
+      "warmupSamples": [
+        230.5
+      ],
+      "rawSamples": [
+        227,
+        229.30000001192093,
+        230.5
+      ],
+      "stats": {
+        "min": 227,
+        "max": 230.5,
+        "mean": 228.93333333730698,
+        "p50": 229.30000001192093,
+        "p95": 230.5,
+        "p99": 230.5
+      }
+    },
+    {
+      "engine": "indexeddb",
+      "workloadName": "worker_roundtrip_small_payload",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 10000,
+      "keySize": 0,
+      "valueSize": 32,
+      "batchSize": 1,
+      "transactionBoundaries": "10,000 sequential Worker roundtrips with a 32-byte Uint8Array payload",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Diagnostic: isolates structured clone overhead for a tiny binary payload. Not applicable to indexeddb.",
+      "status": "skipped",
+      "warmupSamples": [],
+      "rawSamples": []
+    },
+    {
+      "engine": "moyodb",
+      "workloadName": "worker_roundtrip_256b_payload",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 10000,
+      "keySize": 0,
+      "valueSize": 256,
+      "batchSize": 1,
+      "transactionBoundaries": "10,000 sequential Worker roundtrips with a 256-byte Uint8Array payload",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Diagnostic: isolates structured clone overhead for a representative small value.",
+      "status": "ok",
+      "warmupSamples": [
+        237.7999999821186
+      ],
+      "rawSamples": [
+        231.59999999403954,
+        238,
+        249.09999999403954
+      ],
+      "stats": {
+        "min": 231.59999999403954,
+        "max": 249.09999999403954,
+        "mean": 239.56666666269302,
+        "p50": 238,
+        "p95": 249.09999999403954,
+        "p99": 249.09999999403954
+      }
+    },
+    {
+      "engine": "indexeddb",
+      "workloadName": "worker_roundtrip_256b_payload",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 10000,
+      "keySize": 0,
+      "valueSize": 256,
+      "batchSize": 1,
+      "transactionBoundaries": "10,000 sequential Worker roundtrips with a 256-byte Uint8Array payload",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Diagnostic: isolates structured clone overhead for a representative small value. Not applicable to indexeddb.",
+      "status": "skipped",
+      "warmupSamples": [],
+      "rawSamples": []
+    },
+    {
+      "engine": "moyodb",
+      "workloadName": "worker_roundtrip_64kb_payload",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 100,
+      "keySize": 0,
+      "valueSize": 65536,
+      "batchSize": 1,
+      "transactionBoundaries": "100 sequential Worker roundtrips with a 64 KiB Uint8Array payload using structured clone",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Diagnostic: isolates large binary structured clone overhead.",
+      "status": "ok",
+      "warmupSamples": [
+        18.799999982118607
+      ],
+      "rawSamples": [
+        14.700000017881393,
+        15.399999976158142,
+        13.700000017881393
+      ],
+      "stats": {
+        "min": 13.700000017881393,
+        "max": 15.399999976158142,
+        "mean": 14.600000003973642,
+        "p50": 14.700000017881393,
+        "p95": 15.399999976158142,
+        "p99": 15.399999976158142
+      }
+    },
+    {
+      "engine": "indexeddb",
+      "workloadName": "worker_roundtrip_64kb_payload",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 100,
+      "keySize": 0,
+      "valueSize": 65536,
+      "batchSize": 1,
+      "transactionBoundaries": "100 sequential Worker roundtrips with a 64 KiB Uint8Array payload using structured clone",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Diagnostic: isolates large binary structured clone overhead. Not applicable to indexeddb.",
+      "status": "skipped",
+      "warmupSamples": [],
+      "rawSamples": []
+    },
+    {
+      "engine": "moyodb",
+      "workloadName": "worker_binary_transfer_64kb",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 100,
+      "keySize": 0,
+      "valueSize": 65536,
+      "batchSize": 1,
+      "transactionBoundaries": "100 sequential Worker roundtrips with a 64 KiB Uint8Array payload transferred both directions",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Diagnostic: isolates transferable ArrayBuffer roundtrip overhead; buffers are generated during setup and ownership is intentionally moved.",
+      "status": "ok",
+      "warmupSamples": [
+        5.5
+      ],
+      "rawSamples": [
+        4.5,
+        7.0999999940395355,
+        4.699999988079071
+      ],
+      "stats": {
+        "min": 4.5,
+        "max": 7.0999999940395355,
+        "mean": 5.433333327372869,
+        "p50": 4.699999988079071,
+        "p95": 7.0999999940395355,
+        "p99": 7.0999999940395355
+      }
+    },
+    {
+      "engine": "indexeddb",
+      "workloadName": "worker_binary_transfer_64kb",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 100,
+      "keySize": 0,
+      "valueSize": 65536,
+      "batchSize": 1,
+      "transactionBoundaries": "100 sequential Worker roundtrips with a 64 KiB Uint8Array payload transferred both directions",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Diagnostic: isolates transferable ArrayBuffer roundtrip overhead; buffers are generated during setup and ownership is intentionally moved. Not applicable to indexeddb.",
+      "status": "skipped",
+      "warmupSamples": [],
+      "rawSamples": []
+    },
+    {
+      "engine": "moyodb",
+      "workloadName": "noop_wasm_call_100k",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 100000,
+      "keySize": 0,
+      "valueSize": 0,
+      "batchSize": 1,
+      "transactionBoundaries": "100,000 get_schema_version calls inside a worker-held WASM engine",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Diagnostic: isolates repeated JS-to-WASM method dispatch after OPFS-backed engine setup.",
+      "status": "ok",
+      "warmupSamples": [
+        3.5
+      ],
+      "rawSamples": [
+        3.600000023841858,
+        3,
+        3.2999999821186066
+      ],
+      "stats": {
+        "min": 3,
+        "max": 3.600000023841858,
+        "mean": 3.3000000019868216,
+        "p50": 3.2999999821186066,
+        "p95": 3.600000023841858,
+        "p99": 3.600000023841858
+      }
+    },
+    {
+      "engine": "indexeddb",
+      "workloadName": "noop_wasm_call_100k",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 100000,
+      "keySize": 0,
+      "valueSize": 0,
+      "batchSize": 1,
+      "transactionBoundaries": "100,000 get_schema_version calls inside a worker-held WASM engine",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Diagnostic: isolates repeated JS-to-WASM method dispatch after OPFS-backed engine setup. Not applicable to indexeddb.",
+      "status": "skipped",
+      "warmupSamples": [],
+      "rawSamples": []
+    },
+    {
+      "engine": "moyodb",
+      "workloadName": "encode_decode_10k_256b",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 10000,
+      "keySize": 16,
+      "valueSize": 256,
+      "batchSize": 1000,
+      "transactionBoundaries": "encode/decode 10,000 deterministic 256-byte values",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Diagnostic: isolates benchmark key/value generation and byte-copy cost.",
+      "status": "ok",
+      "warmupSamples": [
+        14
+      ],
+      "rawSamples": [
+        13,
+        13.199999988079071,
+        12.899999976158142
+      ],
+      "stats": {
+        "min": 12.899999976158142,
+        "max": 13.199999988079071,
+        "mean": 13.033333321412405,
+        "p50": 13,
+        "p95": 13.199999988079071,
+        "p99": 13.199999988079071
+      }
+    },
+    {
+      "engine": "indexeddb",
+      "workloadName": "encode_decode_10k_256b",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 10000,
+      "keySize": 16,
+      "valueSize": 256,
+      "batchSize": 1000,
+      "transactionBoundaries": "encode/decode 10,000 deterministic 256-byte values",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Diagnostic: isolates benchmark key/value generation and byte-copy cost. Not applicable to indexeddb.",
+      "status": "skipped",
+      "warmupSamples": [],
+      "rawSamples": []
+    },
+    {
+      "engine": "moyodb",
+      "workloadName": "sdk_put_1k_single_calls",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 1000,
+      "keySize": 16,
+      "valueSize": 256,
+      "batchSize": 1,
+      "transactionBoundaries": "1,000 db.put calls; each call opens/scopes/commits one SDK transaction",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Smoke diagnostic: public SDK single-call overhead. This is intentionally not a bulk insert path.",
+      "status": "ok",
+      "warmupSamples": [
+        2156.0999999940395
+      ],
+      "rawSamples": [
+        2092.9000000059605,
+        2072.800000011921,
+        2088.5
+      ],
+      "stats": {
+        "min": 2072.800000011921,
+        "max": 2092.9000000059605,
+        "mean": 2084.733333339294,
+        "p50": 2088.5,
+        "p95": 2092.9000000059605,
+        "p99": 2092.9000000059605
+      }
+    },
+    {
+      "engine": "indexeddb",
+      "workloadName": "sdk_put_1k_single_calls",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 1000,
+      "keySize": 16,
+      "valueSize": 256,
+      "batchSize": 1,
+      "transactionBoundaries": "1,000 db.put calls; each call opens/scopes/commits one SDK transaction",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Smoke diagnostic: public SDK single-call overhead. This is intentionally not a bulk insert path. Not applicable to indexeddb.",
+      "status": "skipped",
+      "warmupSamples": [],
+      "rawSamples": []
+    },
+    {
+      "engine": "moyodb",
+      "workloadName": "sdk_bulk_put_10k",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 10000,
+      "keySize": 16,
+      "valueSize": 256,
+      "batchSize": 10000,
+      "transactionBoundaries": "one SDK transaction, one tx.putMany call with 10,000 entries, one commit",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Diagnostic: SDK bulk put path after data generation and empty DB setup.",
+      "status": "ok",
+      "warmupSamples": [
+        387.09999999403954
+      ],
+      "rawSamples": [
+        406.19999998807907,
+        389.19999998807907,
+        419.19999998807907
+      ],
+      "stats": {
+        "min": 389.19999998807907,
+        "max": 419.19999998807907,
+        "mean": 404.86666665474576,
+        "p50": 406.19999998807907,
+        "p95": 419.19999998807907,
+        "p99": 419.19999998807907
+      }
+    },
+    {
+      "engine": "indexeddb",
+      "workloadName": "sdk_bulk_put_10k",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 10000,
+      "keySize": 16,
+      "valueSize": 256,
+      "batchSize": 10000,
+      "transactionBoundaries": "one SDK transaction, one tx.putMany call with 10,000 entries, one commit",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Diagnostic: SDK bulk put path after data generation and empty DB setup. Not applicable to indexeddb.",
+      "status": "skipped",
+      "warmupSamples": [],
+      "rawSamples": []
+    },
+    {
+      "engine": "moyodb",
+      "workloadName": "engine_stage_put_10k_rollback",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 10000,
+      "keySize": 16,
+      "valueSize": 256,
+      "batchSize": 10000,
+      "transactionBoundaries": "one worker-local WASM put_many call with 10,000 entries followed by rollback; no commit flush",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Diagnostic: isolates WASM conversion and in-memory transaction staging without BTree commit or OPFS flush.",
+      "status": "ok",
+      "warmupSamples": [
+        25.69999998807907
+      ],
+      "rawSamples": [
+        30.69999998807907,
+        28.599999994039536,
+        26.400000005960464
+      ],
+      "stats": {
+        "min": 26.400000005960464,
+        "max": 30.69999998807907,
+        "mean": 28.566666662693024,
+        "p50": 28.599999994039536,
+        "p95": 30.69999998807907,
+        "p99": 30.69999998807907
+      }
+    },
+    {
+      "engine": "indexeddb",
+      "workloadName": "engine_stage_put_10k_rollback",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 10000,
+      "keySize": 16,
+      "valueSize": 256,
+      "batchSize": 10000,
+      "transactionBoundaries": "one worker-local WASM put_many call with 10,000 entries followed by rollback; no commit flush",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Diagnostic: isolates WASM conversion and in-memory transaction staging without BTree commit or OPFS flush. Not applicable to indexeddb.",
+      "status": "skipped",
+      "warmupSamples": [],
+      "rawSamples": []
+    },
+    {
+      "engine": "moyodb",
+      "workloadName": "engine_bulk_put_10k",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 10000,
+      "keySize": 16,
+      "valueSize": 256,
+      "batchSize": 10000,
+      "transactionBoundaries": "one worker-local WASM engine transaction, one put_many call with 10,000 entries, one commit",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Diagnostic: bypasses public SDK payload transfer; isolates worker/WASM/OPFS engine bulk path.",
+      "status": "ok",
+      "warmupSamples": [
+        400.5
+      ],
+      "rawSamples": [
+        409.90000000596046,
+        403.40000000596046,
+        427.09999999403954
+      ],
+      "stats": {
+        "min": 403.40000000596046,
+        "max": 427.09999999403954,
+        "mean": 413.4666666686535,
+        "p50": 409.90000000596046,
+        "p95": 427.09999999403954,
+        "p99": 427.09999999403954
+      }
+    },
+    {
+      "engine": "indexeddb",
+      "workloadName": "engine_bulk_put_10k",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 10000,
+      "keySize": 16,
+      "valueSize": 256,
+      "batchSize": 10000,
+      "transactionBoundaries": "one worker-local WASM engine transaction, one put_many call with 10,000 entries, one commit",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Diagnostic: bypasses public SDK payload transfer; isolates worker/WASM/OPFS engine bulk path. Not applicable to indexeddb.",
+      "status": "skipped",
+      "warmupSamples": [],
+      "rawSamples": []
+    },
+    {
+      "engine": "moyodb",
+      "workloadName": "indexeddb_bulk_put_10k",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 10000,
+      "keySize": 16,
+      "valueSize": 256,
+      "batchSize": 10000,
+      "transactionBoundaries": "one IndexedDB readwrite transaction with 10,000 puts",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Diagnostic: IndexedDB bulk baseline with setup and data generation outside the timed region. Not applicable to moyodb.",
+      "status": "skipped",
+      "warmupSamples": [],
+      "rawSamples": []
+    },
+    {
+      "engine": "indexeddb",
+      "workloadName": "indexeddb_bulk_put_10k",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 10000,
+      "keySize": 16,
+      "valueSize": 256,
+      "batchSize": 10000,
+      "transactionBoundaries": "one IndexedDB readwrite transaction with 10,000 puts",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Diagnostic: IndexedDB bulk baseline with setup and data generation outside the timed region.",
+      "status": "ok",
+      "warmupSamples": [
+        334.7000000178814
+      ],
+      "rawSamples": [
+        591.1999999880791,
+        802.0999999940395,
+        1185
+      ],
+      "stats": {
+        "min": 591.1999999880791,
+        "max": 1185,
+        "mean": 859.4333333273729,
+        "p50": 802.0999999940395,
+        "p95": 1185,
+        "p99": 1185
+      }
+    },
+    {
+      "engine": "moyodb",
+      "workloadName": "open_empty_db",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 1,
+      "keySize": 0,
+      "valueSize": 0,
+      "batchSize": 1,
+      "transactionBoundaries": "database deletion/setup is outside measurement; timed region opens an empty DB and creates no store",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Open/init diagnostic. MoyoDB includes Worker, WASM module initialization, and OPFS open when no cached worker exists.",
+      "status": "ok",
+      "warmupSamples": [
+        31.899999976158142
+      ],
+      "rawSamples": [
+        35.5,
+        32.099999994039536,
+        34.30000001192093
+      ],
+      "stats": {
+        "min": 32.099999994039536,
+        "max": 35.5,
+        "mean": 33.96666666865349,
+        "p50": 34.30000001192093,
+        "p95": 35.5,
+        "p99": 35.5
+      }
+    },
+    {
+      "engine": "indexeddb",
+      "workloadName": "open_empty_db",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 1,
+      "keySize": 0,
+      "valueSize": 0,
+      "batchSize": 1,
+      "transactionBoundaries": "database deletion/setup is outside measurement; timed region opens an empty DB and creates no store",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Open/init diagnostic. MoyoDB includes Worker, WASM module initialization, and OPFS open when no cached worker exists.",
+      "status": "ok",
+      "warmupSamples": [
+        0.3999999761581421
+      ],
+      "rawSamples": [
+        0.30000001192092896,
+        0.30000001192092896,
+        0.20000001788139343
+      ],
+      "stats": {
+        "min": 0.20000001788139343,
+        "max": 0.30000001192092896,
+        "mean": 0.2666666805744171,
+        "p50": 0.30000001192092896,
+        "p95": 0.30000001192092896,
+        "p99": 0.30000001192092896
+      }
+    },
+    {
+      "engine": "moyodb",
+      "workloadName": "bulk_insert_10k",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 10000,
+      "keySize": 16,
+      "valueSize": 256,
+      "batchSize": 1000,
+      "transactionBoundaries": "one readwrite transaction per batch of 1,000 puts",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Comparable batch insert workload. Test data and empty DB setup are outside the measured region.",
+      "status": "ok",
+      "warmupSamples": [
+        1446.4000000059605
+      ],
+      "rawSamples": [
+        1308.800000011921,
+        1357.6000000238419,
+        1335.5999999940395
+      ],
+      "stats": {
+        "min": 1308.800000011921,
+        "max": 1357.6000000238419,
+        "mean": 1334.0000000099342,
+        "p50": 1335.5999999940395,
+        "p95": 1357.6000000238419,
+        "p99": 1357.6000000238419
+      }
+    },
+    {
+      "engine": "indexeddb",
+      "workloadName": "bulk_insert_10k",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 10000,
+      "keySize": 16,
+      "valueSize": 256,
+      "batchSize": 1000,
+      "transactionBoundaries": "one readwrite transaction per batch of 1,000 puts",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Comparable batch insert workload. Test data and empty DB setup are outside the measured region.",
+      "status": "ok",
+      "warmupSamples": [
+        1182.199999988079
+      ],
+      "rawSamples": [
+        1406.199999988079,
+        1813,
+        1768.800000011921
+      ],
+      "stats": {
+        "min": 1406.199999988079,
+        "max": 1813,
+        "mean": 1662.6666666666667,
+        "p50": 1768.800000011921,
+        "p95": 1813,
+        "p99": 1813
+      }
+    },
+    {
+      "engine": "moyodb",
+      "workloadName": "point_get_random_10k",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 10000,
+      "keySize": 16,
+      "valueSize": 256,
+      "batchSize": 1000,
+      "transactionBoundaries": "setup/preload outside measurement; measured region performs 10,000 single tx.get calls inside one readonly transaction",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Random point reads after a 10k-row setup. This measures per-call SDK/Worker/WASM overhead.",
+      "status": "ok",
+      "warmupSamples": [
+        1248.3999999761581
+      ],
+      "rawSamples": [
+        1225.199999988079,
+        1277.5999999940395,
+        1210.699999988079
+      ],
+      "stats": {
+        "min": 1210.699999988079,
+        "max": 1277.5999999940395,
+        "mean": 1237.8333333233993,
+        "p50": 1225.199999988079,
+        "p95": 1277.5999999940395,
+        "p99": 1277.5999999940395
+      }
+    },
+    {
+      "engine": "indexeddb",
+      "workloadName": "point_get_random_10k",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 10000,
+      "keySize": 16,
+      "valueSize": 256,
+      "batchSize": 1000,
+      "transactionBoundaries": "setup/preload outside measurement; measured region performs 10,000 single tx.get calls inside one readonly transaction",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Random point reads after a 10k-row setup. This measures per-call SDK/Worker/WASM overhead.",
+      "status": "ok",
+      "warmupSamples": [
+        149
+      ],
+      "rawSamples": [
+        155.69999998807907,
+        123.2999999821186,
+        123
+      ],
+      "stats": {
+        "min": 123,
+        "max": 155.69999998807907,
+        "mean": 133.9999999900659,
+        "p50": 123.2999999821186,
+        "p95": 155.69999998807907,
+        "p99": 155.69999998807907
+      }
+    },
+    {
+      "engine": "moyodb",
+      "workloadName": "point_get_random_10k_bulk",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 10000,
+      "keySize": 16,
+      "valueSize": 256,
+      "batchSize": 1000,
+      "transactionBoundaries": "setup/preload outside measurement; measured region performs one getMany over 10,000 random keys",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Bulk random point reads after a 10k-row setup. This measures the recommended public bulk read path.",
+      "status": "ok",
+      "warmupSamples": [
+        154.80000001192093
+      ],
+      "rawSamples": [
+        150.80000001192093,
+        155.19999998807907,
+        200.30000001192093
+      ],
+      "stats": {
+        "min": 150.80000001192093,
+        "max": 200.30000001192093,
+        "mean": 168.76666667064032,
+        "p50": 155.19999998807907,
+        "p95": 200.30000001192093,
+        "p99": 200.30000001192093
+      }
+    },
+    {
+      "engine": "indexeddb",
+      "workloadName": "point_get_random_10k_bulk",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 10000,
+      "keySize": 16,
+      "valueSize": 256,
+      "batchSize": 1000,
+      "transactionBoundaries": "setup/preload outside measurement; measured region performs one getMany over 10,000 random keys",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Bulk random point reads after a 10k-row setup. This measures the recommended public bulk read path.",
+      "status": "ok",
+      "warmupSamples": [
+        134.19999998807907
+      ],
+      "rawSamples": [
+        141.40000000596046,
+        138.30000001192093,
+        137.30000001192093
+      ],
+      "stats": {
+        "min": 137.30000001192093,
+        "max": 141.40000000596046,
+        "mean": 139.0000000099341,
+        "p50": 138.30000001192093,
+        "p95": 141.40000000596046,
+        "p99": 141.40000000596046
+      }
+    },
+    {
+      "engine": "moyodb",
+      "workloadName": "range_scan_100",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 10000,
+      "keySize": 16,
+      "valueSize": 256,
+      "batchSize": 1000,
+      "transactionBoundaries": "setup/preload outside measurement; measurement scans 100 contiguous keys",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Range scan over 100 rows.",
+      "status": "ok",
+      "warmupSamples": [
+        2.800000011920929
+      ],
+      "rawSamples": [
+        5.699999988079071,
+        6,
+        6.199999988079071
+      ],
+      "stats": {
+        "min": 5.699999988079071,
+        "max": 6.199999988079071,
+        "mean": 5.96666665871938,
+        "p50": 6,
+        "p95": 6.199999988079071,
+        "p99": 6.199999988079071
+      }
+    },
+    {
+      "engine": "indexeddb",
+      "workloadName": "range_scan_100",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 10000,
+      "keySize": 16,
+      "valueSize": 256,
+      "batchSize": 1000,
+      "transactionBoundaries": "setup/preload outside measurement; measurement scans 100 contiguous keys",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Range scan over 100 rows.",
+      "status": "ok",
+      "warmupSamples": [
+        1.5999999940395355
+      ],
+      "rawSamples": [
+        2.9000000059604645,
+        2.699999988079071,
+        2.5
+      ],
+      "stats": {
+        "min": 2.5,
+        "max": 2.9000000059604645,
+        "mean": 2.6999999980131784,
+        "p50": 2.699999988079071,
+        "p95": 2.9000000059604645,
+        "p99": 2.9000000059604645
+      }
+    },
+    {
+      "engine": "moyodb",
+      "workloadName": "small_tx_1000_commits",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 1000,
+      "keySize": 16,
+      "valueSize": 128,
+      "batchSize": 1,
+      "transactionBoundaries": "1,000 independent readwrite commits; keys/values and empty DB setup outside measurement",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Small transaction commit overhead.",
+      "status": "ok",
+      "warmupSamples": [
+        4251.0999999940395
+      ],
+      "rawSamples": [
+        4032.600000023842,
+        4380.300000011921,
+        3960
+      ],
+      "stats": {
+        "min": 3960,
+        "max": 4380.300000011921,
+        "mean": 4124.300000011921,
+        "p50": 4032.600000023842,
+        "p95": 4380.300000011921,
+        "p99": 4380.300000011921
+      }
+    },
+    {
+      "engine": "indexeddb",
+      "workloadName": "small_tx_1000_commits",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 1000,
+      "keySize": 16,
+      "valueSize": 128,
+      "batchSize": 1,
+      "transactionBoundaries": "1,000 independent readwrite commits; keys/values and empty DB setup outside measurement",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "Small transaction commit overhead.",
+      "status": "ok",
+      "warmupSamples": [
+        699.8000000119209
+      ],
+      "rawSamples": [
+        1233.2999999821186,
+        959.5999999940395,
+        898
+      ],
+      "stats": {
+        "min": 898,
+        "max": 1233.2999999821186,
+        "mean": 1030.2999999920528,
+        "p50": 959.5999999940395,
+        "p95": 1233.2999999821186,
+        "p99": 1233.2999999821186
+      }
+    },
+    {
+      "engine": "moyodb",
+      "workloadName": "worker_roundtrip_overhead",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 1000,
+      "keySize": 16,
+      "valueSize": 64,
+      "batchSize": 1,
+      "transactionBoundaries": "measurement calls stats() 1,000 times through the SDK worker boundary",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "MoyoDB SDK worker transport overhead; IndexedDB baseline is marked not applicable.",
+      "status": "ok",
+      "warmupSamples": [
+        693.7000000178814
+      ],
+      "rawSamples": [
+        650.6999999880791,
+        657.2000000178814,
+        631.9000000059605
+      ],
+      "stats": {
+        "min": 631.9000000059605,
+        "max": 657.2000000178814,
+        "mean": 646.6000000039736,
+        "p50": 650.6999999880791,
+        "p95": 657.2000000178814,
+        "p99": 657.2000000178814
+      }
+    },
+    {
+      "engine": "indexeddb",
+      "workloadName": "worker_roundtrip_overhead",
+      "browser": {
+        "name": "HeadlessChrome",
+        "version": "149",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "platform": "Windows"
+      },
+      "timestamp": "2026-06-25T19:03:04.806Z",
+      "recordCount": 1000,
+      "keySize": 16,
+      "valueSize": 64,
+      "batchSize": 1,
+      "transactionBoundaries": "measurement calls stats() 1,000 times through the SDK worker boundary",
+      "warmupCount": 1,
+      "sampleCount": 3,
+      "notes": "MoyoDB SDK worker transport overhead; IndexedDB baseline is marked not applicable. Not applicable to indexeddb.",
+      "status": "skipped",
+      "warmupSamples": [],
+      "rawSamples": []
+    }
+  ],
+  "notes": [
+    "Raw samples are wall-clock milliseconds measured with performance.now() inside the browser page.",
+    "Warmup samples are recorded separately and excluded from percentiles.",
+    "Setup/preload/data generation/open/delete are outside the timed region unless the workload name explicitly says open/init or the notes say otherwise.",
+    "MoyoDB browser measurements include SDK, Worker, WASM, and OPFS overhead unless a diagnostic workload isolates a lower layer.",
+    "Native Rust microbenchmarks measure the engine core only. Browser benchmarks measure SDK/WASM/Worker/OPFS overhead. Do not compare them as if they measure the same path.",
+    "IndexedDB is measured with the same record counts, key/value sizes, batch sizes, and transaction boundaries for comparable workloads."
+  ]
+}

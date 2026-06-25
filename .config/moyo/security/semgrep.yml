@@ -1,0 +1,38 @@
+rules:
+  - id: moyo-ts-no-eval
+    languages: [typescript, javascript]
+    message: 'Do not evaluate dynamic strings in the SDK or tooling.'
+    severity: ERROR
+    pattern-either:
+      - pattern: eval($X)
+      - pattern: new Function(...)
+  - id: moyo-ts-no-shell-string-concat
+    languages: [typescript, javascript]
+    message: 'Avoid string-built shell commands; pass argv arrays to child_process APIs.'
+    severity: ERROR
+    pattern-either:
+      - pattern: child_process.exec($CMD, ...)
+      - pattern: exec($CMD, ...)
+  - id: moyo-ts-no-postmessage-wildcard
+    languages: [typescript, javascript]
+    message: "postMessage with '*' must be reviewed; use an explicit origin when crossing origins."
+    severity: WARNING
+    pattern: $TARGET.postMessage($MSG, "*")
+  - id: moyo-rust-no-unwrap-in-core
+    languages: [rust]
+    paths:
+      include:
+        - '**/crates/engine/src/**'
+    message: 'Avoid unwrap/expect in Rust engine core; propagate typed errors instead.'
+    severity: WARNING
+    pattern-either:
+      - pattern: $X.unwrap()
+      - pattern: $X.expect($MSG)
+  - id: moyo-lean-no-sorry
+    languages: [generic]
+    paths:
+      include:
+        - '**/proofs/moyodb_proofs/**/*.lean'
+    message: 'Lean proof artifacts must not contain sorry/admit placeholders.'
+    severity: ERROR
+    pattern-regex: '\b(sorry|admit|sorryAx)\b'

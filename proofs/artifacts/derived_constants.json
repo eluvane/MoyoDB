@@ -1,0 +1,37 @@
+{
+  "format_version": 1,
+  "superblock_magic": "STKDB001",
+  "wal_magic": "WAL1",
+  "page_magic": "PAG1",
+  "page_size": 4096,
+  "superblock_slot_size": 4096,
+  "inline_value_limit": 1024,
+  "file_kinds": {
+    "manifest": 0,
+    "main": 1,
+    "wal": 2
+  },
+  "page_kinds": {
+    "leaf": 1,
+    "internal": 2,
+    "overflow": 3
+  },
+  "value_kinds": {
+    "inline": 1,
+    "overflow": 2
+  },
+  "record_tags": {
+    "page_image": 1,
+    "commit": 2
+  },
+  "limits": {
+    "store_name_bytes": 255,
+    "key_bytes": 1024,
+    "value_bytes": 8388608
+  },
+  "failpoints": [
+    "after_wal_flush",
+    "after_main_flush",
+    "before_superblock_flush"
+  ]
+}

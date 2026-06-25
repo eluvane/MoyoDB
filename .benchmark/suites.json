@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "project": "MoyoDB",
+  "suites": [
+    {
+      "id": "rust-criterion",
+      "command": "npm run bench:rust",
+      "smokeCommand": "npm run bench:rust:compile",
+      "scope": "Native Rust storage engine microbenchmarks for BTree, WAL, recovery and transaction paths."
+    },
+    {
+      "id": "browser-sdk-wasm-opfs",
+      "command": "npm run bench:browser",
+      "smokeCommand": "npm run bench:collect:smoke",
+      "scope": "Browser SDK, Web Worker, WASM, OPFS and IndexedDB comparison workloads."
+    },
+    {
+      "id": "benchmark-compare",
+      "command": "npm run bench:compare",
+      "smokeCommand": "npm run bench:compare -- --current .benchmark/current/baseline.json",
+      "scope": "Regression visibility against a prior benchmark-baseline artifact."
+    }
+  ]
+}

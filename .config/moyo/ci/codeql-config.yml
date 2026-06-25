@@ -1,0 +1,14 @@
+name: 'MoyoDB CodeQL paranoid profile'
+queries:
+  - uses: security-and-quality
+paths:
+  - packages/sdk
+  - .github/workflows
+paths-ignore:
+  - .benchmark
+  - .bench
+  - node_modules
+  - packages/sdk/dist
+  - packages/sdk/public/engine
+  - target
+  - proofs/moyodb_proofs/.lake

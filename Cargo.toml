@@ -1,0 +1,26 @@
+[workspace]
+members = [ "crates/engine" ]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+crc32fast = "1.4"
+serde = { version = "1.0", features = [ "derive" ] }
+serde_bytes = "0.11"
+serde_json = "1.0"
+thiserror = "2.0"
+zerocopy = { version = "0.7", features = [ "derive" ] }
+
+[workspace.lints.rust]
+rust_2018_idioms = { level = "deny", priority = -1 }
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+undocumented_unsafe_blocks = "deny"

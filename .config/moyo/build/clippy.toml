@@ -1,0 +1,8 @@
+# Canonical Clippy config. Loaded with CLIPPY_CONF_DIR=.config/moyo/build.
+# Only Clippy-supported configuration keys live here; lint levels are in Cargo.toml.
+avoid-breaking-exported-api = true
+msrv = "1.81.0"
+allowed-duplicate-crates = []
+disallowed-names = ["foo", "bar", "baz", "quux", "tmp"]
+too-many-arguments-threshold = 7
+type-complexity-threshold = 250
