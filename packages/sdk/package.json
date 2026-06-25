@@ -24,7 +24,7 @@
   "devDependencies": {
     "@playwright/test": "1.61.1",
     "typescript": "6.0.3",
-    "vite": "7.3.6"
+    "vite": "8.1.0"
   },
   "description": "Experimental Rust/WASM transactional key-value storage engine SDK for browser apps, backed by OPFS.",
   "license": "MIT OR Apache-2.0",
