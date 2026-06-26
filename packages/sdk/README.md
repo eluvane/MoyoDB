@@ -10,7 +10,7 @@ The package name is lowercase/scoped for npm compatibility. The public brand is 
 npm install @moyodb/sdk
 ```
 
-This repository snapshot is prepared for `v0.1.0-alpha.1` package-readiness checks; publishing is not performed automatically.
+This repository snapshot is prepared for `v0.0.0-alpha.1` package-readiness checks; publishing is not performed automatically.
 
 ## Usage
 
