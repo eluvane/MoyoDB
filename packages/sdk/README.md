@@ -7,10 +7,10 @@ The package name is lowercase/scoped for npm compatibility. The public brand is 
 ## Install
 
 ```bash
-npm install @moyodb/sdk
+npm install @moyodb/sdk@alpha
 ```
 
-This repository snapshot is prepared for `v0.0.0-alpha.1` package-readiness checks; publishing is not performed automatically.
+Current alpha: `@moyodb/sdk@0.0.0-alpha.1`.
 
 ## Usage
 

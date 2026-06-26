@@ -19,16 +19,12 @@ Experimental Rust/WASM transactional key-value storage engine for browser apps.
 
 It provides ordered byte keys, range scans, snapshots, TTL, recovery checks, and a TypeScript SDK that talks to a dedicated Worker-backed runtime over OPFS.
 
-> Status: **alpha / pre-public release**. MoyoDB is useful for experiments and early integrations. Do not use it for production data without your own durability and compatibility validation.
+> Status: **alpha**. MoyoDB is useful for experiments and early integrations. Do not use it for production data without your own durability and compatibility validation.
 
 ## Quick start
 
 ```bash
-rustup target add wasm32-unknown-unknown
-cargo install --locked wasm-pack --version 0.15.0
-npm ci
-npm run build
-npm run test:sdk
+npm install @moyodb/sdk@alpha
 ```
 
 ```ts
@@ -44,7 +40,7 @@ console.log(value ? utf8Decode(value) : null);
 await db.close();
 ```
 
-The npm package name is `@moyodb/sdk`. The human-facing project name is **MoyoDB**.
+The current alpha package is `@moyodb/sdk@0.0.0-alpha.1`. The human-facing project name is **MoyoDB**.
 
 ## Limitations
 
