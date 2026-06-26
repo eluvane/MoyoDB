@@ -11,6 +11,8 @@ const COMPRESSION_TAG_DEFLATE = 2;
 const STORE_FLAG_COMPRESSION_SHIFT = 2;
 const STORE_FLAG_COMPRESSION_MASK = 0b11 << STORE_FLAG_COMPRESSION_SHIFT;
 export const STORE_VALUE_COMPRESSION_THRESHOLD = 1024;
+const MAX_DECOMPRESSED_STORE_VALUE_BYTES = 8 * 1024 * 1024;
+const MAX_DECOMPRESSED_SNAPSHOT_BYTES = 256 * 1024 * 1024;
 const CRC32_TABLE = (() => {
     const table = new Uint32Array(256);
     for (let index = 0; index < 256; index += 1) {
@@ -126,7 +128,12 @@ async function compressBytes(data: Uint8Array, kind: CompressionKind): Promise<U
         throw namedError('InternalError', `failed to compress bytes with ${kind}: ${String(error)}`);
     }
 }
-async function decompressBytes(data: Uint8Array, kind: CompressionKind, label: string): Promise<Uint8Array> {
+async function decompressBytes(
+    data: Uint8Array,
+    kind: CompressionKind,
+    label: string,
+    maxOutputBytes?: number
+): Promise<Uint8Array> {
     ensureCompressionRuntime();
     let stream: ReadableStream<Uint8Array>;
     try {
@@ -135,10 +142,46 @@ async function decompressBytes(data: Uint8Array, kind: CompressionKind, label: s
         throw compressionRuntimeUnavailable();
     }
     try {
-        return new Uint8Array(await new Response(stream).arrayBuffer());
+        return await readBoundedStream(stream, label, maxOutputBytes);
     } catch (error) {
         throw namedError('CorruptionError', `failed to decompress ${label}: ${String(error)}`);
     }
+}
+
+async function readBoundedStream(
+    stream: ReadableStream<Uint8Array>,
+    label: string,
+    maxOutputBytes?: number
+): Promise<Uint8Array> {
+    const reader = stream.getReader();
+    const chunks: Uint8Array[] = [];
+    let totalBytes = 0;
+    try {
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) {
+                break;
+            }
+            if (value === undefined) {
+                continue;
+            }
+            totalBytes += value.byteLength;
+            if (maxOutputBytes !== undefined && totalBytes > maxOutputBytes) {
+                await reader.cancel(`decompressed ${label} exceeded ${maxOutputBytes} bytes`);
+                throw namedError('CorruptionError', `decompressed ${label} exceeds ${maxOutputBytes} byte limit`);
+            }
+            chunks.push(value);
+        }
+    } finally {
+        reader.releaseLock();
+    }
+    const out = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+        out.set(chunk, offset);
+        offset += chunk.byteLength;
+    }
+    return out;
 }
 export function compressionFromStoreFlags(flags: number): CompressionOption {
     const encoded = (flags & STORE_FLAG_COMPRESSION_MASK) >>> STORE_FLAG_COMPRESSION_SHIFT;
@@ -210,7 +253,13 @@ export async function decodeStoreValueRecord(
         }
         return payload.slice();
     }
-    const decompressed = await decompressBytes(payload, compression, `value record (${compression})`);
+    if (header.rawLength > MAX_DECOMPRESSED_STORE_VALUE_BYTES) {
+        throw namedError(
+            'CorruptionError',
+            `compressed value advertises ${header.rawLength} decompressed bytes, exceeding the ${MAX_DECOMPRESSED_STORE_VALUE_BYTES} byte limit`
+        );
+    }
+    const decompressed = await decompressBytes(payload, compression, `value record (${compression})`, header.rawLength);
     if (decompressed.byteLength !== header.rawLength) {
         throw namedError(
             'CorruptionError',
@@ -245,7 +294,18 @@ export async function unwrapSnapshotCompression(snapshot: Uint8Array): Promise<U
     if (crc32(payload) !== header.payloadChecksum) {
         throw namedError('CorruptionError', 'snapshot compression checksum mismatch');
     }
-    const decompressed = await decompressBytes(payload, compression, `snapshot export (${compression})`);
+    if (header.rawLength > MAX_DECOMPRESSED_SNAPSHOT_BYTES) {
+        throw namedError(
+            'CorruptionError',
+            `compressed snapshot advertises ${header.rawLength} decompressed bytes, exceeding the ${MAX_DECOMPRESSED_SNAPSHOT_BYTES} byte limit`
+        );
+    }
+    const decompressed = await decompressBytes(
+        payload,
+        compression,
+        `snapshot export (${compression})`,
+        header.rawLength
+    );
     if (decompressed.byteLength !== header.rawLength) {
         throw namedError(
             'CorruptionError',

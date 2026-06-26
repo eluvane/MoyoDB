@@ -180,3 +180,41 @@ test('compressed snapshot export/import roundtrip restores values and indexes', 
     expect(result.restoredTitle).toBe('Compression guide');
     expect(result.indexedTitle).toBe('Compression guide');
 });
+
+test('compressed snapshot import rejects oversized advertised output before inflating', async ({ page }) => {
+    const source = uniqueDbName('compression-oversized-source');
+    const target = uniqueDbName('compression-oversized-target');
+    await prepareMoyoDbPage(page);
+    await requireCompressionStreams(page);
+    const result = await page.evaluate(
+        async ({ sourceName, targetName }) => {
+            const sourceDb = await window.moyodb.openDB(sourceName);
+            let snapshot: Uint8Array;
+            try {
+                await sourceDb.createStore('docs');
+                await sourceDb.put('docs', window.moyodb.utf8Encode('k'), window.moyodb.utf8Encode('v'));
+                snapshot = await sourceDb.exportSnapshot({ compression: 'gzip' });
+            } finally {
+                await sourceDb.close();
+            }
+
+            new DataView(snapshot.buffer, snapshot.byteOffset, snapshot.byteLength).setUint32(10, 0xffff_ffff, true);
+
+            const targetDb = await window.moyodb.openDB(targetName);
+            try {
+                await targetDb.importSnapshot(snapshot);
+                return null;
+            } catch (error) {
+                return {
+                    name: error instanceof Error ? error.name : null,
+                    message: error instanceof Error ? error.message : String(error)
+                };
+            } finally {
+                await targetDb.close();
+            }
+        },
+        { sourceName: source, targetName: target }
+    );
+    expect(result?.name).toBe('CorruptionError');
+    expect(result?.message).toContain('exceeding the 268435456 byte limit');
+});
