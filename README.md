@@ -40,7 +40,6 @@ console.log(value ? utf8Decode(value) : null);
 await db.close();
 ```
 
-The current alpha package is `@moyodb/sdk@0.0.0-alpha.3`. The human-facing project name is **MoyoDB**.
 
 ## Limitations
 
