@@ -10,7 +10,7 @@ The package name is lowercase/scoped for npm compatibility. The public brand is 
 npm install @moyodb/sdk@alpha
 ```
 
-Current alpha: `@moyodb/sdk@0.0.0-alpha.2`.
+Current alpha: `@moyodb/sdk@0.0.0-alpha.3`.
 
 ## Usage
 
