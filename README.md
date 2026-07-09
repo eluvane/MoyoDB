@@ -40,7 +40,6 @@ console.log(value ? utf8Decode(value) : null);
 await db.close();
 ```
 
-
 ## Limitations
 
 - Alpha software; storage format and SDK API may still change.
