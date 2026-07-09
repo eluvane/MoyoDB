@@ -1,7 +1,10 @@
 {
   "$schema": "https://unpkg.com/knip@latest/schema.json",
   "ignoreBinaries": ["lake", "python", "gitleaks", "semgrep", "wasm-pack", "playwright", "osv-scanner"],
-  "ignoreDependencies": ["actionlint"],
+  "ignoreDependencies": [
+    "actionlint",
+    "@typescript/native"
+  ],
   "ignoreIssues": {
     "packages/sdk/src/compression.ts": ["exports"],
     "packages/sdk/src/worker-protocol.ts": ["exports"],
