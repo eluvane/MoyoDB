@@ -25,7 +25,7 @@
     "@playwright/test": "1.61.1",
     "@typescript/native": "npm:typescript@7.0.2",
     "typescript": "npm:@typescript/typescript6@6.0.2",
-    "vite": "7.3.6"
+    "vite": "8.1.4"
   },
   "description": "Experimental Rust/WASM transactional key-value storage engine SDK for browser apps, backed by OPFS.",
   "license": "MIT OR Apache-2.0",
