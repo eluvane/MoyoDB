@@ -12,7 +12,7 @@ test('compressed stores decode transparently for get/scan and managed indexes', 
     await requireCompressionStreams(page);
     const result = await page.evaluate(async (name) => {
         const encode = window.moyodb.utf8Encode;
-        const decodeJson = window.moyodb.jsonDecode as <T>(bytes: Uint8Array) => T;
+        const decodeJson = window.moyodb.jsonDecode;
         const largeBody = 'moyodb compression payload '.repeat(512);
         const db = await window.moyodb.openDB(name, {
             version: 1,
@@ -48,7 +48,7 @@ test('compressed stores decode transparently for get/scan and managed indexes', 
                         rows.length > 0
                             ? decodeJson<{
                                   title: string;
-                              }>(rows[0]!.value).title
+                              }>(rows[0].value).title
                             : null,
                     indexedTitle: indexed
                         ? decodeJson<{
@@ -115,7 +115,7 @@ test('compressed snapshot export/import roundtrip restores values and indexes', 
     const result = await page.evaluate(
         async ({ sourceName, targetName }) => {
             const encode = window.moyodb.utf8Encode;
-            const decodeJson = window.moyodb.jsonDecode as <T>(bytes: Uint8Array) => T;
+            const decodeJson = window.moyodb.jsonDecode;
             const body = 'snapshot-compression-body '.repeat(2048);
             const sourceDb = await window.moyodb.openDB(sourceName, {
                 version: 1,
@@ -157,7 +157,7 @@ test('compressed snapshot export/import roundtrip restores values and indexes', 
                             rows.length > 0
                                 ? decodeJson<{
                                       title: string;
-                                  }>(rows[0]!.value).title
+                                  }>(rows[0].value).title
                                 : null,
                         indexedTitle: indexed
                             ? decodeJson<{

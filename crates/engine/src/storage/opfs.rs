@@ -33,7 +33,11 @@ mod wasm_impl {
         fn opfsSwapActiveGeneration(
             encoded_db_name: &str,
             generation_name: &str,
+            expected_current_generation: Option<String>,
         ) -> std::result::Result<Promise, JsValue>;
+        #[wasm_bindgen(catch)]
+        fn opfsReadActiveGeneration(encoded_db_name: &str)
+            -> std::result::Result<Promise, JsValue>;
         #[wasm_bindgen(catch)]
         fn opfsCleanupInactiveEntries(
             encoded_db_name: &str,
@@ -42,7 +46,13 @@ mod wasm_impl {
         fn opfsDbDirectorySize(encoded_db_name: &str) -> std::result::Result<Promise, JsValue>;
         #[wasm_bindgen(catch)]
         fn opfsRemoveDb(encoded_db_name: &str) -> std::result::Result<Promise, JsValue>;
-        fn opfsReadAt(session_id: u32, file_kind: u32, offset: u64, len: usize) -> Uint8Array;
+        #[wasm_bindgen(catch)]
+        fn opfsReadAt(
+            session_id: u32,
+            file_kind: u32,
+            offset: u64,
+            len: usize,
+        ) -> std::result::Result<Uint8Array, JsValue>;
         #[wasm_bindgen(catch)]
         fn opfsWriteAt(
             session_id: u32,
@@ -50,10 +60,18 @@ mod wasm_impl {
             offset: u64,
             bytes: &[u8],
         ) -> std::result::Result<u32, JsValue>;
-        fn opfsFlush(session_id: u32, file_kind: u32);
-        fn opfsLen(session_id: u32, file_kind: u32) -> u64;
-        fn opfsTruncate(session_id: u32, file_kind: u32, size: u64);
-        fn opfsCloseSession(session_id: u32);
+        #[wasm_bindgen(catch)]
+        fn opfsFlush(session_id: u32, file_kind: u32) -> std::result::Result<(), JsValue>;
+        #[wasm_bindgen(catch)]
+        fn opfsLen(session_id: u32, file_kind: u32) -> std::result::Result<u64, JsValue>;
+        #[wasm_bindgen(catch)]
+        fn opfsTruncate(
+            session_id: u32,
+            file_kind: u32,
+            size: u64,
+        ) -> std::result::Result<(), JsValue>;
+        #[wasm_bindgen(catch)]
+        fn opfsCloseSession(session_id: u32) -> std::result::Result<(), JsValue>;
     }
 
     #[derive(Debug, Clone, Deserialize)]
@@ -118,12 +136,32 @@ mod wasm_impl {
             Ok(info.generation_name)
         }
 
-        pub async fn swap_active_generation(db_name: &str, generation_name: &str) -> Result<()> {
+        pub async fn swap_active_generation(
+            db_name: &str,
+            generation_name: &str,
+            expected_current_generation: Option<String>,
+        ) -> Result<()> {
             let encoded = encode_db_name(db_name);
-            JsFuture::from(opfsSwapActiveGeneration(&encoded, generation_name).map_err(js_err)?)
+            JsFuture::from(
+                opfsSwapActiveGeneration(&encoded, generation_name, expected_current_generation)
+                    .map_err(js_err)?,
+            )
+            .await
+            .map_err(js_err)?;
+            Ok(())
+        }
+
+        pub async fn read_active_generation(db_name: &str) -> Result<Option<String>> {
+            let encoded = encode_db_name(db_name);
+            let value = JsFuture::from(opfsReadActiveGeneration(&encoded).map_err(js_err)?)
                 .await
                 .map_err(js_err)?;
-            Ok(())
+            if value.is_null() || value.is_undefined() {
+                return Ok(None);
+            }
+            value.as_string().map(Some).ok_or_else(|| {
+                EngineError::Storage("read active generation: expected string or null".into())
+            })
         }
 
         pub async fn cleanup_inactive_entries(db_name: &str) -> Result<()> {
@@ -153,7 +191,14 @@ mod wasm_impl {
 
     impl FileBackend for OpfsBackend {
         fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
-            Ok(opfsReadAt(self.session_id, self.file_kind, offset, len).to_vec())
+            let bytes = opfsReadAt(self.session_id, self.file_kind, offset, len).map_err(js_err)?;
+            if bytes.length() as usize != len {
+                return Err(EngineError::Storage(format!(
+                    "opfs short read buffer: expected {len}, got {}",
+                    bytes.length()
+                )));
+            }
+            Ok(bytes.to_vec())
         }
 
         fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
@@ -169,22 +214,19 @@ mod wasm_impl {
         }
 
         fn flush(&mut self) -> Result<()> {
-            opfsFlush(self.session_id, self.file_kind);
-            Ok(())
+            opfsFlush(self.session_id, self.file_kind).map_err(js_err)
         }
 
         fn len(&self) -> Result<u64> {
-            Ok(opfsLen(self.session_id, self.file_kind))
+            opfsLen(self.session_id, self.file_kind).map_err(js_err)
         }
 
         fn truncate(&mut self, size: u64) -> Result<()> {
-            opfsTruncate(self.session_id, self.file_kind, size);
-            Ok(())
+            opfsTruncate(self.session_id, self.file_kind, size).map_err(js_err)
         }
 
         fn close(&mut self) -> Result<()> {
-            opfsCloseSession(self.session_id);
-            Ok(())
+            opfsCloseSession(self.session_id).map_err(js_err)
         }
     }
 
@@ -219,13 +261,26 @@ mod wasm_impl {
         Ok(raw as u64)
     }
 
+    fn js_string_property(value: &JsValue, key: &str) -> Option<String> {
+        js_sys::Reflect::get(value, &JsValue::from_str(key))
+            .ok()
+            .and_then(|property| property.as_string())
+    }
+
     fn js_err(err: JsValue) -> EngineError {
-        let text = if let Some(s) = err.as_string() {
-            s
-        } else {
-            format!("{err:?}")
-        };
-        EngineError::Storage(text)
+        if let Some(text) = err.as_string() {
+            return EngineError::Storage(text);
+        }
+        let name = js_string_property(&err, "name").unwrap_or_default();
+        let message = js_string_property(&err, "message").unwrap_or_else(|| format!("{err:?}"));
+        match name.as_str() {
+            "CorruptionError" => EngineError::Corruption(message),
+            "DatabaseBusyError" | "NoModificationAllowedError" | "InvalidStateError" => {
+                EngineError::DatabaseBusy(message)
+            }
+            "" | "Error" | "StorageError" => EngineError::Storage(message),
+            other => EngineError::Storage(format!("{other}: {message}")),
+        }
     }
 }
 
@@ -278,7 +333,15 @@ mod native_impl {
             unsupported_opfs()
         }
 
-        pub async fn swap_active_generation(_db_name: &str, _generation_name: &str) -> Result<()> {
+        pub async fn swap_active_generation(
+            _db_name: &str,
+            _generation_name: &str,
+            _expected_current_generation: Option<String>,
+        ) -> Result<()> {
+            unsupported_opfs()
+        }
+
+        pub async fn read_active_generation(_db_name: &str) -> Result<Option<String>> {
             unsupported_opfs()
         }
 

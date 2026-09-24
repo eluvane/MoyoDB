@@ -1,11 +1,14 @@
 import { exposeWorkerApi } from './worker-server';
 import {
+    packedOptionalValues,
     unpackPackedBatchOpKeys,
     unpackPackedBatchOps,
     unpackPackedBinaryList,
     unpackPackedBinaryPairKeys,
     unpackPackedBinaryPairs,
-    type PackedBatchOpKey
+    unpackPackedOptionalValues,
+    type PackedBatchOpKey,
+    type PackedOptionalValuesV1
 } from './worker-protocol';
 import type { CommitAppliedEvent, StoreChangeSet } from './change-events';
 import {
@@ -37,16 +40,18 @@ import {
     toPublicIndexDefinitions,
     type NormalizedIndexDef
 } from './indexing';
-import type { WorkerApi, WorkerOpenRequest } from './worker-api';
+import type { AutocommitCommand, IndexScanPage, WorkerApi, WorkerOpenRequest } from './worker-api';
 import type {
     BatchOp,
     ChangeFeed,
     ChangeFeedOptions,
+    ChangeFeedSettings,
     CompactionResult,
     CreateStoreOptions,
     DbChange,
     DbStats,
     DebugFailpoint,
+    EngineHealth,
     ExportSnapshotOptions,
     IndexDef,
     PutOptions,
@@ -81,6 +86,7 @@ type WasmDbStats = Omit<
     | 'manifest_len'
     | 'main_len'
     | 'wal_len'
+    | 'health'
 > & {
     db_id: number | bigint;
     catalog_root_page_id: number | bigint;
@@ -90,6 +96,70 @@ type WasmDbStats = Omit<
     manifest_len: number | bigint;
     main_len: number | bigint;
     wal_len: number | bigint;
+    health: WasmEngineHealth;
+};
+type WasmEngineHealth =
+    | { state: 'healthy' }
+    | { state: 'recoveryRequired'; reason: string; pendingTxid?: number | bigint | null }
+    | { state: 'closed' };
+type WasmRecoveryReport = {
+    lastCommittedTxid: number | bigint;
+    pendingTxid?: number | bigint | null;
+    pendingCommitted: boolean;
+};
+type WasmChangeFeedPolicy = {
+    enabled: boolean;
+    retainTxids?: number | bigint | null;
+};
+type WasmEngine = {
+    open(name: string, options: unknown): Promise<void>;
+    openGeneration(name: string, generationName: string, options: unknown): Promise<void>;
+    /** Checkpoints when healthy, then releases the files. */
+    close(): void;
+    /** Releases the files without writing anything. */
+    abandon(): void;
+    health(): WasmEngineHealth;
+    needs_recovery(): boolean;
+    recover(): WasmRecoveryReport;
+    checkpoint(): void;
+    compact_into(target: WasmEngine): WasmU64;
+    change_feed_policy(): WasmChangeFeedPolicy;
+    set_change_feed_policy(txId: WasmU64, policy: { enabled: boolean; retainTxids: number | null }): void;
+    begin_tx(mode: TxMode): WasmU64;
+    commit_tx(txId: WasmU64): WasmU64;
+    rollback_tx(txId: WasmU64): void;
+    create_store(txId: WasmU64, name: string, options?: unknown): void;
+    drop_store(txId: WasmU64, name: string): void;
+    clear_store(txId: WasmU64, name: string): void;
+    get(txId: WasmU64, store: string, key: Uint8Array): Uint8Array | null;
+    get_many(txId: WasmU64, store: string, keys: Array<Uint8Array>): Array<Uint8Array | null>;
+    /** Packed optional values: u32 count | count x u32 length (u32::MAX = missing) | bytes. */
+    get_many_packed(txId: WasmU64, store: string, keys: Uint8Array): Uint8Array;
+    /** Key metadata only; the value is never materialized. */
+    has(txId: WasmU64, store: string, key: Uint8Array): boolean;
+    /** Returns whether a live value existed before the write. */
+    put(txId: WasmU64, store: string, key: Uint8Array, value: Uint8Array, options?: unknown): boolean;
+    put_many(txId: WasmU64, store: string, entries: Array<[Uint8Array, Uint8Array]>, options?: unknown): boolean[];
+    /** One byte per entry: 1 when a live value existed before the write. */
+    put_many_packed(txId: WasmU64, store: string, entries: Uint8Array, options?: unknown): Uint8Array;
+    delete(txId: WasmU64, store: string, key: Uint8Array): boolean;
+    delete_many(txId: WasmU64, store: string, keys: Array<Uint8Array>): boolean[];
+    /** One byte per key: 1 when a live value was deleted. */
+    delete_many_packed(txId: WasmU64, store: string, keys: Uint8Array): Uint8Array;
+    apply_batch(txId: WasmU64, store: string, ops: Array<BatchOp>): WasmBatchOutcome[];
+    /** One byte per op: baselineExists for puts, deleted for deletes. */
+    apply_batch_packed(txId: WasmU64, store: string, ops: Uint8Array): Uint8Array;
+    scan(txId: WasmU64, store: string, range: unknown): unknown;
+    changes_since(txId: WasmU64, options?: unknown): unknown;
+    get_schema_version(): WasmU64;
+    export_snapshot(): Uint8Array;
+    list_store_configs(): unknown;
+    import_snapshot(data: Uint8Array): WasmU64;
+    reset(): WasmU64;
+    list_stores(): unknown;
+    set_schema_version(txId: WasmU64, version: WasmU64): void;
+    stats(): unknown;
+    set_failpoint(failpoint: string | null): void;
 };
 type WasmModule = {
     default: (
@@ -99,51 +169,27 @@ type WasmModule = {
     prepareRebuildTarget(name: string): Promise<{
         generationName: string;
     }>;
-    swapActiveGeneration(name: string, generationName: string): Promise<void>;
+    /**
+     * Publishes `generationName` as the active generation, but only if the
+     * control file still names `expectedCurrent` (`null` = no control file).
+     * The written control file is read back and verified before resolving.
+     */
+    swapActiveGeneration(name: string, generationName: string, expectedCurrent: string | null): Promise<void>;
+    /** Active generation name, `null` when there is no control file; rejects on a corrupt one. */
+    readActiveGeneration(name: string): Promise<string | null>;
     cleanupInactiveEntries(name: string): Promise<void>;
     dbDirectorySize(name: string): Promise<number>;
-    WasmEngine: new () => {
-        open(name: string, options: unknown): Promise<void>;
-        openGeneration(name: string, generationName: string, options: unknown): Promise<void>;
-        close(): void;
-        begin_tx(mode: TxMode): WasmU64;
-        commit_tx(txId: WasmU64): WasmU64;
-        rollback_tx(txId: WasmU64): void;
-        create_store(txId: WasmU64, name: string, options?: unknown): void;
-        drop_store(txId: WasmU64, name: string): void;
-        clear_store(txId: WasmU64, name: string): void;
-        get(txId: WasmU64, store: string, key: Uint8Array): Uint8Array | null;
-        get_many(txId: WasmU64, store: string, keys: Array<Uint8Array>): Array<Uint8Array | null>;
-        get_many_packed(txId: WasmU64, store: string, keys: Uint8Array): Array<Uint8Array | null>;
-        has(txId: WasmU64, store: string, key: Uint8Array): boolean;
-        put(txId: WasmU64, store: string, key: Uint8Array, value: Uint8Array, options?: unknown): void;
-        put_many(txId: WasmU64, store: string, entries: Array<[Uint8Array, Uint8Array]>, options?: unknown): boolean[];
-        put_many_packed(txId: WasmU64, store: string, entries: Uint8Array, options?: unknown): boolean[];
-        delete(txId: WasmU64, store: string, key: Uint8Array): boolean;
-        delete_many(txId: WasmU64, store: string, keys: Array<Uint8Array>): boolean[];
-        delete_many_packed(txId: WasmU64, store: string, keys: Uint8Array): boolean[];
-        apply_batch(txId: WasmU64, store: string, ops: Array<BatchOp>): WasmBatchOutcome[];
-        apply_batch_packed(txId: WasmU64, store: string, ops: Uint8Array): WasmBatchOutcome[];
-        scan(txId: WasmU64, store: string, range: unknown): unknown;
-        changes_since(txId: WasmU64, options?: unknown): unknown;
-        get_schema_version(): WasmU64;
-        export_snapshot(): Uint8Array;
-        list_store_configs(): unknown;
-        import_snapshot(data: Uint8Array): WasmU64;
-        reset(): WasmU64;
-        list_stores(): unknown;
-        set_schema_version(txId: WasmU64, version: WasmU64): void;
-        stats(): unknown;
-        set_failpoint(failpoint: string | null): void;
-    };
+    WasmEngine: new () => WasmEngine;
 };
-const nativeModuleImport = Function('moduleUrl', 'return import(moduleUrl)') as (moduleUrl: string) => Promise<unknown>;
 type WasmU64 = bigint;
 function toWasmU64(value: number | bigint): WasmU64 {
     return BigInt(value);
 }
 function fromWasmU64(value: number | bigint): number {
     return typeof value === 'bigint' ? Number(value) : value;
+}
+function fromOptionalWasmU64(value: number | bigint | null | undefined): number | null {
+    return value === null || value === undefined ? null : fromWasmU64(value);
 }
 function toWasmPutOptions(options: PutOptions): unknown {
     return options.ttl === undefined ? options : { ...options, ttl: toWasmU64(options.ttl) };
@@ -177,6 +223,8 @@ interface TrackedKeyChange {
 }
 interface TrackedStoreChanges {
     touched: boolean;
+    /** Latest store-level change; every tracked key change happened after it. */
+    storeLevel: 'clear' | 'drop' | null;
     keys: Map<string, TrackedKeyChange>;
 }
 type TrackedTxnChanges = Map<string, TrackedStoreChanges>;
@@ -184,6 +232,8 @@ type MaintenanceOperation = 'compact' | 'rebuild';
 const EMPTY_RANGE: Range = {};
 const EMPTY_VALUE = new Uint8Array(0);
 const MAX_ENGINE_KEY_BYTES = 1024;
+const INDEX_SCAN_PAGE_ROWS = 256;
+const INDEX_SCAN_RAW_CHUNK_ROWS = 512;
 const HEX_BYTE_STRINGS = Array.from({ length: 256 }, (_value, byte) => byte.toString(16).padStart(2, '0'));
 function getOrInsert<K, V>(map: Map<K, V>, key: K, create: () => V): V {
     const existing = map.get(key);
@@ -207,6 +257,14 @@ interface PersistenceBridgeResponse {
     type: typeof PERSISTENCE_BRIDGE_RESPONSE;
     id: number;
     granted: boolean;
+}
+function isPersistenceBridgeResponse(value: unknown): value is PersistenceBridgeResponse {
+    return (
+        isRecord(value) &&
+        value.type === PERSISTENCE_BRIDGE_RESPONSE &&
+        typeof value.id === 'number' &&
+        typeof value.granted === 'boolean'
+    );
 }
 class MainThreadPersistenceBridge {
     private port: MessagePort | null = null;
@@ -276,10 +334,10 @@ class MainThreadPersistenceBridge {
         if (data?.type !== PERSISTENCE_BRIDGE_INIT) {
             return;
         }
-        const port = event.ports[0];
-        if (!port) {
+        if (event.ports.length === 0) {
             return;
         }
+        const port = event.ports[0];
         if (this.port) {
             port.close();
             return;
@@ -292,8 +350,8 @@ class MainThreadPersistenceBridge {
         this.readyResolve = null;
     };
     private handleResponse = (event: MessageEvent<unknown>) => {
-        const data = event.data as PersistenceBridgeResponse | null;
-        if (!data || data.type !== PERSISTENCE_BRIDGE_RESPONSE) {
+        const data = event.data;
+        if (!isPersistenceBridgeResponse(data)) {
             return;
         }
         const pending = this.pending.get(data.id);
@@ -309,7 +367,7 @@ async function estimateOriginStorage(): Promise<{
     quota: number;
 }> {
     const storage = navigator.storage;
-    if (typeof storage?.estimate !== 'function') {
+    if (typeof storage.estimate !== 'function') {
         return { usage: 0, quota: 0 };
     }
     const estimate = await storage.estimate();
@@ -321,7 +379,7 @@ async function estimateOriginStorage(): Promise<{
 function bytesToHex(bytes: Uint8Array): string {
     let out = '';
     for (let index = 0; index < bytes.byteLength; index += 1) {
-        out += HEX_BYTE_STRINGS[bytes[index]!];
+        out += HEX_BYTE_STRINGS[bytes[index]];
     }
     return out;
 }
@@ -421,9 +479,6 @@ class OwnershipLease {
     private requestPromise: Promise<unknown> | null = null;
     private held = false;
     async acquire(dbName: string, ownerWaitMs: number): Promise<void> {
-        if (!navigator.locks) {
-            throw remoteError('UnsupportedPlatformError', 'navigator.locks is unavailable');
-        }
         const holdPromise = new Promise<void>((resolve) => {
             this.releaseResolver = resolve;
         });
@@ -473,7 +528,7 @@ class OwnershipLease {
         );
         try {
             await Promise.race([acquiredPromise, this.requestPromise]);
-        } catch (_err) {
+        } catch {
             if (!this.held) {
                 throw remoteError('DatabaseBusyError', `timed out waiting for ownership of ${dbName}`);
             }
@@ -495,14 +550,19 @@ class OwnershipLease {
 }
 class DbWorker implements WorkerApi {
     private dbName: string | null = null;
-    private engine: InstanceType<WasmModule['WasmEngine']> | null = null;
+    private engine: WasmEngine | null = null;
     private events: BroadcastChannel | null = null;
     private lease: OwnershipLease | null = null;
     private wasmReady: Promise<WasmModule> | null = null;
     private persistenceBridge = new MainThreadPersistenceBridge();
     private txChanges = new Map<number, TrackedTxnChanges>();
     private txModes = new Map<number, TxMode>();
+    /**
+     * Index schema each transaction runs against: the committed schema at
+     * `begin`, replaced by `reconcileIndexes`. Never mutated in place.
+     */
     private txIndexSchemas = new Map<number, NormalizedIndexDef[]>();
+    private txIndexSchemaChanged = new Set<number>();
     private txStoreCompression = new Map<number, Map<string, CompressionOption>>();
     private committedIndexes: NormalizedIndexDef[] | null = null;
     private committedStoreCompression: Map<string, CompressionOption> | null = null;
@@ -517,7 +577,7 @@ class DbWorker implements WorkerApi {
         this.dbName = request.dbName;
         this.events = new BroadcastChannel(`db:${request.dbName}:events`);
         this.lease = new OwnershipLease();
-        let engine: InstanceType<WasmModule['WasmEngine']> | null = null;
+        let engine: WasmEngine | null = null;
         try {
             await this.lease.acquire(request.dbName, request.options.ownerWaitMs);
             const wasm = await this.loadWasm();
@@ -526,6 +586,9 @@ class DbWorker implements WorkerApi {
                 create_if_missing: request.options.createIfMissing,
                 cache_pages: request.options.cachePages
             });
+            if (request.options.changeFeed) {
+                applyChangeFeedPolicy(engine, request.options.changeFeed);
+            }
             if (request.options.debugFailpoint) {
                 engine.set_failpoint(request.options.debugFailpoint);
             }
@@ -576,7 +639,8 @@ class DbWorker implements WorkerApi {
         let failure: unknown = null;
         try {
             this.rollbackAllTransactions();
-            this.engine?.close();
+            // The files are deleted next; checkpointing into them is wasted work.
+            this.engine?.abandon();
             const wasm = await this.loadWasm();
             await wasm.deleteDB(dbName);
             broadcastLifecycleEvent(dbName, 'db_deleted');
@@ -637,16 +701,20 @@ class DbWorker implements WorkerApi {
             throw remapError(failure);
         }
     }
-    async begin(mode: TxMode): Promise<number> {
+    begin(mode: TxMode): Promise<number> {
+        this.recoverEngineIfNeeded();
+        const indexSchema = this.loadCommittedIndexSchema();
+        const storeCompression = new Map(this.loadCommittedStoreCompression());
         const txId = fromWasmU64(this.withEngine((engine) => engine.begin_tx(mode)));
-        this.txChanges.set(txId, new Map());
+        this.txChanges.set(txId, new Map<string, TrackedStoreChanges>());
         this.txModes.set(txId, mode);
-        this.txStoreCompression.set(txId, new Map(this.loadCommittedStoreCompression()));
-        return txId;
+        this.txIndexSchemas.set(txId, indexSchema);
+        this.txStoreCompression.set(txId, storeCompression);
+        return Promise.resolve(txId);
     }
-    async commit(txId: number): Promise<number> {
-        const tracked = this.txChanges.get(txId) ?? new Map();
-        const indexOverride = this.txIndexSchemas.get(txId);
+    commit(txId: number): Promise<number> {
+        const tracked = this.txChanges.get(txId) ?? new Map<string, TrackedStoreChanges>();
+        const indexOverride = this.txIndexSchemaChanged.has(txId) ? this.txIndexSchemas.get(txId) : undefined;
         const storeCompressionSnapshot = this.txStoreCompression.get(txId);
         const txMode = this.txModes.get(txId);
         let txid: number;
@@ -654,7 +722,17 @@ class DbWorker implements WorkerApi {
             txid = fromWasmU64(this.withEngine((engine) => engine.commit_tx(toWasmU64(txId))));
         } catch (err) {
             this.cleanupTxState(txId);
-            throw err;
+            const recovery = this.recoverEngineIfNeeded();
+            // A durable commit is reported as committed. Injected failpoints
+            // stand for a crash, which never gets to report anything.
+            if (
+                !recovery?.pendingCommitted ||
+                recovery.pendingTxid === null ||
+                isNamedError(err, 'InjectedFailureError')
+            ) {
+                throw err;
+            }
+            txid = recovery.pendingTxid;
         }
         if (indexOverride) {
             this.committedIndexes = cloneNormalizedIndexDefinitions(indexOverride);
@@ -672,40 +750,61 @@ class DbWorker implements WorkerApi {
             };
             this.events.postMessage(event);
         }
-        return txid;
+        return Promise.resolve(txid);
     }
-    async rollback(txId: number): Promise<void> {
+    rollback(txId: number): Promise<void> {
         try {
             this.withEngine((engine) => engine.rollback_tx(toWasmU64(txId)));
         } finally {
             this.cleanupTxState(txId);
         }
+        return Promise.resolve();
     }
-    async createStore(txId: number, name: string, options: CreateStoreOptions = {}): Promise<void> {
+    async autocommit(mode: TxMode, command: AutocommitCommand, args: unknown[]): Promise<unknown> {
+        const txId = await this.begin(mode);
+        const method = this[command] as unknown as (...methodArgs: unknown[]) => Promise<unknown>;
+        let result: unknown;
+        try {
+            result = await method.apply(this, [txId, ...args]);
+        } catch (error) {
+            try {
+                await this.rollback(txId);
+            } catch {}
+            throw error;
+        }
+        if (mode === 'readwrite') {
+            await this.commit(txId);
+        } else {
+            await this.rollback(txId);
+        }
+        return result;
+    }
+    createStore(txId: number, name: string, options: CreateStoreOptions = {}): Promise<void> {
         const compression = options.compression ?? false;
         this.withEngine((engine) => engine.create_store(toWasmU64(txId), name, { compression }));
         this.recordStoreCompressionCreate(txId, name, compression);
         this.ensureInternalStoresForStore(txId, name);
         this.markStoreTouched(txId, name);
+        return Promise.resolve();
     }
-    async dropStore(txId: number, name: string): Promise<void> {
-        const keys = this.loadStoreKeys(txId, name);
+    dropStore(txId: number, name: string): Promise<void> {
         const defs = this.indexesForStoreInTx(txId, name);
         this.withEngine((engine) => engine.drop_store(toWasmU64(txId), name));
         this.recordStoreCompressionDrop(txId, name);
         for (const def of defs) {
             this.dropRawStoreIfExists(txId, def.internalStore);
         }
-        this.recordDeletedKeys(txId, name, keys);
+        this.recordStoreLevelChange(txId, name, 'drop');
+        return Promise.resolve();
     }
-    async clearStore(txId: number, name: string): Promise<void> {
-        const keys = this.loadStoreKeys(txId, name);
+    clearStore(txId: number, name: string): Promise<void> {
         const defs = this.indexesForStoreInTx(txId, name);
         this.withEngine((engine) => engine.clear_store(toWasmU64(txId), name));
         for (const def of defs) {
             this.clearRawStoreIfExists(txId, def.internalStore);
         }
-        this.recordDeletedKeys(txId, name, keys);
+        this.recordStoreLevelChange(txId, name, 'clear');
+        return Promise.resolve();
     }
     async get(txId: number, store: string, key: Uint8Array): Promise<Uint8Array | null> {
         return this.readStoreValue(txId, store, key);
@@ -716,24 +815,31 @@ class DbWorker implements WorkerApi {
             return values.map((value) => (value === null ? null : normalizeWasmBytes(value)));
         }
         return Promise.all(
-            values.map((value) =>
+            values.map(async (value) =>
                 value === null ? null : this.decodeStoreValue(txId, store, normalizeWasmBytes(value))
             )
         );
     }
-    async getManyPacked(txId: number, store: string, packedKeys: Uint8Array): Promise<Array<Uint8Array | null>> {
-        const values = this.withEngine((engine) => engine.get_many_packed(toWasmU64(txId), store, packedKeys));
+    async getManyPacked(
+        txId: number,
+        store: string,
+        packedKeys: Uint8Array
+    ): Promise<PackedOptionalValuesV1 | Array<Uint8Array | null>> {
+        const packed = normalizeWasmBytes(
+            this.withEngine((engine) => engine.get_many_packed(toWasmU64(txId), store, packedKeys))
+        );
         if (isInternalStoreName(store) || this.storeCompressionForTx(txId, store) === false) {
-            return values.map((value) => (value === null ? null : normalizeWasmBytes(value)));
+            // Raw values go back to the caller in the engine's own layout.
+            return packedOptionalValues(packed);
         }
         return Promise.all(
-            values.map((value) =>
-                value === null ? null : this.decodeStoreValue(txId, store, normalizeWasmBytes(value))
+            unpackPackedOptionalValues(packed).map(async (value) =>
+                value === null ? null : this.decodeStoreValue(txId, store, value)
             )
         );
     }
-    async has(txId: number, store: string, key: Uint8Array): Promise<boolean> {
-        return this.withEngine((engine) => engine.has(toWasmU64(txId), store, key));
+    has(txId: number, store: string, key: Uint8Array): Promise<boolean> {
+        return Promise.resolve(this.withEngine((engine) => engine.has(toWasmU64(txId), store, key)));
     }
     async put(
         txId: number,
@@ -743,11 +849,16 @@ class DbWorker implements WorkerApi {
         options: PutOptions = {}
     ): Promise<void> {
         const defs = this.indexesForStoreInTx(txId, store);
-        const trackedStore = this.getOrCreateTrackedStore(txId, store);
-        const keyId = bytesToHex(key);
-        const existing = trackedStore.keys.get(keyId);
+        if (defs.length === 0) {
+            const storedValue = await this.encodeStoreValueForWrite(txId, store, value);
+            const baselineExists = this.withEngine((engine) =>
+                engine.put(toWasmU64(txId), store, key, storedValue, toWasmPutOptions(options))
+            );
+            this.recordPutChange(txId, store, key, baselineExists);
+            return;
+        }
+        // Index maintenance needs the previous value to find its old index keys.
         const oldValue = await this.readStoreValue(txId, store, key);
-        const baselineExists = existing?.baselineExists ?? oldValue !== null;
         const plans = defs.map((def) => {
             const oldLogicalKey = oldValue === null ? null : extractLogicalIndexKey(def, oldValue);
             const newLogicalKey = extractLogicalIndexKey(def, value);
@@ -770,7 +881,9 @@ class DbWorker implements WorkerApi {
             await this.assertUniqueIndexAvailability(txId, plan.def, plan.newLogicalKey, key);
         }
         const storedValue = await this.encodeStoreValueForWrite(txId, store, value);
-        this.withEngine((engine) => engine.put(toWasmU64(txId), store, key, storedValue, toWasmPutOptions(options)));
+        const baselineExists = this.withEngine((engine) =>
+            engine.put(toWasmU64(txId), store, key, storedValue, toWasmPutOptions(options))
+        );
         for (const plan of plans) {
             if (plan.oldLogicalKey === null) {
                 continue;
@@ -787,7 +900,10 @@ class DbWorker implements WorkerApi {
             if (plan.oldLogicalKey !== null && bytesEqual(plan.oldLogicalKey, plan.newLogicalKey)) {
                 continue;
             }
-            this.putIndexEntry(txId, plan.def, plan.newPhysicalKey!, EMPTY_VALUE);
+            if (plan.newPhysicalKey === null) {
+                throw remoteError('InternalError', 'missing index entry key');
+            }
+            this.putIndexEntry(txId, plan.def, plan.newPhysicalKey, EMPTY_VALUE);
         }
         this.recordPutChange(txId, store, key, baselineExists);
     }
@@ -841,7 +957,7 @@ class DbWorker implements WorkerApi {
         if (keys.length === 0) {
             return;
         }
-        let baselines: boolean[];
+        let baselines: Uint8Array;
         try {
             baselines = this.withEngine((engine) =>
                 engine.put_many_packed(toWasmU64(txId), store, packedEntries, toWasmPutOptions(options))
@@ -860,9 +976,12 @@ class DbWorker implements WorkerApi {
         this.recordPutKeyChanges(txId, store, keys, baselines);
     }
     async delete(txId: number, store: string, key: Uint8Array): Promise<boolean> {
-        const oldValue = await this.readStoreValue(txId, store, key);
-        const defs = oldValue === null ? [] : this.indexesForStoreInTx(txId, store);
-        const oldLogicalKeys = defs.map((def) => ({ def, logicalKey: extractLogicalIndexKey(def, oldValue!) }));
+        const defs = this.indexesForStoreInTx(txId, store);
+        // Only index maintenance needs the old value; otherwise the engine's
+        // metadata answer is enough.
+        const oldValue = defs.length === 0 ? null : await this.readStoreValue(txId, store, key);
+        const oldLogicalKeys =
+            oldValue === null ? [] : defs.map((def) => ({ def, logicalKey: extractLogicalIndexKey(def, oldValue) }));
         const deleted = this.withEngine((engine) => engine.delete(toWasmU64(txId), store, key));
         if (!deleted) {
             this.recordDeleteChange(txId, store, key, false);
@@ -884,11 +1003,11 @@ class DbWorker implements WorkerApi {
         if (defs.length === 0) {
             let deleted: boolean[];
             try {
-                deleted = this.withEngine((engine) => engine.delete_many(toWasmU64(txId), store, keys)) as boolean[];
+                deleted = this.withEngine((engine) => engine.delete_many(toWasmU64(txId), store, keys));
             } catch (error) {
                 const partial = partialBooleanOutcomes(error);
                 for (let i = 0; i < partial.length && i < keys.length; i += 1) {
-                    this.recordDeleteChange(txId, store, keys[i]!, partial[i]!);
+                    this.recordDeleteChange(txId, store, keys[i], partial[i]);
                 }
                 throw error;
             }
@@ -899,7 +1018,7 @@ class DbWorker implements WorkerApi {
                 );
             }
             for (let i = 0; i < keys.length; i += 1) {
-                this.recordDeleteChange(txId, store, keys[i]!, deleted[i]!);
+                this.recordDeleteChange(txId, store, keys[i], deleted[i]);
             }
             return;
         }
@@ -917,15 +1036,13 @@ class DbWorker implements WorkerApi {
             await this.deleteMany(txId, store, keys);
             return;
         }
-        let deleted: boolean[];
+        let deleted: Uint8Array;
         try {
-            deleted = this.withEngine((engine) =>
-                engine.delete_many_packed(toWasmU64(txId), store, packedKeys)
-            ) as boolean[];
+            deleted = this.withEngine((engine) => engine.delete_many_packed(toWasmU64(txId), store, packedKeys));
         } catch (error) {
             const partial = partialBooleanOutcomes(error);
             for (let i = 0; i < partial.length && i < keys.length; i += 1) {
-                this.recordDeleteChange(txId, store, keys[i]!, partial[i]!);
+                this.recordDeleteChange(txId, store, keys[i], partial[i]);
             }
             throw error;
         }
@@ -936,7 +1053,7 @@ class DbWorker implements WorkerApi {
             );
         }
         for (let i = 0; i < keys.length; i += 1) {
-            this.recordDeleteChange(txId, store, keys[i]!, deleted[i]!);
+            this.recordDeleteChange(txId, store, keys[i], deleted[i] === 1);
         }
     }
     async applyBatch(txId: number, store: string, ops: Array<BatchOp>): Promise<void> {
@@ -948,9 +1065,7 @@ class DbWorker implements WorkerApi {
             const storedOps = await this.encodeBatchOpsForWrite(txId, store, ops);
             let outcomes: WasmBatchOutcome[];
             try {
-                outcomes = this.withEngine((engine) =>
-                    engine.apply_batch(toWasmU64(txId), store, storedOps)
-                ) as WasmBatchOutcome[];
+                outcomes = this.withEngine((engine) => engine.apply_batch(toWasmU64(txId), store, storedOps));
             } catch (error) {
                 this.recordBatchOutcomes(txId, store, ops, partialBatchOutcomes(error));
                 throw error;
@@ -986,37 +1101,74 @@ class DbWorker implements WorkerApi {
         if (ops.length === 0) {
             return;
         }
-        let outcomes: WasmBatchOutcome[];
+        let flags: Uint8Array;
         try {
-            outcomes = this.withEngine((engine) =>
-                engine.apply_batch_packed(toWasmU64(txId), store, packedOps)
-            ) as WasmBatchOutcome[];
+            flags = this.withEngine((engine) => engine.apply_batch_packed(toWasmU64(txId), store, packedOps));
         } catch (error) {
             this.recordBatchKeyOutcomes(txId, store, ops, partialBatchOutcomes(error));
             throw error;
         }
-        if (outcomes.length !== ops.length) {
+        if (flags.length !== ops.length) {
             throw remoteError(
                 'InternalError',
-                `apply_batch_packed outcome count mismatch: ${outcomes.length} != ${ops.length}`
+                `apply_batch_packed outcome count mismatch: ${flags.length} != ${ops.length}`
             );
         }
-        this.recordBatchKeyOutcomes(txId, store, ops, outcomes);
+        for (let i = 0; i < ops.length; i += 1) {
+            const op = ops[i];
+            if (op.kind === 'put') {
+                this.recordPutChange(txId, store, op.key, flags[i] === 1);
+            } else {
+                this.recordDeleteChange(txId, store, op.key, flags[i] === 1);
+            }
+        }
     }
     async scan(txId: number, store: string, range: Range): Promise<ScanItem[]> {
         return this.readStoreScan(txId, store, range);
     }
     async getByIndex(txId: number, store: string, indexName: string, key: Uint8Array): Promise<Uint8Array | null> {
         const def = this.resolveIndexDefinition(txId, store, indexName);
-        const rows = await this.loadVisibleIndexRows(txId, def, prefixRange(key));
-        return rows.length === 0 ? null : rows[0]!.value;
+        const page = await this.loadVisibleIndexPage(txId, def, prefixRange(key), null, 1);
+        return page.rows.length === 0 ? null : page.rows[0].value;
     }
     async scanByIndex(txId: number, store: string, indexName: string, range: Range = {}): Promise<ScanItem[]> {
         const def = this.resolveIndexDefinition(txId, store, indexName);
-        return this.loadVisibleIndexRows(txId, def, range);
+        const rows: ScanItem[] = [];
+        let remaining = range.limit ?? Number.POSITIVE_INFINITY;
+        let cursor: Uint8Array | null = null;
+        while (remaining > 0) {
+            const page = await this.loadVisibleIndexPage(
+                txId,
+                def,
+                range,
+                cursor,
+                Math.min(remaining, INDEX_SCAN_PAGE_ROWS)
+            );
+            rows.push(...page.rows);
+            remaining -= page.rows.length;
+            if (page.cursor === null) {
+                break;
+            }
+            cursor = page.cursor;
+        }
+        return rows;
     }
-    async getIndexes(): Promise<IndexDef[]> {
-        return toPublicIndexDefinitions(this.loadCommittedIndexSchema());
+    async scanByIndexPage(
+        txId: number,
+        store: string,
+        indexName: string,
+        range: Range,
+        cursor: Uint8Array | null,
+        limit: number
+    ): Promise<IndexScanPage> {
+        if (!Number.isSafeInteger(limit) || limit <= 0) {
+            throw remoteError('InvalidRangeError', 'index scan page limit must be a positive integer');
+        }
+        const def = this.resolveIndexDefinition(txId, store, indexName);
+        return this.loadVisibleIndexPage(txId, def, range, cursor, limit);
+    }
+    getIndexes(): Promise<IndexDef[]> {
+        return Promise.resolve(toPublicIndexDefinitions(this.loadCommittedIndexSchema()));
     }
     async reconcileIndexes(txId: number, indexes: IndexDef[]): Promise<void> {
         const target = normalizeIndexDefinitions(indexes);
@@ -1051,12 +1203,13 @@ class DbWorker implements WorkerApi {
             );
         }
         this.txIndexSchemas.set(txId, cloneNormalizedIndexDefinitions(target));
+        this.txIndexSchemaChanged.add(txId);
     }
-    async listStores(): Promise<string[]> {
-        return this.currentStoreNames();
+    listStores(): Promise<string[]> {
+        return Promise.resolve(this.currentStoreNames());
     }
-    async getVersion(): Promise<number> {
-        return fromWasmU64(this.withEngine((engine) => engine.get_schema_version()));
+    getVersion(): Promise<number> {
+        return Promise.resolve(fromWasmU64(this.withEngine((engine) => engine.get_schema_version())));
     }
     async changesSince(txId: number, options: ChangeFeedOptions = {}): Promise<ChangeFeed> {
         const visibleStores = options.stores?.filter((store) => !isInternalStoreName(store));
@@ -1095,8 +1248,9 @@ class DbWorker implements WorkerApi {
             changes: options.limit === undefined ? changes : changes.slice(0, options.limit)
         };
     }
-    async setSchemaVersion(txId: number, version: number): Promise<void> {
+    setSchemaVersion(txId: number, version: number): Promise<void> {
         this.withEngine((engine) => engine.set_schema_version(toWasmU64(txId), toWasmU64(version)));
+        return Promise.resolve();
     }
     async exportSnapshot(options: ExportSnapshotOptions = {}): Promise<Uint8Array> {
         const defs = cloneNormalizedIndexDefinitions(this.loadCommittedIndexSchema());
@@ -1120,7 +1274,10 @@ class DbWorker implements WorkerApi {
         }
         const defs = cloneNormalizedIndexDefinitions(this.loadCommittedIndexSchema());
         this.rollbackAllTransactions();
-        const stores = this.captureResetChanges();
+        const stores: StoreChangeSet[] = this.currentStoreNames().map((store) => ({
+            store,
+            changes: [{ key: new Uint8Array(0), kind: 'clear' }]
+        }));
         const txid = fromWasmU64(this.withEngine((engine) => engine.reset()));
         this.committedIndexes = [];
         await this.applyCommittedIndexSchema(defs);
@@ -1140,9 +1297,9 @@ class DbWorker implements WorkerApi {
     async rebuild(): Promise<CompactionResult> {
         return this.runCompactionOperation('rebuild');
     }
-    async stats(): Promise<DbStats> {
+    stats(): Promise<DbStats> {
         const stats = this.withEngine((engine) => engine.stats()) as WasmDbStats;
-        return {
+        return Promise.resolve({
             ...stats,
             db_id: fromWasmU64(stats.db_id),
             catalog_root_page_id: fromWasmU64(stats.catalog_root_page_id),
@@ -1152,8 +1309,9 @@ class DbWorker implements WorkerApi {
             manifest_len: fromWasmU64(stats.manifest_len),
             main_len: fromWasmU64(stats.main_len),
             wal_len: fromWasmU64(stats.wal_len),
+            health: normalizeEngineHealth(stats.health),
             store_count: this.currentStoreNames().length
-        };
+        });
     }
     async storageInfo(): Promise<StorageInfo> {
         const [dbSize, estimate, persisted] = await Promise.all([
@@ -1171,8 +1329,9 @@ class DbWorker implements WorkerApi {
     async requestPersistence(): Promise<boolean> {
         return this.persistenceBridge.persist();
     }
-    async setFailpoint(failpoint: DebugFailpoint): Promise<void> {
+    setFailpoint(failpoint: DebugFailpoint): Promise<void> {
         this.withEngine((engine) => engine.set_failpoint(failpoint));
+        return Promise.resolve();
     }
     private requireDbName(): string {
         if (!this.dbName) {
@@ -1219,6 +1378,16 @@ class DbWorker implements WorkerApi {
             this.cleanupTxState(txId);
         }
     }
+    /**
+     * Compaction publishes a new generation with a strict swap:
+     * 1. read the active generation (a corrupt control file aborts here);
+     * 2. stream every live row into a fresh generation inside the engine;
+     * 3. compare-and-swap the control file against the generation read in 1;
+     * 4. if the swap reports an error, re-read the control file to learn
+     *    which generation is actually active before deciding what to clean up.
+     * The old engine is abandoned, not closed: its files are no longer
+     * active, so it must not checkpoint into them.
+     */
     private async runCompactionOperation(operation: MaintenanceOperation): Promise<CompactionResult> {
         const dbName = this.requireDbName();
         if (this.maintenanceOperation) {
@@ -1230,45 +1399,55 @@ class DbWorker implements WorkerApi {
         this.maintenanceOperation = operation;
         const start = performance.now();
         const wasm = await this.loadWasm();
-        let rebuiltEngine: InstanceType<WasmModule['WasmEngine']> | null = null;
+        let rebuiltEngine: WasmEngine | null = null;
         let generationName: string | null = null;
-        let swapCommitted = false;
+        let published = false;
         try {
             const sizeBefore = await wasm.dbDirectorySize(dbName);
             const defs = cloneNormalizedIndexDefinitions(this.loadCommittedIndexSchema());
-            const snapshot = normalizeWasmBytes(
-                this.withEngine((engine) => engine.export_snapshot(), { allowDuringMaintenance: true })
-            );
             this.rollbackAllTransactions({ allowDuringMaintenance: true });
+            const expectedGeneration = await wasm.readActiveGeneration(dbName);
             generationName = (await wasm.prepareRebuildTarget(dbName)).generationName;
             rebuiltEngine = new wasm.WasmEngine();
             await rebuiltEngine.openGeneration(dbName, generationName, {
                 create_if_missing: true,
                 cache_pages: this.currentCachePages()
             });
-            rebuiltEngine.import_snapshot(snapshot);
-            if (defs.length > 0) {
+            const target = rebuiltEngine;
+            this.withEngine((engine) => engine.compact_into(target), { allowDuringMaintenance: true });
+            if (operation === 'rebuild' && defs.length > 0) {
+                // compact copies index entries as they are; rebuild regenerates
+                // them from the rows so stale entries do not survive.
                 const previousEngine = this.engine;
                 const previousMaintenance = this.maintenanceOperation;
-                this.engine = rebuiltEngine;
+                this.engine = target;
                 this.maintenanceOperation = null;
                 try {
                     this.committedIndexes = [];
+                    this.committedStoreCompression = null;
                     await this.applyCommittedIndexSchema(defs);
                 } finally {
                     this.engine = previousEngine;
                     this.maintenanceOperation = previousMaintenance;
+                    this.committedStoreCompression = null;
                 }
             }
-            await wasm.swapActiveGeneration(dbName, generationName);
-            swapCommitted = true;
+            try {
+                await wasm.swapActiveGeneration(dbName, generationName, expectedGeneration);
+                published = true;
+            } catch (swapError) {
+                published = (await readActiveGenerationOrNull(wasm, dbName)) === generationName;
+                if (!published) {
+                    throw swapError;
+                }
+            }
             const previousEngine = this.engine;
             this.engine = rebuiltEngine;
             rebuiltEngine = null;
             this.committedIndexes = defs;
             this.committedStoreCompression = null;
             try {
-                previousEngine?.close();
+                previousEngine?.abandon();
             } catch {}
             try {
                 await wasm.cleanupInactiveEntries(dbName);
@@ -1281,33 +1460,78 @@ class DbWorker implements WorkerApi {
                 durationMs: performance.now() - start
             };
         } catch (error) {
-            if (!swapCommitted) {
+            if (!published) {
+                this.committedIndexes = null;
+                this.committedStoreCompression = null;
                 try {
-                    rebuiltEngine?.close();
+                    rebuiltEngine?.abandon();
                 } catch {}
-                try {
-                    await wasm.cleanupInactiveEntries(dbName);
-                } catch {}
+                if (generationName !== null) {
+                    // Only unpublished generations are removed; if the control
+                    // file cannot be read, nothing is deleted.
+                    const active = await readActiveGenerationOrNull(wasm, dbName);
+                    if (active !== undefined && active !== generationName) {
+                        try {
+                            await wasm.cleanupInactiveEntries(dbName);
+                        } catch {}
+                    }
+                }
             }
             throw remapError(error);
         } finally {
             this.maintenanceOperation = null;
         }
     }
+    /**
+     * Brings a poisoned engine back to a trusted state. Returns `null` when
+     * the engine was healthy. All open transactions are gone afterwards.
+     */
+    private recoverEngineIfNeeded(): { pendingTxid: number | null; pendingCommitted: boolean } | null {
+        const engine = this.engine;
+        if (!engine || !engine.needs_recovery()) {
+            return null;
+        }
+        let report: WasmRecoveryReport;
+        try {
+            report = engine.recover();
+        } catch (error) {
+            throw remoteError(
+                'RecoveryRequiredError',
+                `database ${this.dbName ?? ''} needs recovery and recovery failed: ${remapError(error).message}`
+            );
+        }
+        this.clearRuntimeCaches();
+        return {
+            pendingTxid: fromOptionalWasmU64(report.pendingTxid),
+            pendingCommitted: report.pendingCommitted === true
+        };
+    }
     private cleanupTxState(txId: number): void {
         this.txChanges.delete(txId);
         this.txModes.delete(txId);
         this.txIndexSchemas.delete(txId);
+        this.txIndexSchemaChanged.delete(txId);
         this.txStoreCompression.delete(txId);
     }
     private getOrCreateTrackedTxn(txId: number): TrackedTxnChanges {
-        return getOrInsert(this.txChanges, txId, () => new Map());
+        return getOrInsert(this.txChanges, txId, () => new Map<string, TrackedStoreChanges>());
     }
     private getOrCreateTrackedStore(txId: number, store: string): TrackedStoreChanges {
         return getOrInsert(this.getOrCreateTrackedTxn(txId), store, () => ({
             touched: false,
+            storeLevel: null,
             keys: new Map()
         }));
+    }
+    private recordStoreLevelChange(txId: number, store: string, kind: 'clear' | 'drop'): void {
+        if (isInternalStoreName(store)) {
+            return;
+        }
+        const trackedStore = this.getOrCreateTrackedStore(txId, store);
+        trackedStore.touched = true;
+        trackedStore.storeLevel = kind;
+        // Earlier key changes are subsumed by the store-level change.
+        trackedStore.keys.clear();
     }
     private recordPutChange(txId: number, store: string, key: Uint8Array, baselineExists: boolean): void {
         this.recordKeyChange(txId, store, key, baselineExists, 'put');
@@ -1325,10 +1549,15 @@ class DbWorker implements WorkerApi {
         trackedStore.touched = true;
         const count = Math.min(entries.length, baselines.length);
         for (let i = 0; i < count; i += 1) {
-            this.setTrackedKeyChange(trackedStore, entries[i]![0], baselines[i]!, 'put');
+            this.setTrackedKeyChange(trackedStore, entries[i][0], baselines[i], 'put');
         }
     }
-    private recordPutKeyChanges(txId: number, store: string, keys: Uint8Array[], baselines: boolean[]): void {
+    private recordPutKeyChanges(
+        txId: number,
+        store: string,
+        keys: Uint8Array[],
+        baselines: ArrayLike<boolean | number>
+    ): void {
         if (isInternalStoreName(store)) {
             return;
         }
@@ -1336,7 +1565,7 @@ class DbWorker implements WorkerApi {
         trackedStore.touched = true;
         const count = Math.min(keys.length, baselines.length);
         for (let i = 0; i < count; i += 1) {
-            this.setTrackedKeyChange(trackedStore, keys[i]!, baselines[i]!, 'put');
+            this.setTrackedKeyChange(trackedStore, keys[i], baselines[i] === true || baselines[i] === 1, 'put');
         }
     }
     private recordDeleteChange(txId: number, store: string, key: Uint8Array, deleted: boolean): void {
@@ -1378,20 +1607,6 @@ class DbWorker implements WorkerApi {
         }
         this.getOrCreateTrackedStore(txId, store).touched = true;
     }
-    private loadStoreKeys(txId: number, store: string): Uint8Array[] {
-        const rows = this.readRawScan(txId, store, EMPTY_RANGE);
-        return rows.map((row) => row.key.slice());
-    }
-    private recordDeletedKeys(txId: number, store: string, keys: Uint8Array[]): void {
-        if (isInternalStoreName(store)) {
-            return;
-        }
-        const trackedStore = this.getOrCreateTrackedStore(txId, store);
-        trackedStore.touched = true;
-        for (const key of keys) {
-            this.setTrackedKeyChange(trackedStore, key, true, 'delete');
-        }
-    }
     private recordBatchOutcomes(
         txId: number,
         store: string,
@@ -1399,8 +1614,8 @@ class DbWorker implements WorkerApi {
         outcomes: Array<WasmBatchOutcome>
     ): void {
         for (let i = 0; i < outcomes.length && i < ops.length; i += 1) {
-            const op = ops[i]!;
-            const outcome = outcomes[i]!;
+            const op = ops[i];
+            const outcome = outcomes[i];
             if (op.kind === 'put' && outcome.kind === 'put') {
                 this.recordPutChange(txId, store, op.key, outcome.baselineExists);
             } else if (op.kind === 'delete' && outcome.kind === 'delete') {
@@ -1415,8 +1630,8 @@ class DbWorker implements WorkerApi {
         outcomes: Array<WasmBatchOutcome>
     ): void {
         for (let i = 0; i < outcomes.length && i < ops.length; i += 1) {
-            const op = ops[i]!;
-            const outcome = outcomes[i]!;
+            const op = ops[i];
+            const outcome = outcomes[i];
             if (op.kind === 'put' && outcome.kind === 'put') {
                 this.recordPutChange(txId, store, op.key, outcome.baselineExists);
             } else if (op.kind === 'delete' && outcome.kind === 'delete') {
@@ -1431,6 +1646,9 @@ class DbWorker implements WorkerApi {
                 continue;
             }
             const changes: DbChange[] = [];
+            if (trackedStore.storeLevel !== null) {
+                changes.push({ key: new Uint8Array(0), kind: trackedStore.storeLevel });
+            }
             for (const change of trackedStore.keys.values()) {
                 if (change.finalKind === 'delete' && !change.baselineExists) {
                     continue;
@@ -1478,7 +1696,7 @@ class DbWorker implements WorkerApi {
         }>;
         const loaded = new Map<string, CompressionOption>();
         for (const row of rows) {
-            if (typeof row?.name !== 'string') {
+            if (typeof row.name !== 'string') {
                 throw remoteError('CorruptionError', 'invalid store config row: missing name');
             }
             const flags = typeof row.flags === 'bigint' ? Number(row.flags) : row.flags;
@@ -1491,7 +1709,7 @@ class DbWorker implements WorkerApi {
         return loaded;
     }
     private ensureTxStoreCompression(txId: number): Map<string, CompressionOption> {
-        return getOrInsert(this.txStoreCompression, txId, () => new Map());
+        return getOrInsert(this.txStoreCompression, txId, () => new Map<string, CompressionOption>());
     }
     private recordStoreCompressionCreate(txId: number, store: string, compression: CompressionOption): void {
         if (isInternalStoreName(store)) {
@@ -1527,10 +1745,9 @@ class DbWorker implements WorkerApi {
         if (compression === false) {
             return entries;
         }
-        const storedEntries: Array<[Uint8Array, Uint8Array]> = new Array(entries.length);
-        for (let i = 0; i < entries.length; i += 1) {
-            const [key, value] = entries[i]!;
-            storedEntries[i] = [key, await encodeStoreValueRecord(value, compression)];
+        const storedEntries: Array<[Uint8Array, Uint8Array]> = [];
+        for (const [key, value] of entries) {
+            storedEntries.push([key, await encodeStoreValueRecord(value, compression)]);
         }
         return storedEntries;
     }
@@ -1542,13 +1759,13 @@ class DbWorker implements WorkerApi {
         if (compression === false) {
             return ops;
         }
-        const storedOps: Array<BatchOp> = new Array(ops.length);
-        for (let i = 0; i < ops.length; i += 1) {
-            const op = ops[i]!;
-            storedOps[i] =
+        const storedOps: Array<BatchOp> = [];
+        for (const op of ops) {
+            storedOps.push(
                 op.kind === 'put'
                     ? { kind: 'put', key: op.key, value: await encodeStoreValueRecord(op.value, compression) }
-                    : op;
+                    : op
+            );
         }
         return storedOps;
     }
@@ -1590,27 +1807,6 @@ class DbWorker implements WorkerApi {
                 value: await this.decodeStoreValue(txId, store, row.value)
             }))
         );
-    }
-    private captureResetChanges(): StoreChangeSet[] {
-        const stores = this.currentStoreNames();
-        if (stores.length === 0) {
-            return [];
-        }
-        const txId = fromWasmU64(this.withEngine((engine) => engine.begin_tx('readonly')));
-        try {
-            return stores.map((store) => {
-                const rows = this.readRawScan(txId, store, EMPTY_RANGE);
-                return {
-                    store,
-                    changes: rows.map((row) => ({
-                        key: row.key.slice(),
-                        kind: 'delete' as const
-                    }))
-                };
-            });
-        } finally {
-            this.withEngine((engine) => engine.rollback_tx(toWasmU64(txId)));
-        }
     }
     private indexesForStoreInTx(txId: number, store: string): NormalizedIndexDef[] {
         return indexesForStore(this.indexSchemaForTx(txId), store);
@@ -1759,29 +1955,59 @@ class DbWorker implements WorkerApi {
             );
         }
     }
-    private async loadVisibleIndexRows(txId: number, def: NormalizedIndexDef, range: Range): Promise<ScanItem[]> {
-        const { limit, ...withoutLimit } = range;
-        let rawRows: ScanItem[];
-        try {
-            rawRows = this.readRawScan(txId, def.internalStore, indexRangeToPhysicalRange(withoutLimit));
-        } catch (error) {
-            if (isNamedError(error, 'StoreNotFoundError')) {
-                return [];
-            }
-            throw error;
-        }
+    /**
+     * Reads up to `limit` live rows of an index range, starting after
+     * `cursor` (a physical index key from a previous page). Raw index entries
+     * are fetched in bounded chunks, so stale entries skipped along the way
+     * never force the whole range into memory.
+     */
+    private async loadVisibleIndexPage(
+        txId: number,
+        def: NormalizedIndexDef,
+        range: Range,
+        cursor: Uint8Array | null,
+        limit: number
+    ): Promise<IndexScanPage> {
+        const { limit: _ignored, ...withoutLimit } = range;
+        const physical = indexRangeToPhysicalRange(withoutLimit);
+        const reverse = physical.reverse === true;
+        let resumeAfter = cursor;
         const visible: ScanItem[] = [];
-        for (const row of rawRows) {
-            const resolved = await this.resolveVisibleIndexedRow(txId, def, row.key);
-            if (!resolved) {
-                continue;
+        for (;;) {
+            const chunkRange: Range = { ...physical, limit: INDEX_SCAN_RAW_CHUNK_ROWS };
+            if (resumeAfter !== null) {
+                if (reverse) {
+                    delete chunkRange.lte;
+                    chunkRange.lt = resumeAfter;
+                } else {
+                    delete chunkRange.gte;
+                    chunkRange.gt = resumeAfter;
+                }
             }
-            visible.push(resolved);
-            if (limit !== undefined && visible.length >= limit) {
-                break;
+            let rawRows: ScanItem[];
+            try {
+                rawRows = this.readRawScan(txId, def.internalStore, chunkRange);
+            } catch (error) {
+                if (isNamedError(error, 'StoreNotFoundError')) {
+                    return { rows: [], cursor: null };
+                }
+                throw error;
+            }
+            for (const row of rawRows) {
+                resumeAfter = row.key;
+                const resolved = await this.resolveVisibleIndexedRow(txId, def, row.key);
+                if (!resolved) {
+                    continue;
+                }
+                visible.push(resolved);
+                if (visible.length >= limit) {
+                    return { rows: visible, cursor: row.key.slice() };
+                }
+            }
+            if (rawRows.length < INDEX_SCAN_RAW_CHUNK_ROWS) {
+                return { rows: visible, cursor: null };
             }
         }
-        return visible;
     }
     private async resolveVisibleIndexedRow(
         txId: number,
@@ -1815,9 +2041,13 @@ class DbWorker implements WorkerApi {
     private async loadWasm(): Promise<WasmModule> {
         if (!this.wasmReady) {
             this.wasmReady = (async () => {
-                const moduleUrl = '/engine/moyodb_engine.js';
-                const wasmUrl = '/engine/moyodb_engine_bg.wasm';
-                const wasmModule = (await nativeModuleImport(moduleUrl)) as WasmModule;
+                // Absolute URLs stay outside Vite's ?import transform, which rejects JS in /public.
+                const moduleUrl = new URL('/engine/moyodb_engine.js', import.meta.url).href;
+                const wasmUrl = new URL('/engine/moyodb_engine_bg.wasm', import.meta.url).href;
+                const wasmModule = (await import(
+                    /* @vite-ignore */
+                    moduleUrl
+                )) as WasmModule;
                 await wasmModule.default({ module_or_path: wasmUrl });
                 return wasmModule;
             })();
@@ -1856,6 +2086,7 @@ class DbWorker implements WorkerApi {
         this.txChanges.clear();
         this.txModes.clear();
         this.txIndexSchemas.clear();
+        this.txIndexSchemaChanged.clear();
         this.txStoreCompression.clear();
     }
     private clearRuntimeCaches(): void {
@@ -1863,9 +2094,9 @@ class DbWorker implements WorkerApi {
         this.committedIndexes = null;
         this.committedStoreCompression = null;
     }
-    private async cleanupAfterFailedOpen(engine: InstanceType<WasmModule['WasmEngine']> | null): Promise<void> {
+    private async cleanupAfterFailedOpen(engine: WasmEngine | null): Promise<void> {
         try {
-            engine?.close();
+            engine?.abandon();
         } catch {}
         this.engine = null;
         this.clearRuntimeCaches();
@@ -1887,17 +2118,11 @@ class DbWorker implements WorkerApi {
     }
 }
 async function assertCapabilities(): Promise<void> {
-    if (!navigator?.storage) {
-        throw remoteError('UnsupportedPlatformError', 'navigator.storage is unavailable');
-    }
     if (typeof navigator.storage.getDirectory !== 'function') {
         throw remoteError('UnsupportedPlatformError', 'navigator.storage.getDirectory is unavailable');
     }
     if (typeof BroadcastChannel === 'undefined') {
         throw remoteError('UnsupportedPlatformError', 'BroadcastChannel is unavailable');
-    }
-    if (!navigator.locks) {
-        throw remoteError('UnsupportedPlatformError', 'navigator.locks is unavailable');
     }
     const root = await navigator.storage.getDirectory();
     const dir = await root.getDirectoryHandle('__moyodb_capability__', { create: true });
@@ -1916,8 +2141,50 @@ function assertSecureContext() {
         throw remoteError('UnsupportedPlatformError', 'moyodb requires a secure context (HTTPS)');
     }
 }
-function remoteError(code: string, message: string) {
-    return { code, name: code, message };
+function remoteError(code: string, message: string): Error {
+    const error = new Error(message);
+    error.name = code;
+    Object.defineProperty(error, 'code', {
+        value: code,
+        enumerable: true,
+        configurable: true
+    });
+    return error;
+}
+function applyChangeFeedPolicy(engine: WasmEngine, settings: Required<ChangeFeedSettings>): void {
+    const current = engine.change_feed_policy();
+    const currentRetain = fromOptionalWasmU64(current.retainTxids);
+    if (current.enabled === settings.enabled && (!settings.enabled || currentRetain === settings.retainTxids)) {
+        return;
+    }
+    const txId = engine.begin_tx('readwrite');
+    try {
+        engine.set_change_feed_policy(txId, { enabled: settings.enabled, retainTxids: settings.retainTxids });
+        engine.commit_tx(txId);
+    } catch (error) {
+        try {
+            engine.rollback_tx(txId);
+        } catch {}
+        throw remapError(error);
+    }
+}
+/** Active generation name, `null` without a control file, `undefined` when it cannot be read. */
+async function readActiveGenerationOrNull(wasm: WasmModule, dbName: string): Promise<string | null | undefined> {
+    try {
+        return await wasm.readActiveGeneration(dbName);
+    } catch {
+        return undefined;
+    }
+}
+function normalizeEngineHealth(health: WasmEngineHealth): EngineHealth {
+    if (health.state === 'recoveryRequired') {
+        return {
+            state: 'recoveryRequired',
+            reason: health.reason,
+            pendingTxid: fromOptionalWasmU64(health.pendingTxid)
+        };
+    }
+    return { state: health.state };
 }
 function partialBooleanOutcomes(error: unknown): boolean[] {
     if (!isRecord(error) || !Array.isArray(error.partial)) {
@@ -1939,16 +2206,23 @@ function partialBatchOutcomes(error: unknown): WasmBatchOutcome[] {
         );
     });
 }
-function remapError(err: unknown) {
-    if (isRecord(err) && 'code' in err && 'message' in err) {
+function remapError(err: unknown): Error {
+    if (err instanceof Error) {
         return err;
     }
-    const anyErr = err as
-        | {
-              message?: string;
-              name?: string;
-          }
-        | undefined;
-    return remoteError(anyErr?.name ?? 'Error', anyErr?.message ?? String(err));
+    if (isRecord(err)) {
+        const code = typeof err.code === 'string' ? err.code : typeof err.name === 'string' ? err.name : 'Error';
+        const message = typeof err.message === 'string' ? err.message : 'Unknown error';
+        const error = remoteError(code, message);
+        if ('partial' in err) {
+            Object.defineProperty(error, 'partial', {
+                value: err.partial,
+                enumerable: true,
+                configurable: true
+            });
+        }
+        return error;
+    }
+    return remoteError('Error', String(err));
 }
 exposeWorkerApi(new DbWorker());

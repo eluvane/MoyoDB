@@ -126,6 +126,8 @@ fn multiple_commits_replay_in_order() {
         engine.put(tx, "kv", b"ordered", value).unwrap();
         let err = engine.commit_tx(tx).unwrap_err();
         assert_eq!(err.code(), "InjectedFailureError");
+        assert!(engine.needs_recovery());
+        assert!(engine.recover().unwrap().pending_committed);
     }
     drop(engine);
 

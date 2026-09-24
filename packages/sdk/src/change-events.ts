@@ -27,7 +27,13 @@ export interface DbDeletedEvent {
 }
 export type WorkerBroadcastEvent = CommitAppliedEvent | OwnerChangedEvent | DbClosedEvent | DbDeletedEvent;
 function isDbChange(value: unknown): value is DbChange {
-    return isRecord(value) && value.key instanceof Uint8Array && (value.kind === 'put' || value.kind === 'delete');
+    if (!isRecord(value) || !(value.key instanceof Uint8Array)) {
+        return false;
+    }
+    if (value.kind === 'put' || value.kind === 'delete') {
+        return true;
+    }
+    return (value.kind === 'clear' || value.kind === 'drop') && value.key.byteLength === 0;
 }
 function isStoreChangeSet(value: unknown): value is StoreChangeSet {
     return (

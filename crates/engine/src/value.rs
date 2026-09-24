@@ -86,6 +86,24 @@ impl StoredValue {
         }
     }
 
+    /// Same as [`Self::decode_for_store`] but reuses the buffer instead of copying the value.
+    pub fn decode_owned_for_store(store_flags: u64, mut bytes: Vec<u8>) -> Result<Self> {
+        if store_uses_system_raw_values(store_flags) {
+            return Ok(Self::plain(bytes));
+        }
+        if !store_uses_value_envelope(store_flags) {
+            validate_value(&bytes)?;
+            return Ok(Self::plain(bytes));
+        }
+        let expires_at_ms = decode_envelope_expiry(&bytes)?;
+        bytes.drain(..VALUE_ENVELOPE_HEADER_SIZE);
+        validate_value(&bytes)?;
+        Ok(Self {
+            value: bytes,
+            expires_at_ms,
+        })
+    }
+
     pub fn decode_for_store(store_flags: u64, bytes: &[u8]) -> Result<Self> {
         if store_uses_system_raw_values(store_flags) {
             return Ok(Self::plain(bytes.to_vec()));
@@ -120,6 +138,35 @@ impl StoredValue {
             },
         })
     }
+}
+
+/// Expiry from the first bytes of an enveloped value; only the header is needed.
+pub fn decode_envelope_expiry(prefix: &[u8]) -> Result<Option<u64>> {
+    if prefix.len() < VALUE_ENVELOPE_HEADER_SIZE {
+        return Err(EngineError::Corruption(format!(
+            "value envelope too short: expected at least {VALUE_ENVELOPE_HEADER_SIZE} bytes, got {}",
+            prefix.len()
+        )));
+    }
+    if prefix[..8] != VALUE_ENVELOPE_MAGIC {
+        return Err(EngineError::Corruption(
+            "value envelope magic mismatch".into(),
+        ));
+    }
+    let expires_at_ms = read_u64_le(prefix, 8)?;
+    Ok(if expires_at_ms == 0 {
+        None
+    } else {
+        Some(expires_at_ms)
+    })
+}
+
+/// Whether a raw stored value is expired, reading only its envelope header.
+pub fn stored_value_expired(store_flags: u64, raw: &[u8], now_ms: u64) -> Result<bool> {
+    if store_uses_system_raw_values(store_flags) || !store_uses_value_envelope(store_flags) {
+        return Ok(false);
+    }
+    Ok(matches!(decode_envelope_expiry(raw)?, Some(expires_at_ms) if now_ms >= expires_at_ms))
 }
 
 pub fn store_flags_for_user_store(compression: StoreCompression) -> u64 {

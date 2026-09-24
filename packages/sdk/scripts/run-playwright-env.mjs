@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 
 const profiles = {
@@ -28,10 +28,26 @@ if (!profile) {
     process.exit(1);
 }
 
+function gitRevision() {
+    try {
+        const git = (args) =>
+            execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+        const sha = git(['rev-parse', 'HEAD']);
+        return git(['status', '--porcelain', '--untracked-files=no']) ? `${sha}-dirty` : sha;
+    } catch {
+        return 'unknown';
+    }
+}
+
+const env = { ...process.env, ...profile.env };
+if (profile.env.MOYODB_RUN_BENCH === '1' && !env.MOYODB_BENCH_GIT_SHA) {
+    env.MOYODB_BENCH_GIT_SHA = env.GITHUB_SHA ?? gitRevision();
+}
+
 const require = createRequire(import.meta.url);
 const playwrightCli = require.resolve('@playwright/test/cli');
 const child = spawn(process.execPath, [playwrightCli, ...profile.args], {
-    env: { ...process.env, ...profile.env },
+    env,
     stdio: 'inherit'
 });
 

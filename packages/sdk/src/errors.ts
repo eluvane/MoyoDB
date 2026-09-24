@@ -111,6 +111,16 @@ export class ChangeFeedCompactedError extends MoyoDbError {
         super('ChangeFeedCompactedError', message);
     }
 }
+/**
+ * The outcome of a commit could not be confirmed (storage failed at or after
+ * the WAL append) or the engine hit an unrecoverable fault. The database
+ * rejects further work until it is reopened, which replays durable state.
+ */
+export class RecoveryRequiredError extends MoyoDbError {
+    constructor(message: string) {
+        super('RecoveryRequiredError', message);
+    }
+}
 export class InternalError extends MoyoDbError {
     constructor(message: string) {
         super('InternalError', message);
@@ -154,14 +164,15 @@ const ERROR_CONSTRUCTORS = {
     SerializationError,
     InjectedFailureError,
     ChangeFeedCompactedError,
+    RecoveryRequiredError,
     InternalError,
     InvalidOpenOptionsError,
     VersionError
 } satisfies Record<string, ErrorConstructor>;
 
 function instantiateError(code: string, message: string): Error {
-    const ErrorConstructor = ERROR_CONSTRUCTORS[code as keyof typeof ERROR_CONSTRUCTORS];
-    if (ErrorConstructor) {
+    if (Object.prototype.hasOwnProperty.call(ERROR_CONSTRUCTORS, code)) {
+        const ErrorConstructor = ERROR_CONSTRUCTORS[code as keyof typeof ERROR_CONSTRUCTORS];
         return new ErrorConstructor(message);
     }
     const err = new Error(message);

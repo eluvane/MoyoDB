@@ -51,8 +51,8 @@ test('db.changesSince returns durable filtered changes and respects limit', asyn
     expect(result.filtered).toHaveLength(2);
     expect(result.filtered[0]).toMatchObject({ store: 'docs', key: 'seed', kind: 'put', value: 'v2' });
     expect(result.filtered[1]).toMatchObject({ store: 'docs', key: 'next', kind: 'put', value: 'v3' });
-    expect(result.filtered[0]!.txId).toBeLessThan(result.filtered[1]!.txId);
-    expect(result.filtered[1]!.txId).toBeLessThan(result.latestTxId);
+    expect(result.filtered[0].txId).toBeLessThan(result.filtered[1].txId);
+    expect(result.filtered[1].txId).toBeLessThan(result.latestTxId);
     expect(result.limitedLatestTxId).toBe(result.latestTxId);
     expect(result.limitedCount).toBe(1);
     expect(result.limitedFirstKind).toBe('put');
@@ -102,7 +102,7 @@ test('db.changesSince rejects reserved internal store filters', async ({ page })
         try {
             await db.createStore('docs');
             try {
-                await db.changesSince(0, { stores: ['__browserdb:indexes'] as any });
+                await db.changesSince(0, { stores: ['__browserdb:indexes'] });
                 return { name: 'NO_ERROR', message: '' };
             } catch (error) {
                 return {

@@ -22,12 +22,20 @@ export interface SampleContext {
     workload: WorkloadSpec;
     sampleIndex: number;
     engine: BenchEngine;
+    indexedDbDurability: IDBTransactionDurability;
 }
 
 export interface WorkloadRunner {
     engine: BenchEngine;
     prepare?(ctx: SampleContext): Promise<(() => Promise<void>) | void>;
     run(ctx: SampleContext): Promise<void>;
+    /**
+     * Runs after the timed region and before cleanup. Throws when the data the
+     * sample read or wrote differs from the deterministic dataset; otherwise
+     * returns a content checksum that must match across engines, or null when
+     * the workload has no comparable content.
+     */
+    verify?(ctx: SampleContext): Promise<string | null>;
     cleanup?(ctx: SampleContext): Promise<void>;
 }
 
@@ -40,6 +48,8 @@ export interface BenchOptions {
     dbNamePrefix?: string;
     workloadTimeoutMs?: number;
     persistentContext?: boolean;
+    gitSha?: string;
+    indexedDbDurability?: IDBTransactionDurability;
 }
 
 export interface BrowserInfo {
@@ -56,9 +66,12 @@ export interface BenchEnvironment {
     os?: string;
     secureContext: boolean;
     webdriver: boolean;
+    gitSha: string;
     sdkBuildMode: string;
     wasmBuildMode: string;
     backendPath: string;
+    indexedDbDurability: IDBTransactionDurability;
+    moyoDbDurability: string;
     opfsSupported: boolean;
     syncAccessHandleSupported: boolean;
     locksSupported: boolean;
@@ -91,6 +104,8 @@ export interface BenchResult {
     sampleCount: number;
     warmupSamples: number[];
     rawSamples: number[];
+    /** One entry per measured sample, aligned with `rawSamples`. */
+    contentChecksums: Array<string | null>;
     stats?: BenchStats;
     notes: string;
     error?: string;

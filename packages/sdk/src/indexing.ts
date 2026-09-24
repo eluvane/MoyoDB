@@ -6,8 +6,7 @@ import {
     prefixRange,
     prefixSuccessor,
     splitCompoundKey,
-    utf8Encode,
-    type IndexKeyPrimitive
+    utf8Encode
 } from './codec';
 import type { IndexDef, Range } from './types';
 const encoder = new TextEncoder();
@@ -149,8 +148,8 @@ export function decodeIndexEntryKey(bytes: Uint8Array): DecodedIndexEntryKey {
         throw new SerializationError('invalid index entry key encoding');
     }
     return {
-        logicalKey: parts[0]!,
-        primaryKey: parts[1]!
+        logicalKey: parts[0],
+        primaryKey: parts[1]
     };
 }
 export function indexKeyExactRange(logicalIndexKey: Uint8Array): Range {
@@ -198,7 +197,7 @@ export function extractLogicalIndexKey(def: NormalizedIndexDef, valueBytes: Uint
         }
         return encodeCompoundKeyParts(parts);
     }
-    const resolved = resolveKeyPath(documentValue, def.keyPath[0]!);
+    const resolved = resolveKeyPath(documentValue, def.keyPath[0]);
     if (resolved === MISSING) {
         return null;
     }
@@ -224,7 +223,7 @@ function toPublicIndexDefinition(def: NormalizedIndexDef): IndexDef {
     return {
         store: def.store,
         name: def.name,
-        keyPath: def.compound ? [...def.keyPath] : def.keyPath[0]!,
+        keyPath: def.compound ? [...def.keyPath] : def.keyPath[0],
         unique: def.unique
     };
 }
@@ -236,7 +235,11 @@ function normalizeIndexKeyPath(value: unknown): {
         validateSingleKeyPath(value);
         return { paths: [value], compound: false };
     }
-    if (!Array.isArray(value) || value.length === 0 || value.some((item) => typeof item !== 'string')) {
+    if (
+        !Array.isArray(value) ||
+        value.length === 0 ||
+        !value.every((item): item is string => typeof item === 'string')
+    ) {
         throw new InvalidOpenOptionsError('index keyPath must be a non-empty string or non-empty string[]');
     }
     for (const path of value) {
@@ -253,7 +256,7 @@ function validateSingleKeyPath(value: string): void {
     }
 }
 function serializeIndexKeyPath(def: NormalizedIndexDef): string {
-    return def.compound ? `[${def.keyPath.join(',')}]` : def.keyPath[0]!;
+    return def.compound ? `[${def.keyPath.join(',')}]` : def.keyPath[0];
 }
 function makeInternalIndexStoreName(store: string, name: string): string {
     const storeToken = base64Url(utf8Encode(store));
@@ -287,7 +290,7 @@ function decodeIndexedDocument(bytes: Uint8Array): unknown {
         throw new SerializationError(`indexed values must be valid UTF-8 JSON: ${String(error)}`);
     }
 }
-function resolveKeyPath(root: unknown, keyPath: string): unknown | typeof MISSING {
+function resolveKeyPath(root: unknown, keyPath: string): unknown {
     let current: unknown = root;
     for (const segment of keyPath.split('.')) {
         if (current === null || current === undefined) {
@@ -306,7 +309,7 @@ function encodeDocumentIndexValue(value: unknown): Uint8Array {
         return encodeIndexScalar(value);
     }
     if (value === null || typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
-        return encodeIndexScalar(value as IndexKeyPrimitive);
+        return encodeIndexScalar(value);
     }
     throw new SerializationError(
         `indexed keyPath values must resolve to string, number, boolean, null, or Uint8Array; got ${describeValue(value)}`

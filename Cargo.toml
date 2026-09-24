@@ -4,16 +4,16 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-license = "MIT OR Apache-2.0"
-version = "0.1.0"
+license-file = "LICENSE"
+version = "1.0.0"
 
 [workspace.dependencies]
-crc32fast = "1.4"
+crc32fast = "1.5"
 serde = { version = "1.0", features = [ "derive" ] }
 serde_bytes = "0.11"
 serde_json = "1.0"
 thiserror = "2.0"
-zerocopy = { version = "0.7", features = [ "derive" ] }
+zerocopy = { version = "0.8", features = [ "derive" ] }
 
 [workspace.lints.rust]
 rust_2018_idioms = { level = "deny", priority = -1 }
@@ -24,3 +24,15 @@ unused_must_use = "deny"
 dbg_macro = "deny"
 todo = "deny"
 undocumented_unsafe_blocks = "deny"
+
+# Release artifacts (WASM package and native benches): whole-program LTO, one CGU,
+# no unwind tables, stripped symbols.
+# Fat LTO + codegen-units = 1 is slow and RAM-heavy; drop to lto = "thin" if the machine chokes.
+# Tests and build scripts ignore `panic` (Cargo still unwinds the test harness).
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+incremental = false

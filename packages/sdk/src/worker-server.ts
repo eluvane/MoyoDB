@@ -1,9 +1,10 @@
-import type { WorkerApi } from './worker-api';
+import type { AutocommitCommand, WorkerApi } from './worker-api';
 import {
     WORKER_PROTOCOL_READY,
     WORKER_PROTOCOL_RESPONSE,
     WORKER_PROTOCOL_VERSION,
     decodeWorkerCommandPayload,
+    isAutocommitCommand,
     packedBatchOpsBytes,
     packedBinaryListBytes,
     prepareWorkerResponsePayload,
@@ -29,12 +30,131 @@ export interface WorkerServerHandle {
     close(): void;
 }
 
+/** Commands whose first argument is a transaction handle; they run in that transaction's lane. */
+const TRANSACTION_COMMANDS = new Set<WorkerCommand>([
+    'commit',
+    'rollback',
+    'createStore',
+    'dropStore',
+    'clearStore',
+    'get',
+    'getMany',
+    'has',
+    'put',
+    'putMany',
+    'delete',
+    'deleteMany',
+    'applyBatch',
+    'scan',
+    'getByIndex',
+    'scanByIndex',
+    'scanByIndexPage',
+    'reconcileIndexes',
+    'setSchemaVersion'
+]);
+
+/** Commands that replace or tear down engine state and must not overlap any other engine work. */
+const EXCLUSIVE_COMMANDS = new Set<WorkerCommand>([
+    'open',
+    'close',
+    'destroy',
+    'importSnapshot',
+    'reset',
+    'compact',
+    'rebuild'
+]);
+
+/**
+ * Commands that never touch the open engine. They bypass scheduling so a slow
+ * browser API (storage estimate, persistence prompt) cannot stall a close.
+ */
+const UNSCHEDULED_COMMANDS = new Set<WorkerCommand>(['deleteDB', 'storageInfo', 'requestPersistence']);
+
+const noop = () => {};
+
+/**
+ * Orders requests the way the engine needs them:
+ * - operations of one transaction run strictly one after another, so an
+ *   awaited step (compression, uniqueness check) cannot interleave with the
+ *   next operation of the same transaction;
+ * - readwrite autocommits queue behind each other instead of failing on the
+ *   single-writer rule;
+ * - exclusive commands wait for all in-flight work and hold back new work
+ *   until they finish.
+ */
+class RequestScheduler {
+    #lanes = new Map<number | string, Promise<void>>();
+    #inFlight = new Set<Promise<void>>();
+    #barrier: Promise<void> = Promise.resolve();
+
+    schedule<T>(command: WorkerCommand, args: unknown[], task: () => Promise<T>): Promise<T> {
+        if (UNSCHEDULED_COMMANDS.has(command)) {
+            return task();
+        }
+        if (EXCLUSIVE_COMMANDS.has(command)) {
+            return this.#runExclusive(task);
+        }
+        return this.#runShared(laneFor(command, args), task);
+    }
+
+    #runShared<T>(lane: number | string | null, task: () => Promise<T>): Promise<T> {
+        const barrier = this.#barrier;
+        const previous = lane === null ? undefined : this.#lanes.get(lane);
+        const result = (async () => {
+            await barrier;
+            if (previous) {
+                await previous;
+            }
+            return task();
+        })();
+        const settled = result.then(noop, noop);
+        this.#inFlight.add(settled);
+        void settled.then(() => {
+            this.#inFlight.delete(settled);
+        });
+        if (lane !== null) {
+            this.#lanes.set(lane, settled);
+            void settled.then(() => {
+                if (this.#lanes.get(lane) === settled) {
+                    this.#lanes.delete(lane);
+                }
+            });
+        }
+        return result;
+    }
+
+    #runExclusive<T>(task: () => Promise<T>): Promise<T> {
+        const previousBarrier = this.#barrier;
+        const pending = Array.from(this.#inFlight);
+        const result = (async () => {
+            await previousBarrier;
+            await Promise.all(pending);
+            return task();
+        })();
+        this.#barrier = result.then(noop, noop);
+        return result;
+    }
+}
+
+const AUTOCOMMIT_WRITER_LANE = 'autocommit:readwrite';
+
+function laneFor(command: WorkerCommand, args: unknown[]): number | string | null {
+    if (TRANSACTION_COMMANDS.has(command) && typeof args[0] === 'number') {
+        return args[0];
+    }
+    if (command === 'autocommit' && args[0] === 'readwrite') {
+        return AUTOCOMMIT_WRITER_LANE;
+    }
+    return null;
+}
+
 export function exposeWorkerApi(
     api: WorkerApi,
     scope: DedicatedWorkerGlobalScope = self as DedicatedWorkerGlobalScope
 ): WorkerServerHandle {
+    const scheduler = new RequestScheduler();
     const handleMessage = (event: MessageEvent<unknown>) => {
-        void dispatchWorkerRequest(scope, api, event.data);
+        void dispatchWorkerRequest(scope, api, scheduler, event.data);
     };
     scope.addEventListener('message', handleMessage);
     scope.postMessage({
@@ -48,7 +168,12 @@ export function exposeWorkerApi(
     };
 }
 
-async function dispatchWorkerRequest(scope: DedicatedWorkerGlobalScope, api: WorkerApi, data: unknown): Promise<void> {
+async function dispatchWorkerRequest(
+    scope: DedicatedWorkerGlobalScope,
+    api: WorkerApi,
+    scheduler: RequestScheduler,
+    data: unknown
+): Promise<void> {
     if (!isWorkerProtocolEnvelope(data)) {
         return;
     }
@@ -70,31 +195,72 @@ async function dispatchWorkerRequest(scope: DedicatedWorkerGlobalScope, api: Wor
         );
         return;
     }
-    const method = api[data.command] as unknown;
-    if (typeof method !== 'function') {
-        postWorkerResponse(
-            scope,
-            errorResponse(
-                data.id,
-                workerProtocolError('WorkerProtocolError', `worker command is not implemented: ${data.command}`)
-            )
-        );
-        return;
-    }
+    const command = data.command;
+    const args = data.args as unknown[];
     try {
-        const packedResult = dispatchPackedCommand(api, data.command, data.args);
-        const result =
-            packedResult === null
-                ? await (method as (...args: unknown[]) => Promise<unknown>).apply(
-                      api,
-                      decodeWorkerCommandPayload(data.command, data.args)
-                  )
-                : await packedResult;
-        const responsePayload = prepareWorkerResponsePayload(data.command, result as never);
+        let responseCommand: WorkerCommand = command;
+        let invoke: () => Promise<unknown>;
+        if (command === 'autocommit') {
+            const [mode, inner, innerArgs] = args;
+            if (
+                (mode !== 'readonly' && mode !== 'readwrite') ||
+                !isAutocommitCommand(inner) ||
+                !Array.isArray(innerArgs)
+            ) {
+                throw workerProtocolError('WorkerProtocolError', 'invalid autocommit request');
+            }
+            assertImplemented(api, inner);
+            responseCommand = inner;
+            invoke = () => runAutocommit(api, mode, inner, innerArgs);
+        } else {
+            assertImplemented(api, command);
+            invoke = () => invokeCommand(api, command, args);
+        }
+        const result = await scheduler.schedule(command, args, invoke);
+        const responsePayload = prepareWorkerResponsePayload(responseCommand, result as never);
         postWorkerResponse(scope, successResponse(data.id, responsePayload.result), responsePayload.transfer);
     } catch (error) {
         postWorkerResponse(scope, errorResponse(data.id, error));
     }
+}
+
+function assertImplemented(api: WorkerApi, command: WorkerCommand): void {
+    if (typeof (api[command] as unknown) !== 'function') {
+        throw workerProtocolError('WorkerProtocolError', `worker command is not implemented: ${command}`);
+    }
+}
+
+function invokeCommand(api: WorkerApi, command: WorkerCommand, args: unknown[]): Promise<unknown> {
+    const packedResult = dispatchPackedCommand(api, command, args);
+    if (packedResult !== null) {
+        return packedResult;
+    }
+    const method = api[command] as unknown as (...methodArgs: unknown[]) => Promise<unknown>;
+    return method.apply(api, decodeWorkerCommandPayload(command, args as never) as unknown[]);
+}
+
+async function runAutocommit(
+    api: WorkerApi,
+    mode: 'readonly' | 'readwrite',
+    command: AutocommitCommand,
+    args: unknown[]
+): Promise<unknown> {
+    const txId = await api.begin(mode);
+    let result: unknown;
+    try {
+        result = await invokeCommand(api, command, [txId, ...args]);
+    } catch (error) {
+        try {
+            await api.rollback(txId);
+        } catch {}
+        throw error;
+    }
+    if (mode === 'readwrite') {
+        await api.commit(txId);
+    } else {
+        await api.rollback(txId);
+    }
+    return result;
 }
 
 function dispatchPackedCommand(api: WorkerApi, command: WorkerCommand, args: unknown[]): Promise<unknown> | null {

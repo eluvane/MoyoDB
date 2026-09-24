@@ -1,6 +1,14 @@
 import { test, expect } from '@playwright/test';
 import { persistentContextTest, prepareMoyoDbPage, requireMoyoDbCapabilities, uniqueDbName } from './support';
 
+declare global {
+    interface Window {
+        __heldDb?: {
+            close: () => Promise<void>;
+        };
+    }
+}
+
 test('opfs_reopen_after_reload', async ({ page }) => {
     const dbName = uniqueDbName('opfs-reload');
     await prepareMoyoDbPage(page);
@@ -177,7 +185,7 @@ test('second_tab_owner_rejected', async ({ browser }) => {
     await page2.goto('/');
     await requireMoyoDbCapabilities(page1);
     await page1.evaluate(async (name) => {
-        (window as any).__heldDb = await window.moyodb.openDB(name, { requestPersistence: false });
+        window.__heldDb = await window.moyodb.openDB(name, { requestPersistence: false });
     }, dbName);
     const errorName = await page2.evaluate(async (name) => {
         try {
@@ -189,7 +197,10 @@ test('second_tab_owner_rejected', async ({ browser }) => {
         }
     }, dbName);
     await page1.evaluate(async () => {
-        const db = (window as any).__heldDb;
+        const db = window.__heldDb;
+        if (!db) {
+            throw new Error('missing held database');
+        }
         await db.close();
     });
     await context.close();
@@ -209,7 +220,7 @@ test('unsupported_opfs_path_returns_clear_error', async ({ page }) => {
                 return (error as Error).name;
             }
         }
-        const original = storage.getDirectory;
+        const original = Reflect.get(storage, 'getDirectory');
         try {
             Object.defineProperty(storage, 'getDirectory', { configurable: true, value: undefined });
             try {

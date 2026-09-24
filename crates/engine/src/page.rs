@@ -6,7 +6,7 @@ use crate::layout::{
     PAGE_HEADER_CHECKSUM_OFFSET, PAGE_HEADER_SIZE, PAGE_MAGIC, PAGE_SIZE,
 };
 use serde::{Deserialize, Serialize};
-use zerocopy::AsBytes;
+use zerocopy::IntoBytes;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LeafCell {
@@ -61,6 +61,23 @@ pub(crate) struct InternalCellRef<'a> {
     pub child_page_id: u64,
 }
 
+/// Highest B-tree level a page may declare. Levels strictly decrease on every
+/// descent, so this also bounds traversal depth on corrupt input.
+pub const MAX_TREE_LEVEL: u8 = 48;
+
+/// Full validation of an image that did not come from this process: size,
+/// magic, checksum, header bounds, kind/level invariants and the page id.
+pub(crate) fn verify_page_image(bytes: &[u8], expected_page_id: u64) -> Result<PageHeaderInfo> {
+    let header = decode_page_header(bytes)?;
+    if header.page_id != expected_page_id {
+        return Err(EngineError::Corruption(format!(
+            "page header id mismatch: expected {expected_page_id}, got {}",
+            header.page_id
+        )));
+    }
+    Ok(header)
+}
+
 pub(crate) fn decode_page_header(bytes: &[u8]) -> Result<PageHeaderInfo> {
     if bytes.len() != PAGE_SIZE {
         return Err(EngineError::Corruption(format!(
@@ -76,6 +93,19 @@ pub(crate) fn decode_page_header(bytes: &[u8]) -> Result<PageHeaderInfo> {
     let checksum = read_u32_le(bytes, PAGE_HEADER_CHECKSUM_OFFSET)?;
     if expected != checksum {
         return Err(EngineError::Corruption("page checksum mismatch".into()));
+    }
+    decode_page_header_verified(bytes)
+}
+
+/// Header decode for bytes the pager already verified on load. Skips the
+/// checksum; the bounds checks are cheap and stay.
+pub(crate) fn decode_page_header_verified(bytes: &[u8]) -> Result<PageHeaderInfo> {
+    if bytes.len() != PAGE_SIZE {
+        return Err(EngineError::Corruption(format!(
+            "page size mismatch: expected {}, got {}",
+            PAGE_SIZE,
+            bytes.len()
+        )));
     }
     let header: PageHeader = unsafe_read_struct(&bytes[..PAGE_HEADER_SIZE])?;
     let header_info = PageHeaderInfo {
@@ -220,31 +250,8 @@ pub fn decode_page(bytes: &[u8]) -> Result<DecodedPage> {
             })
         }
         PageKind::Overflow => {
-            if header_info.cell_count != 0 {
-                return Err(EngineError::Corruption(
-                    "overflow page unexpectedly contains cell slots".into(),
-                ));
-            }
-            let next_overflow_page_id = read_u64_le(bytes, PAGE_HEADER_SIZE)?;
-            let chunk_len = read_u32_le(bytes, PAGE_HEADER_SIZE + 8)? as usize;
-            let chunk_start = PAGE_HEADER_SIZE + 12;
-            let chunk_end = chunk_start
-                .checked_add(chunk_len)
-                .ok_or_else(|| EngineError::Corruption("overflow chunk length overflow".into()))?;
-            if header_info.lower as usize != chunk_start {
-                return Err(EngineError::Corruption(
-                    "overflow page lower bound mismatch".into(),
-                ));
-            }
-            if header_info.upper as usize != chunk_end {
-                return Err(EngineError::Corruption(
-                    "overflow page upper bound mismatch".into(),
-                ));
-            }
-            let chunk = bytes
-                .get(chunk_start..chunk_end)
-                .ok_or_else(|| EngineError::Corruption("overflow chunk out of bounds".into()))?
-                .to_vec();
+            let (next_overflow_page_id, chunk) = decode_overflow_body_ref(bytes, &header_info)?;
+            let chunk = chunk.to_vec();
             Ok(DecodedPage {
                 header: header_info,
                 leaf_cells: Vec::new(),
@@ -256,6 +263,48 @@ pub fn decode_page(bytes: &[u8]) -> Result<DecodedPage> {
             })
         }
     }
+}
+
+pub(crate) fn decode_overflow_body_ref<'a>(
+    bytes: &'a [u8],
+    header: &PageHeaderInfo,
+) -> Result<(u64, &'a [u8])> {
+    if header.page_kind != PageKind::Overflow {
+        return Err(EngineError::Corruption(format!(
+            "page {} is not an overflow page",
+            header.page_id
+        )));
+    }
+    if header.cell_count != 0 {
+        return Err(EngineError::Corruption(
+            "overflow page unexpectedly contains cell slots".into(),
+        ));
+    }
+    let next_overflow_page_id = read_u64_le(bytes, PAGE_HEADER_SIZE)?;
+    let chunk_len = read_u32_le(bytes, PAGE_HEADER_SIZE + 8)? as usize;
+    let chunk_start = PAGE_HEADER_SIZE + 12;
+    let chunk_end = chunk_start
+        .checked_add(chunk_len)
+        .ok_or_else(|| EngineError::Corruption("overflow chunk length overflow".into()))?;
+    if header.lower as usize != chunk_start {
+        return Err(EngineError::Corruption(
+            "overflow page lower bound mismatch".into(),
+        ));
+    }
+    if header.upper as usize != chunk_end {
+        return Err(EngineError::Corruption(
+            "overflow page upper bound mismatch".into(),
+        ));
+    }
+    if chunk_len == 0 {
+        return Err(EngineError::Corruption(
+            "overflow page has an empty chunk".into(),
+        ));
+    }
+    let chunk = bytes
+        .get(chunk_start..chunk_end)
+        .ok_or_else(|| EngineError::Corruption("overflow chunk out of bounds".into()))?;
+    Ok((next_overflow_page_id, chunk))
 }
 
 pub fn encode_leaf_page(
@@ -491,6 +540,43 @@ fn decode_internal_cell(bytes: &[u8]) -> Result<InternalCell> {
 }
 
 fn validate_page_bounds(header: &PageHeaderInfo) -> Result<()> {
+    if header.page_id == 0 {
+        return Err(EngineError::Corruption(
+            "page header declares page id 0".into(),
+        ));
+    }
+    match header.page_kind {
+        PageKind::Leaf => {
+            if header.level != 0 {
+                return Err(EngineError::Corruption(format!(
+                    "leaf page {} declares level {}",
+                    header.page_id, header.level
+                )));
+            }
+        }
+        PageKind::Internal => {
+            if header.level == 0 || header.level > MAX_TREE_LEVEL {
+                return Err(EngineError::Corruption(format!(
+                    "internal page {} declares invalid level {}",
+                    header.page_id, header.level
+                )));
+            }
+            if header.cell_count == 0 {
+                return Err(EngineError::Corruption(format!(
+                    "internal page {} has no children",
+                    header.page_id
+                )));
+            }
+        }
+        PageKind::Overflow => {
+            if header.level != 0 || header.cell_count != 0 || header.right_sibling_page_id != 0 {
+                return Err(EngineError::Corruption(format!(
+                    "overflow page {} has tree metadata",
+                    header.page_id
+                )));
+            }
+        }
+    }
     let lower = header.lower as usize;
     let upper = header.upper as usize;
     let slot_table_end = PAGE_HEADER_SIZE + header.cell_count as usize * 2;

@@ -35,11 +35,16 @@ export function u64Key(value: bigint | number): Uint8Array {
     view.setBigUint64(0, asBigInt, false);
     return new Uint8Array(buf);
 }
+function isCompoundKeyPartList(
+    value: CompoundKeyPart | ReadonlyArray<CompoundKeyPart>
+): value is ReadonlyArray<CompoundKeyPart> {
+    return Array.isArray(value);
+}
 export function indexKey(value: CompoundKeyPart | ReadonlyArray<CompoundKeyPart>): Uint8Array {
-    if (Array.isArray(value)) {
+    if (isCompoundKeyPartList(value)) {
         return compoundKey(...value);
     }
-    return encodeCompoundKeyPart(value as CompoundKeyPart);
+    return encodeCompoundKeyPart(value);
 }
 export function compoundKey(...parts: CompoundKeyPart[]): Uint8Array {
     return encodeCompoundBytes(parts.map((part) => encodeCompoundKeyPart(part)));
@@ -54,7 +59,7 @@ export function splitCompoundKey(key: Uint8Array): Uint8Array[] {
     const parts: Uint8Array[] = [];
     const current: number[] = [];
     for (let index = 0; index < key.length; index += 1) {
-        const byte = key[index]!;
+        const byte = key[index];
         if (byte !== COMPOUND_ESCAPE) {
             current.push(byte);
             continue;

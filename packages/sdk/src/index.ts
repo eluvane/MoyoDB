@@ -49,6 +49,10 @@ import {
 } from './indexing';
 import { SubscriptionHub } from './subscriptions';
 import { compareStringsByCodeUnit, withTimeout } from './internal';
+import type { AutocommitCommand, IndexScanPage } from './worker-api';
+import type { AutocommitArgs, WorkerCommandResult } from './worker-protocol';
+
+const INDEX_SCAN_PAGE_ROWS = 256;
 
 async function callProxy<T>(fn: () => Promise<T>): Promise<T> {
     try {
@@ -123,9 +127,23 @@ class TransactionImpl implements Transaction {
     async *scanByIndex(store: string, indexName: string, range: Range = {}): AsyncIterable<[Uint8Array, Uint8Array]> {
         this.#ensureOpen();
         assertPublicStoreName(store);
-        const rows = await callProxy(() => this.#entry.proxy.scanByIndex(this.#txId, store, indexName, range));
-        for (const row of rows) {
-            yield [row.key, row.value];
+        let remaining = range.limit ?? Number.POSITIVE_INFINITY;
+        let cursor: Uint8Array | null = null;
+        while (remaining > 0) {
+            this.#ensureOpen();
+            const pageLimit = Math.min(remaining, INDEX_SCAN_PAGE_ROWS);
+            const resumeAfter: Uint8Array | null = cursor;
+            const page: IndexScanPage = await callProxy(() =>
+                this.#entry.proxy.scanByIndexPage(this.#txId, store, indexName, range, resumeAfter, pageLimit)
+            );
+            for (const row of page.rows) {
+                yield [row.key, row.value];
+            }
+            remaining -= page.rows.length;
+            if (page.cursor === null) {
+                return;
+            }
+            cursor = page.cursor;
         }
     }
     async createStore(name: string, options: CreateStoreOptions = {}): Promise<void> {
@@ -263,8 +281,7 @@ class DBImpl implements DB {
         this.#ensureOpen();
         return callProxy(async () => {
             const txId = await this.#entry.proxy.begin(mode);
-            let tx!: TransactionImpl;
-            tx = new TransactionImpl(this.#entry, txId, mode, () => {
+            const tx = new TransactionImpl(this.#entry, txId, mode, () => {
                 this.#transactions.delete(tx);
             });
             this.#transactions.add(tx);
@@ -272,39 +289,49 @@ class DBImpl implements DB {
         });
     }
     async createStore(name: string, options: CreateStoreOptions = {}): Promise<void> {
-        await this.#withScopedTx('readwrite', async (tx) => {
-            await tx.createStore(name, normalizeCreateStoreOptions(options));
-        });
+        assertPublicStoreName(name);
+        await this.#autocommit('readwrite', 'createStore', [name, normalizeCreateStoreOptions(options)]);
     }
     async dropStore(name: string): Promise<void> {
-        await this.#withScopedTx('readwrite', async (tx) => {
-            await tx.dropStore(name);
-        });
+        assertPublicStoreName(name);
+        await this.#autocommit('readwrite', 'dropStore', [name]);
     }
     async clearStore(name: string): Promise<void> {
-        await this.#withScopedTx('readwrite', async (tx) => {
-            await tx.clearStore(name);
-        });
+        assertPublicStoreName(name);
+        await this.#autocommit('readwrite', 'clearStore', [name]);
     }
     async get(store: string, key: Uint8Array): Promise<Uint8Array | null> {
-        return this.#withScopedTx('readonly', (tx) => tx.get(store, key));
+        assertPublicStoreName(store);
+        return this.#autocommit('readonly', 'get', [store, key]);
     }
     async getMany(store: string, keys: Array<Uint8Array>): Promise<Array<Uint8Array | null>> {
-        return this.#withScopedTx('readonly', (tx) => tx.getMany(store, keys));
+        assertPublicStoreName(store);
+        return this.#autocommit('readonly', 'getMany', [store, keys]);
     }
     async has(store: string, key: Uint8Array): Promise<boolean> {
-        return this.#withScopedTx('readonly', (tx) => tx.has(store, key));
+        assertPublicStoreName(store);
+        return this.#autocommit('readonly', 'has', [store, key]);
     }
     async put(store: string, key: Uint8Array, value: Uint8Array, options: PutOptions = {}): Promise<void> {
-        await this.#withScopedTx('readwrite', async (tx) => {
-            await tx.put(store, key, value, normalizePutOptions(options));
-        });
+        assertPublicStoreName(store);
+        await this.#autocommit('readwrite', 'put', [store, key, value, normalizePutOptions(options)]);
     }
     async delete(store: string, key: Uint8Array): Promise<boolean> {
-        return this.#withScopedTx('readwrite', (tx) => tx.delete(store, key));
+        assertPublicStoreName(store);
+        return this.#autocommit('readwrite', 'delete', [store, key]);
     }
     async scan(store: string, range: Range = {}): Promise<ScanItem[]> {
-        return this.#withScopedTx('readonly', (tx) => tx.scan(store, range));
+        assertPublicStoreName(store);
+        return this.#autocommit('readonly', 'scan', [store, range]);
+    }
+    /** Begin, run and commit (or release) a single operation in one worker round trip. */
+    async #autocommit<M extends AutocommitCommand>(
+        mode: TxMode,
+        command: M,
+        args: AutocommitArgs<M>
+    ): Promise<WorkerCommandResult<M>> {
+        this.#ensureOpen();
+        return callProxy(() => this.#entry.proxy.autocommit(mode, command, args));
     }
     async exportSnapshot(options: ExportSnapshotOptions = {}): Promise<Uint8Array> {
         this.#ensureOpen();
@@ -424,23 +451,6 @@ class DBImpl implements DB {
             throw rollbackError;
         }
     }
-    async #withScopedTx<T>(mode: TxMode, fn: (tx: Transaction) => Promise<T>): Promise<T> {
-        const tx = await this.begin(mode);
-        try {
-            const result = await fn(tx);
-            if (mode === 'readwrite') {
-                await tx.commit();
-            } else {
-                await tx.rollback();
-            }
-            return result;
-        } catch (error) {
-            try {
-                await tx.rollback();
-            } catch {}
-            throw error;
-        }
-    }
     #disposeRegistrySubscriptions() {
         this.#unsubscribeTxInvalidated?.();
         this.#unsubscribeTxInvalidated = null;
@@ -545,11 +555,11 @@ class MigrationTransactionImpl implements Transaction {
     async clearStore(name: string): Promise<void> {
         await this.#inner.clearStore(name);
     }
-    async commit(): Promise<void> {
-        throw migrationUnsupportedMethod('transaction.commit');
+    commit(): Promise<void> {
+        return Promise.reject(migrationUnsupportedMethod('transaction.commit'));
     }
-    async rollback(): Promise<void> {
-        throw migrationUnsupportedMethod('transaction.rollback');
+    rollback(): Promise<void> {
+        return Promise.reject(migrationUnsupportedMethod('transaction.rollback'));
     }
 }
 class MigrationDbImpl implements DB {
@@ -561,8 +571,8 @@ class MigrationDbImpl implements DB {
         this.#transaction = transaction;
         this.#tracker = tracker;
     }
-    async begin(_mode: TxMode = 'readonly'): Promise<Transaction> {
-        throw migrationUnsupportedMethod('db.begin');
+    begin(_mode: TxMode = 'readonly'): Promise<Transaction> {
+        return Promise.reject(migrationUnsupportedMethod('db.begin'));
     }
     async createStore(name: string, options: CreateStoreOptions = {}): Promise<void> {
         await this.#transaction.createStore(name, options);
@@ -579,8 +589,8 @@ class MigrationDbImpl implements DB {
     async getVersion(): Promise<number> {
         return this.#db.getVersion();
     }
-    async changesSince(_txid: TxId, _options: ChangeFeedOptions = {}): Promise<ChangeFeed> {
-        throw migrationUnsupportedMethod('db.changesSince');
+    changesSince(_txid: TxId, _options: ChangeFeedOptions = {}): Promise<ChangeFeed> {
+        return Promise.reject(migrationUnsupportedMethod('db.changesSince'));
     }
     async get(store: string, key: Uint8Array): Promise<Uint8Array | null> {
         return this.#transaction.get(store, key);
@@ -600,20 +610,20 @@ class MigrationDbImpl implements DB {
     async scan(store: string, range: Range = {}): Promise<ScanItem[]> {
         return this.#transaction.scan(store, range);
     }
-    async exportSnapshot(_options: ExportSnapshotOptions = {}): Promise<Uint8Array> {
-        throw migrationUnsupportedMethod('db.exportSnapshot');
+    exportSnapshot(_options: ExportSnapshotOptions = {}): Promise<Uint8Array> {
+        return Promise.reject(migrationUnsupportedMethod('db.exportSnapshot'));
     }
-    async importSnapshot(_data: Uint8Array): Promise<void> {
-        throw migrationUnsupportedMethod('db.importSnapshot');
+    importSnapshot(_data: Uint8Array): Promise<void> {
+        return Promise.reject(migrationUnsupportedMethod('db.importSnapshot'));
     }
-    async reset(): Promise<void> {
-        throw migrationUnsupportedMethod('db.reset');
+    reset(): Promise<void> {
+        return Promise.reject(migrationUnsupportedMethod('db.reset'));
     }
-    async compact(): Promise<CompactionResult> {
-        throw migrationUnsupportedMethod('db.compact');
+    compact(): Promise<CompactionResult> {
+        return Promise.reject(migrationUnsupportedMethod('db.compact'));
     }
-    async rebuild(): Promise<CompactionResult> {
-        throw migrationUnsupportedMethod('db.rebuild');
+    rebuild(): Promise<CompactionResult> {
+        return Promise.reject(migrationUnsupportedMethod('db.rebuild'));
     }
     async stats() {
         return this.#db.stats();
@@ -624,14 +634,14 @@ class MigrationDbImpl implements DB {
     async requestPersistence(): Promise<boolean> {
         return this.#db.requestPersistence();
     }
-    async close(): Promise<void> {
-        throw migrationUnsupportedMethod('db.close');
+    close(): Promise<void> {
+        return Promise.reject(migrationUnsupportedMethod('db.close'));
     }
-    async destroy(): Promise<void> {
-        throw migrationUnsupportedMethod('db.destroy');
+    destroy(): Promise<void> {
+        return Promise.reject(migrationUnsupportedMethod('db.destroy'));
     }
-    async setFailpoint(_failpoint: DebugFailpoint): Promise<void> {
-        throw migrationUnsupportedMethod('db.setFailpoint');
+    setFailpoint(_failpoint: DebugFailpoint): Promise<void> {
+        return Promise.reject(migrationUnsupportedMethod('db.setFailpoint'));
     }
     subscribe(callback: DbSubscriptionCallback): Unsubscribe;
     subscribe(storeName: string, callback: DbSubscriptionCallback): Unsubscribe;
@@ -751,7 +761,7 @@ function normalizeChangeFeedOptions(options: unknown): ChangeFeedOptions {
     }>(options, 'change feed options must be an object');
     const normalized: ChangeFeedOptions = {};
     if (stores !== undefined) {
-        if (!Array.isArray(stores) || stores.some((store) => typeof store !== 'string')) {
+        if (!Array.isArray(stores) || !stores.every((store): store is string => typeof store === 'string')) {
             throw new TypeError('stores must be an array of strings');
         }
         for (const store of stores) {
@@ -794,9 +804,6 @@ function assertMainThreadCapabilities() {
         throw new UnsupportedPlatformError('moyodb requires a secure context (HTTPS)');
     }
     const nav = globalThis.navigator;
-    if (!nav?.storage) {
-        throw new UnsupportedPlatformError('navigator.storage is unavailable');
-    }
     if (typeof nav.storage.getDirectory !== 'function') {
         throw new UnsupportedPlatformError('navigator.storage.getDirectory is unavailable');
     }
@@ -806,13 +813,10 @@ function assertMainThreadCapabilities() {
     if (typeof globalThis.BroadcastChannel === 'undefined') {
         throw new UnsupportedPlatformError('BroadcastChannel is unavailable');
     }
-    if (!nav.locks) {
-        throw new UnsupportedPlatformError('navigator.locks is unavailable');
-    }
 }
 async function requestPersistentStorageOnOpen(options: OpenOptions): Promise<void> {
     const nav = globalThis.navigator;
-    if ((options.requestPersistence ?? true) && typeof nav?.storage?.persist === 'function') {
+    if ((options.requestPersistence ?? true) && typeof nav.storage.persist === 'function') {
         await withTimeout(nav.storage.persist(), 1000, false);
     }
 }

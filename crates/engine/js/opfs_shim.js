@@ -12,6 +12,15 @@ const TEXT_DECODER = new TextDecoder();
 let rootDir = null;
 let nextSessionId = 1;
 const sessions = new Map();
+function namedError(name, message) {
+    const error = new Error(message);
+    error.name = name;
+    error.code = name;
+    return error;
+}
+function corruptionError(message) {
+    return namedError('CorruptionError', message);
+}
 async function getRootDir() {
     if (!navigator?.storage?.getDirectory) {
         throw new Error('navigator.storage.getDirectory is unavailable');
@@ -25,18 +34,27 @@ async function getOrCreateStackdbRoot() {
     const root = await getRootDir();
     return await root.getDirectoryHandle(DB_ROOT_DIR, { create: true });
 }
+function isNotFoundError(error) {
+    return error?.name === 'NotFoundError' || error?.name === 'TypeMismatchError';
+}
 async function lookupDirectoryHandle(parent, name) {
     try {
         return await parent.getDirectoryHandle(name, { create: false });
-    } catch (_err) {
-        return null;
+    } catch (err) {
+        if (isNotFoundError(err)) {
+            return null;
+        }
+        throw err;
     }
 }
 async function lookupFileHandle(parent, name) {
     try {
         return await parent.getFileHandle(name, { create: false });
-    } catch (_err) {
-        return null;
+    } catch (err) {
+        if (isNotFoundError(err)) {
+            return null;
+        }
+        throw err;
     }
 }
 function sessionPath(encodedDbName, generationName = null) {
@@ -64,7 +82,41 @@ function fnv1a32(bytes, zeroOffset = -1, zeroLength = 0) {
 function isGenerationNameValid(name) {
     return typeof name === 'string' && /^gen-[a-z0-9]+-[a-z0-9]+$/i.test(name);
 }
-function encodeControlSlot(generationCounter, activeGeneration) {
+// Every byte must reach the file or the call fails: a short write that returns
+// normally would let callers publish state that is not on disk.
+export function writeAll(handle, bytes, at) {
+    let writtenTotal = 0;
+    while (writtenTotal < bytes.length) {
+        const chunk = bytes.subarray(writtenTotal, writtenTotal + OPFS_WRITE_CHUNK_SIZE);
+        const rawWritten = handle.write(chunk, { at: at + writtenTotal });
+        const written = Number(rawWritten);
+        if (!Number.isSafeInteger(written) || written < 0 || written > chunk.length) {
+            throw namedError('StorageError', `opfs write failed: invalid byte count ${String(rawWritten)}`);
+        }
+        if (written === 0 && chunk.length > 0) {
+            throw namedError('StorageError', 'opfs write failed: wrote 0 bytes');
+        }
+        writtenTotal += written;
+    }
+    return writtenTotal;
+}
+// Fills `buffer` from `at`, stopping only at end of file. Bytes past EOF stay zero.
+export function readAll(handle, buffer, at) {
+    let readTotal = 0;
+    while (readTotal < buffer.length) {
+        const rawRead = handle.read(buffer.subarray(readTotal), { at: at + readTotal });
+        const read = Number(rawRead);
+        if (!Number.isSafeInteger(read) || read < 0 || read > buffer.length - readTotal) {
+            throw namedError('StorageError', `opfs read failed: invalid byte count ${String(rawRead)}`);
+        }
+        if (read === 0) {
+            break;
+        }
+        readTotal += read;
+    }
+    return readTotal;
+}
+export function encodeControlSlot(generationCounter, activeGeneration) {
     if (!isGenerationNameValid(activeGeneration)) {
         throw new Error(`invalid generation name ${activeGeneration}`);
     }
@@ -86,7 +138,9 @@ function encodeControlSlot(generationCounter, activeGeneration) {
     view.setUint32(CONTROL_CHECKSUM_OFFSET, checksum, true);
     return slot;
 }
-function decodeControlSlot(slotIndex, bytes) {
+// Returns null for any slot whose bytes do not checksum. Fields are interpreted
+// only after the checksum passes, so a torn slot never masks its valid sibling.
+export function decodeControlSlot(slotIndex, bytes) {
     if (bytes.length < CONTROL_SLOT_SIZE) {
         return null;
     }
@@ -96,23 +150,23 @@ function decodeControlSlot(slotIndex, bytes) {
         }
     }
     const view = slotBytesView(bytes);
-    const version = view.getUint32(8, true);
-    if (version !== CONTROL_VERSION) {
-        throw new Error(`unsupported control file version ${version}`);
-    }
-    const expectedChecksum = fnv1a32(bytes, CONTROL_CHECKSUM_OFFSET, 4);
+    const expectedChecksum = fnv1a32(bytes.subarray(0, CONTROL_SLOT_SIZE), CONTROL_CHECKSUM_OFFSET, 4);
     const storedChecksum = view.getUint32(CONTROL_CHECKSUM_OFFSET, true);
     if (expectedChecksum !== storedChecksum) {
         return null;
     }
+    const version = view.getUint32(8, true);
+    if (version !== CONTROL_VERSION) {
+        throw corruptionError(`unsupported control file version ${version}`);
+    }
     const nameLength = view.getUint16(20, true);
     const nameEnd = CONTROL_NAME_OFFSET + nameLength;
     if (nameEnd > CONTROL_SLOT_SIZE) {
-        throw new Error(`control slot name length out of bounds: ${nameLength}`);
+        throw corruptionError(`control slot name length out of bounds: ${nameLength}`);
     }
     const activeGeneration = TEXT_DECODER.decode(bytes.subarray(CONTROL_NAME_OFFSET, nameEnd));
     if (!isGenerationNameValid(activeGeneration)) {
-        throw new Error(`invalid generation in control slot: ${activeGeneration}`);
+        throw corruptionError(`invalid generation in control slot: ${activeGeneration}`);
     }
     return {
         slotIndex,
@@ -120,25 +174,31 @@ function decodeControlSlot(slotIndex, bytes) {
         activeGeneration
     };
 }
-function readControlStateFromAccessHandle(accessHandle) {
-    const buffer = new Uint8Array(CONTROL_SLOT_SIZE * 2);
+// `absent`  — the file is empty: no generation has ever been published.
+// `invalid` — the file has bytes but no slot checksums.
+// `valid`   — `control` is the newest checksummed slot.
+export function readControlStateFromAccessHandle(accessHandle) {
     const size = Number(accessHandle.getSize());
-    if (size <= 0) {
-        return null;
+    if (!Number.isSafeInteger(size) || size < 0) {
+        throw namedError('StorageError', `invalid control file size ${String(size)}`);
     }
-    const readLength = Math.min(buffer.length, size);
-    accessHandle.read(buffer.subarray(0, readLength), { at: 0 });
+    if (size === 0) {
+        return { status: 'absent', control: null };
+    }
+    const buffer = new Uint8Array(CONTROL_SLOT_SIZE * 2);
+    readAll(accessHandle, buffer.subarray(0, Math.min(buffer.length, size)), 0);
     const slot0 = decodeControlSlot(0, buffer.subarray(0, CONTROL_SLOT_SIZE));
     const slot1 = decodeControlSlot(1, buffer.subarray(CONTROL_SLOT_SIZE, CONTROL_SLOT_SIZE * 2));
     if (slot0 && slot1) {
-        return slot0.generationCounter >= slot1.generationCounter ? slot0 : slot1;
+        return { status: 'valid', control: slot0.generationCounter >= slot1.generationCounter ? slot0 : slot1 };
     }
-    return slot0 ?? slot1 ?? null;
+    const control = slot0 ?? slot1;
+    return control ? { status: 'valid', control } : { status: 'invalid', control: null };
 }
-async function readControlState(dbRoot) {
+async function readControlFile(dbRoot) {
     const fileHandle = await lookupFileHandle(dbRoot, CONTROL_FILE_NAME);
     if (!fileHandle) {
-        return null;
+        return { status: 'absent', control: null };
     }
     const accessHandle = await fileHandle.createSyncAccessHandle();
     try {
@@ -147,16 +207,62 @@ async function readControlState(dbRoot) {
         accessHandle.close();
     }
 }
-async function writeControlState(dbRoot, activeGeneration) {
+async function hasLegacyDataFiles(dbRoot) {
+    for (const fileName of FILE_NAMES) {
+        if (await lookupFileHandle(dbRoot, fileName)) {
+            return true;
+        }
+    }
+    return false;
+}
+// Resolves which directory holds the live database, failing closed on damage.
+//
+// Legacy root files are removed before the first write into a published
+// generation (see opfsCleanupInactiveEntries and opfsOpenActiveDb). So an
+// unreadable control file next to legacy files can only be a torn first
+// publication, and legacy is still authoritative. Without legacy files it is
+// real corruption of the pointer to live data.
+async function resolveActiveGeneration(dbRoot) {
+    const state = await readControlFile(dbRoot);
+    if (state.status === 'valid') {
+        return state.control.activeGeneration;
+    }
+    if (state.status === 'absent') {
+        return null;
+    }
+    if (await hasLegacyDataFiles(dbRoot)) {
+        return null;
+    }
+    throw corruptionError(`control file ${CONTROL_FILE_NAME} is corrupt: no slot has a valid checksum`);
+}
+async function writeControlState(dbRoot, activeGeneration, expectedCurrentGeneration) {
     const fileHandle = await dbRoot.getFileHandle(CONTROL_FILE_NAME, { create: true });
     const accessHandle = await fileHandle.createSyncAccessHandle();
     try {
         const current = readControlStateFromAccessHandle(accessHandle);
-        const nextSlot = current ? (current.slotIndex === 0 ? 1 : 0) : 0;
-        const nextGenerationCounter = (current?.generationCounter ?? 0) + 1;
+        if (current.status === 'invalid' && !(await hasLegacyDataFiles(dbRoot))) {
+            throw corruptionError('refusing to publish a generation over a corrupt control file');
+        }
+        const currentGeneration = current.control?.activeGeneration ?? null;
+        if (expectedCurrentGeneration !== undefined && currentGeneration !== expectedCurrentGeneration) {
+            throw namedError(
+                'DatabaseBusyError',
+                `active generation changed underneath compaction: expected ${String(expectedCurrentGeneration)}, found ${String(currentGeneration)}`
+            );
+        }
+        const nextSlot = current.control ? (current.control.slotIndex === 0 ? 1 : 0) : 0;
+        const nextGenerationCounter = (current.control?.generationCounter ?? 0) + 1;
         const encoded = encodeControlSlot(nextGenerationCounter, activeGeneration);
-        accessHandle.write(encoded, { at: nextSlot * CONTROL_SLOT_SIZE });
+        writeAll(accessHandle, encoded, nextSlot * CONTROL_SLOT_SIZE);
         accessHandle.flush();
+        const published = readControlStateFromAccessHandle(accessHandle);
+        if (
+            published.status !== 'valid' ||
+            published.control.activeGeneration !== activeGeneration ||
+            published.control.generationCounter !== nextGenerationCounter
+        ) {
+            throw namedError('StorageError', `control file does not select ${activeGeneration} after publication`);
+        }
     } finally {
         accessHandle.close();
     }
@@ -179,23 +285,37 @@ async function getDbRoot(encodedDbName, createIfMissing) {
     }
     return dbRoot;
 }
+async function removeLegacyDataFiles(dbRoot) {
+    for (const fileName of FILE_NAMES) {
+        try {
+            await dbRoot.removeEntry(fileName);
+        } catch (err) {
+            if (!isNotFoundError(err)) {
+                throw err;
+            }
+        }
+    }
+}
 async function resolveActiveDataDir(dbRoot) {
-    const control = await readControlState(dbRoot);
-    if (!control) {
+    const activeGeneration = await resolveActiveGeneration(dbRoot);
+    if (!activeGeneration) {
         return {
             dirHandle: dbRoot,
             generationName: null,
             path: dbRoot.name
         };
     }
-    const activeDir = await lookupDirectoryHandle(dbRoot, control.activeGeneration);
+    const activeDir = await lookupDirectoryHandle(dbRoot, activeGeneration);
     if (!activeDir) {
-        throw new Error(`active generation ${control.activeGeneration} is missing`);
+        throw corruptionError(`active generation ${activeGeneration} is missing`);
     }
+    // A crash after publication but before legacy cleanup leaves stale root
+    // files. They must be gone before this generation accepts writes.
+    await removeLegacyDataFiles(dbRoot);
     return {
         dirHandle: activeDir,
-        generationName: control.activeGeneration,
-        path: `${dbRoot.name}/${control.activeGeneration}`
+        generationName: activeGeneration,
+        path: `${dbRoot.name}/${activeGeneration}`
     };
 }
 function closeSession(sessionId) {
@@ -218,7 +338,7 @@ function closeSessionsForDb(encodedDbName) {
         }
     }
 }
-async function openSessionForDir(dbPath, dirHandle) {
+async function openSessionForDir(dbPath, dirHandle, generationName) {
     const handles = new Map();
     try {
         for (let fileKind = 0; fileKind < FILE_NAMES.length; fileKind += 1) {
@@ -244,12 +364,12 @@ async function openSessionForDir(dbPath, dirHandle) {
         path: dbPath,
         handles
     });
-    return { sessionId };
+    return { sessionId, generationName };
 }
 function getSession(sessionId) {
     const session = sessions.get(sessionId);
     if (!session) {
-        throw new Error(`no OPFS session ${sessionId}`);
+        throw namedError('StorageError', `no OPFS session ${sessionId}`);
     }
     return session;
 }
@@ -257,7 +377,7 @@ function getAccessHandle(sessionId, fileKind) {
     const session = getSession(sessionId);
     const handle = session.handles.get(fileKind);
     if (!handle) {
-        throw new Error(`no OPFS access handle for session ${sessionId} file kind ${fileKind}`);
+        throw namedError('StorageError', `no OPFS access handle for session ${sessionId} file kind ${fileKind}`);
     }
     return handle;
 }
@@ -292,7 +412,7 @@ async function sumDirectorySize(dirHandle, pathPrefix) {
 export async function opfsOpenActiveDb(encodedDbName, createIfMissing = true) {
     const dbRoot = await getDbRoot(encodedDbName, createIfMissing);
     const active = await resolveActiveDataDir(dbRoot);
-    return await openSessionForDir(active.path, active.dirHandle);
+    return await openSessionForDir(active.path, active.dirHandle, active.generationName);
 }
 export async function opfsOpenGenerationDb(encodedDbName, generationName, createIfMissing = true) {
     if (!isGenerationNameValid(generationName)) {
@@ -300,43 +420,29 @@ export async function opfsOpenGenerationDb(encodedDbName, generationName, create
     }
     const dbRoot = await getDbRoot(encodedDbName, createIfMissing);
     const generationDir = await dbRoot.getDirectoryHandle(generationName, { create: createIfMissing });
-    return await openSessionForDir(sessionPath(encodedDbName, generationName), generationDir);
+    return await openSessionForDir(sessionPath(encodedDbName, generationName), generationDir, generationName);
+}
+export async function opfsReadActiveGeneration(encodedDbName) {
+    const dbRoot = await getDbRoot(encodedDbName, false);
+    return await resolveActiveGeneration(dbRoot);
 }
 export function opfsReadAt(sessionId, fileKind, offset, len) {
     const handle = getAccessHandle(sessionId, fileKind);
     const buffer = new Uint8Array(len);
-    handle.read(buffer, { at: Number(offset) });
+    readAll(handle, buffer, Number(offset));
     return buffer;
 }
 export function opfsWriteAt(sessionId, fileKind, offset, bytes) {
-    const handle = getAccessHandle(sessionId, fileKind);
-    const startOffset = Number(offset);
-    let writtenTotal = 0;
-    while (writtenTotal < bytes.length) {
-        const chunk = bytes.subarray(writtenTotal, writtenTotal + OPFS_WRITE_CHUNK_SIZE);
-        const rawWritten = handle.write(chunk, { at: startOffset + writtenTotal });
-        const written = Number(rawWritten);
-        if (!Number.isSafeInteger(written) || written < 0 || written > chunk.length) {
-            throw new Error(`opfs write failed: invalid byte count ${String(rawWritten)}`);
-        }
-        if (written === 0 && chunk.length > 0) {
-            throw new Error('opfs write failed: wrote 0 bytes');
-        }
-        writtenTotal += written;
-    }
-    return writtenTotal;
+    return writeAll(getAccessHandle(sessionId, fileKind), bytes, Number(offset));
 }
 export function opfsFlush(sessionId, fileKind) {
-    const handle = getAccessHandle(sessionId, fileKind);
-    handle.flush();
+    getAccessHandle(sessionId, fileKind).flush();
 }
 export function opfsLen(sessionId, fileKind) {
-    const handle = getAccessHandle(sessionId, fileKind);
-    return BigInt(handle.getSize());
+    return BigInt(getAccessHandle(sessionId, fileKind).getSize());
 }
 export function opfsTruncate(sessionId, fileKind, size) {
-    const handle = getAccessHandle(sessionId, fileKind);
-    handle.truncate(Number(size));
+    getAccessHandle(sessionId, fileKind).truncate(Number(size));
 }
 export function opfsCloseSession(sessionId) {
     closeSession(sessionId);
@@ -350,7 +456,10 @@ export async function opfsPrepareRebuildTarget(encodedDbName) {
     await dbRoot.getDirectoryHandle(generationName, { create: true });
     return { generationName };
 }
-export async function opfsSwapActiveGeneration(encodedDbName, generationName) {
+// Publishes `generationName` as the live database. Resolves only after the
+// control file has been flushed and read back selecting the new generation;
+// the caller may switch its live engine only after that.
+export async function opfsSwapActiveGeneration(encodedDbName, generationName, expectedCurrentGeneration) {
     if (!isGenerationNameValid(generationName)) {
         throw new Error(`invalid generation name ${generationName}`);
     }
@@ -359,31 +468,29 @@ export async function opfsSwapActiveGeneration(encodedDbName, generationName) {
     if (!generationDir) {
         throw new Error(`generation ${generationName} does not exist`);
     }
-    await writeControlState(dbRoot, generationName);
+    await writeControlState(dbRoot, generationName, expectedCurrentGeneration ?? null);
 }
+// Legacy root files are removed strictly (see resolveActiveGeneration); stale
+// generation directories are best effort because nothing can select them.
 export async function opfsCleanupInactiveEntries(encodedDbName) {
     const dbRoot = await lookupDirectoryHandle(await getOrCreateStackdbRoot(), encodedDbName);
     if (!dbRoot) {
         return;
     }
-    const control = await readControlState(dbRoot);
-    const activeGeneration = control?.activeGeneration ?? null;
+    const activeGeneration = await resolveActiveGeneration(dbRoot);
+    if (activeGeneration) {
+        await removeLegacyDataFiles(dbRoot);
+    }
+    const staleDirectories = [];
     for await (const [name, handle] of dbRoot.entries()) {
-        if (name === CONTROL_FILE_NAME) {
-            continue;
+        if (handle.kind === 'directory' && name.startsWith('gen-') && name !== activeGeneration) {
+            staleDirectories.push(name);
         }
-        if (handle.kind === 'directory') {
-            if (activeGeneration && name === activeGeneration) {
-                continue;
-            }
-            if (name.startsWith('gen-')) {
-                await dbRoot.removeEntry(name, { recursive: true });
-            }
-            continue;
-        }
-        if (activeGeneration && FILE_NAMES.includes(name)) {
-            await dbRoot.removeEntry(name);
-        }
+    }
+    for (const name of staleDirectories) {
+        try {
+            await dbRoot.removeEntry(name, { recursive: true });
+        } catch (_err) {}
     }
 }
 export async function opfsDbDirectorySize(encodedDbName) {
@@ -398,5 +505,9 @@ export async function opfsRemoveDb(encodedDbName) {
     const stackdb = await getOrCreateStackdbRoot();
     try {
         await stackdb.removeEntry(encodedDbName, { recursive: true });
-    } catch (_err) {}
+    } catch (err) {
+        if (!isNotFoundError(err)) {
+            throw err;
+        }
+    }
 }

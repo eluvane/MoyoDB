@@ -1,5 +1,5 @@
-include = ["**/*.toml"]
-exclude = ["target/**", "**/target/**", "**/.lake/**", "node_modules/**"]
+include = [ "**/*.toml" ]
+exclude = [ "target/**", "**/target/**", "**/.lake/**", "node_modules/**" ]
 
 [formatting]
 align_comments = false

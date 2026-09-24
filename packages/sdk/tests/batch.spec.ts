@@ -58,7 +58,7 @@ test('applyBatch keeps committed prefix visible to subscriptions when a later op
             const delivery = new Promise<{
                 changes: Array<{
                     key: string;
-                    kind: 'put' | 'delete';
+                    kind: 'put' | 'delete' | 'clear' | 'drop';
                 }>;
                 txnId: number;
             }>((resolve) => {
@@ -260,7 +260,7 @@ test('worker bulk putMany roundtrip commits a large batch', async ({ page }) => 
             await tx.putMany('kv', entries);
             await tx.commit();
             const ro = await db.begin('readonly');
-            const keys = [entries[0]![0], entries[1024]![0], entries[2047]![0]];
+            const keys = [entries[0][0], entries[1024][0], entries[2047][0]];
             const values = await ro.getMany('kv', keys);
             const rows = await ro.scan('kv');
             await ro.rollback();

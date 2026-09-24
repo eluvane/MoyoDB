@@ -39,9 +39,12 @@ export function renderMarkdownReport(report: BenchReport): string {
     lines.push(`- Platform/OS: ${report.environment.os ?? 'unknown'}`);
     lines.push(`- Headless: ${String(report.environment.headless)}`);
     lines.push(`- WebDriver: ${String(report.environment.webdriver)}`);
+    lines.push(`- Git SHA: ${report.environment.gitSha}`);
     lines.push(`- SDK build mode: ${report.environment.sdkBuildMode}`);
-    lines.push(`- WASM build mode: ${report.environment.wasmBuildMode}`);
+    lines.push(`- WASM build profile: ${report.environment.wasmBuildMode}`);
     lines.push(`- Backend path: ${report.environment.backendPath}`);
+    lines.push(`- IndexedDB durability: ${report.environment.indexedDbDurability}`);
+    lines.push(`- MoyoDB durability: ${report.environment.moyoDbDurability}`);
     lines.push(`- Secure context: ${String(report.environment.secureContext)}`);
     lines.push(`- OPFS/getDirectory: ${String(report.environment.opfsSupported)}`);
     lines.push(`- SyncAccessHandle in dedicated Worker: ${String(report.environment.syncAccessHandleSupported)}`);
@@ -74,6 +77,17 @@ export function renderMarkdownReport(report: BenchReport): string {
     for (const result of report.results) {
         lines.push(renderResultRow(result));
     }
+    const parity = renderContentParity(report.results);
+    if (parity.length > 0) {
+        lines.push('');
+        lines.push('## Content parity');
+        lines.push('');
+        lines.push('Per-sample checksums of the data each engine read or wrote; rows must match to be comparable.');
+        lines.push('');
+        lines.push('| Workload | Engines | Content |');
+        lines.push('| -------- | ------- | ------- |');
+        lines.push(...parity);
+    }
     lines.push('');
     lines.push('## Notes');
     for (const note of report.notes) {
@@ -101,6 +115,30 @@ function renderResultRow(result: BenchResult): string {
         .join(' | ')
         .replace(/^/, '| ')
         .replace(/$/, ' |');
+}
+
+function renderContentParity(results: BenchResult[]): string[] {
+    const byWorkload = new Map<string, BenchResult[]>();
+    for (const result of results) {
+        if (result.status !== 'ok' || !result.contentChecksums.some((checksum) => checksum !== null)) {
+            continue;
+        }
+        const group = byWorkload.get(result.workloadName) ?? [];
+        group.push(result);
+        byWorkload.set(result.workloadName, group);
+    }
+    const rows: string[] = [];
+    for (const [workloadName, group] of byWorkload) {
+        if (group.length < 2) {
+            continue;
+        }
+        const reference = JSON.stringify(group[0].contentChecksums);
+        const matches = group.every((result) => JSON.stringify(result.contentChecksums) === reference);
+        rows.push(
+            `| ${workloadName} | ${group.map((result) => result.engine).join(', ')} | ${matches ? 'match' : 'MISMATCH'} |`
+        );
+    }
+    return rows;
 }
 
 function formatMetric(value: number | undefined): string {

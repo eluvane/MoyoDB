@@ -1,8 +1,8 @@
 import { readdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-const resultsDir = new URL('./results/', import.meta.url);
-const outPath = new URL('./results/report.md', import.meta.url);
+const resultsDir = join(import.meta.dirname, 'results');
+const outPath = join(resultsDir, 'report.md');
 const files = (await readdir(resultsDir)).filter((name) => name.endsWith('.json')).sort();
 
 if (files.length === 0) {
@@ -14,7 +14,9 @@ if (files.length === 0) {
 
 const reports = [];
 for (const file of files) {
-    const raw = await readFile(new URL(file, resultsDir), 'utf8');
+    // `file` is a name returned by readdir, so this path stays inside resultsDir.
+    // Node's fetch does not implement file: URLs.
+    const raw = await readFile(join(resultsDir, file), 'utf8');
     try {
         const parsed = JSON.parse(raw);
         if (parsed?.schemaVersion === 1 && Array.isArray(parsed.results)) {
@@ -41,8 +43,12 @@ lines.push(
 lines.push('');
 lines.push('## Environments');
 lines.push('');
-lines.push('| File | Browser | SDK mode | WASM mode | Backend | OPFS | SyncAccessHandle | Persistent context |');
-lines.push('| ---- | ------- | -------- | --------- | ------- | ---- | ---------------- | ------------------ |');
+lines.push(
+    '| File | Browser | Git SHA | SDK mode | WASM profile | IndexedDB durability | Backend | OPFS | SyncAccessHandle | Persistent context |'
+);
+lines.push(
+    '| ---- | ------- | ------- | -------- | ------------ | -------------------- | ------- | ---- | ---------------- | ------------------ |'
+);
 
 for (const { file, report } of reports) {
     const env = report.environment ?? {};
@@ -51,8 +57,10 @@ for (const { file, report } of reports) {
         [
             file,
             `${browser.name ?? 'unknown'} ${browser.version ?? ''}`.trim(),
+            tableText(env.gitSha ?? 'unknown'),
             tableText(env.sdkBuildMode ?? 'unknown'),
             tableText(env.wasmBuildMode ?? 'unknown'),
+            tableText(env.indexedDbDurability ?? 'not recorded (implicit default)'),
             tableText(env.backendPath ?? 'unknown'),
             String(env.opfsSupported ?? 'unknown'),
             String(env.syncAccessHandleSupported ?? 'unknown'),
@@ -101,6 +109,41 @@ for (const { file, report } of reports) {
     }
 }
 
+const parityRows = [];
+for (const { file, report } of reports) {
+    const byWorkload = new Map();
+    for (const result of report.results) {
+        const checksums = result.contentChecksums ?? [];
+        if (result.status !== 'ok' || !checksums.some((checksum) => checksum !== null)) {
+            continue;
+        }
+        const group = byWorkload.get(result.workloadName) ?? [];
+        group.push(result);
+        byWorkload.set(result.workloadName, group);
+    }
+    for (const [workloadName, group] of byWorkload) {
+        if (group.length < 2) {
+            continue;
+        }
+        const reference = JSON.stringify(group[0].contentChecksums);
+        const matches = group.every((result) => JSON.stringify(result.contentChecksums) === reference);
+        parityRows.push(
+            `| ${file} | ${workloadName} | ${group.map((result) => result.engine).join(', ')} | ${matches ? 'match' : 'MISMATCH'} |`
+        );
+    }
+}
+
+if (parityRows.length > 0) {
+    lines.push('');
+    lines.push('## Content parity');
+    lines.push('');
+    lines.push('Per-sample checksums of the data each engine read or wrote; rows must match to be comparable.');
+    lines.push('');
+    lines.push('| File | Workload | Engines | Content |');
+    lines.push('| ---- | -------- | ------- | ------- |');
+    lines.push(...parityRows);
+}
+
 lines.push('');
 lines.push('## Reading this report');
 lines.push('');
@@ -108,6 +151,13 @@ lines.push('- Percentiles are computed from raw browser samples; warmups are exc
 lines.push(
     '- Compare only rows with matching workload, browser, record count, key/value size, batch size, and transaction boundaries.'
 );
+lines.push(
+    '- Random-read rows name their request mode: sequential, pipelined, or bulk. Compare rows of the same mode across engines.'
+);
+lines.push(
+    '- Rows without a Git SHA, with a WASM profile other than `release`, or without an IndexedDB durability value are not publishable numbers.'
+);
+lines.push('- With fewer than about 20 measured samples, p95/p99 say little about tail latency.');
 lines.push('- Do not treat native Criterion results as browser SDK/OPFS performance.');
 lines.push('- Commit the raw JSON alongside any published report so claims remain reproducible.');
 

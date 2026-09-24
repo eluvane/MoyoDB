@@ -1,12 +1,13 @@
 import { expect, test, type Page } from '@playwright/test';
+import type { WorkerProtocolClient } from '../src/worker-client';
 import { prepareMoyoDbPage, uniqueDbName } from './support';
 
 declare global {
     interface Window {
         createWorkerProtocolHarness: () => Promise<{
             worker: Worker;
-            client: import('../src/worker-client').WorkerProtocolClient;
-            cleanup(): void;
+            client: WorkerProtocolClient;
+            cleanup: () => void;
         }>;
     }
 }
@@ -150,13 +151,25 @@ test('worker_protocol_unknown_command', async ({ page }) => {
             await client.whenReady();
             return await new Promise<{ ok: boolean; name: string; message: string }>((resolve) => {
                 const id = 99;
-                const onMessage = (event: MessageEvent) => {
+                const onMessage = (event: MessageEvent<unknown>) => {
                     const data = event.data;
-                    if (data?.type !== 'moyodb:worker-protocol:response' || data.id !== id) {
+                    if (typeof data !== 'object' || data === null) {
                         return;
                     }
+                    if (!('type' in data) || data.type !== 'moyodb:worker-protocol:response') {
+                        return;
+                    }
+                    if (!('id' in data) || data.id !== id) {
+                        return;
+                    }
+                    const ok = 'ok' in data && data.ok === true;
+                    const error =
+                        'error' in data && typeof data.error === 'object' && data.error !== null ? data.error : null;
+                    const name = error !== null && 'name' in error && typeof error.name === 'string' ? error.name : '';
+                    const message =
+                        error !== null && 'message' in error && typeof error.message === 'string' ? error.message : '';
                     worker.removeEventListener('message', onMessage);
-                    resolve({ ok: data.ok, name: data.error?.name, message: data.error?.message });
+                    resolve({ ok, name, message });
                 };
                 worker.addEventListener('message', onMessage);
                 worker.postMessage({

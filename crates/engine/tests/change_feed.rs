@@ -91,13 +91,16 @@ fn change_feed_survives_reopen_and_snapshot_import_advances_retention_floor() {
 }
 
 #[test]
-fn change_feed_clear_and_drop_emit_visible_deletes_only() {
+fn change_feed_clear_and_drop_are_single_store_level_records() {
     let (_bundle, mut engine) = common::open_memory_engine("change-feed-clear-drop");
 
     let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
     engine.create_store(tx, "docs").unwrap();
-    engine.put(tx, "docs", b"a", b"one").unwrap();
-    engine.put(tx, "docs", b"b", b"two").unwrap();
+    for index in 0..500u32 {
+        engine
+            .put(tx, "docs", &index.to_be_bytes(), b"value")
+            .unwrap();
+    }
     let seed_txid = engine.commit_tx(tx).unwrap();
 
     let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
@@ -111,8 +114,9 @@ fn change_feed_clear_and_drop_emit_visible_deletes_only() {
         .unwrap();
     assert_eq!(cleared_feed.latest_tx_id, cleared_txid);
     assert_eq!(cleared_feed.changes.len(), 3);
-    assert_eq!(cleared_feed.changes[0].key, b"a".to_vec());
-    assert_eq!(cleared_feed.changes[0].kind, ChangeKind::Delete);
+    assert_eq!(cleared_feed.changes[0].kind, ChangeKind::Clear);
+    assert!(cleared_feed.changes[0].key.is_empty());
+    assert_eq!(cleared_feed.changes[0].value, None);
     assert_eq!(cleared_feed.changes[1].key, b"b".to_vec());
     assert_eq!(cleared_feed.changes[1].kind, ChangeKind::Put);
     assert_eq!(cleared_feed.changes[1].value, Some(b"two-new".to_vec()));
@@ -128,9 +132,82 @@ fn change_feed_clear_and_drop_emit_visible_deletes_only() {
         .changes_since(cleared_txid, ChangeFeedOptions::default())
         .unwrap();
     assert_eq!(dropped_feed.latest_tx_id, dropped_txid);
-    assert_eq!(dropped_feed.changes.len(), 2);
-    assert_eq!(dropped_feed.changes[0].key, b"b".to_vec());
-    assert_eq!(dropped_feed.changes[0].kind, ChangeKind::Delete);
-    assert_eq!(dropped_feed.changes[1].key, b"c".to_vec());
-    assert_eq!(dropped_feed.changes[1].kind, ChangeKind::Delete);
+    assert_eq!(dropped_feed.changes.len(), 1);
+    assert_eq!(dropped_feed.changes[0].store, "docs");
+    assert_eq!(dropped_feed.changes[0].kind, ChangeKind::Drop);
+    assert!(dropped_feed.changes[0].key.is_empty());
+}
+
+#[test]
+fn change_feed_retention_prunes_old_records_and_advances_floor() {
+    let (_bundle, mut engine) = common::open_memory_engine("change-feed-retention-policy");
+
+    let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
+    engine.create_store(tx, "docs").unwrap();
+    engine
+        .set_change_feed_policy(
+            tx,
+            moyodb_engine::ChangeFeedPolicy {
+                enabled: true,
+                retain_txids: Some(3),
+            },
+        )
+        .unwrap();
+    engine.commit_tx(tx).unwrap();
+
+    let mut last = 0;
+    for index in 0..10u8 {
+        let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
+        engine.put(tx, "docs", &[index], b"v").unwrap();
+        last = engine.commit_tx(tx).unwrap();
+    }
+
+    let err = engine
+        .changes_since(0, ChangeFeedOptions::default())
+        .unwrap_err();
+    assert!(matches!(err, EngineError::ChangeFeedCompacted(_)));
+
+    let retained = engine
+        .changes_since(last - 3, ChangeFeedOptions::default())
+        .unwrap();
+    assert_eq!(retained.changes.len(), 3);
+    assert!(retained
+        .changes
+        .iter()
+        .all(|change| change.tx_id > last - 3));
+}
+
+#[test]
+fn disabled_change_feed_keeps_no_history() {
+    let (_bundle, mut engine) = common::open_memory_engine("change-feed-disabled");
+
+    let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
+    engine.create_store(tx, "docs").unwrap();
+    engine.put(tx, "docs", b"a", b"one").unwrap();
+    engine.commit_tx(tx).unwrap();
+
+    let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
+    engine
+        .set_change_feed_policy(
+            tx,
+            moyodb_engine::ChangeFeedPolicy {
+                enabled: false,
+                retain_txids: None,
+            },
+        )
+        .unwrap();
+    engine.put(tx, "docs", b"b", b"two").unwrap();
+    let disabled_txid = engine.commit_tx(tx).unwrap();
+    assert!(!engine
+        .catalog()
+        .contains_key(moyodb_engine::change_feed::SYSTEM_CHANGELOG_STORE_NAME));
+
+    let err = engine
+        .changes_since(0, ChangeFeedOptions::default())
+        .unwrap_err();
+    assert!(matches!(err, EngineError::ChangeFeedCompacted(_)));
+    let empty = engine
+        .changes_since(disabled_txid, ChangeFeedOptions::default())
+        .unwrap();
+    assert!(empty.changes.is_empty());
 }

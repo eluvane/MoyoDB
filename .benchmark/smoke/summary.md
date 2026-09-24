@@ -1,8 +1,8 @@
 # MoyoDB benchmark baseline
 
-Generated at: 2026-06-25T19:04:55.109Z
+Generated at: 2026-09-24T10:01:49.723Z
 Mode: smoke
-Node: v24.11.0
+Node: v24.5.0
 Platform: win32/x64
 
 ## Policy
@@ -15,30 +15,33 @@ Platform: win32/x64
 
 | Case | ops/sec | avg ms | p50 ms | p95 ms | p99 ms | source |
 | --- | --- | --- | --- | --- | --- | --- |
-| moyodb / noop_js_loop_1m | 3750.00 | 0.27 | 0.30 | 0.30 | 0.30 | browser-bench-chromium-all-smoke.json |
-| moyodb / noop_worker_roundtrip_10k | 5.40 | 185.23 | 183.20 | 191.70 | 191.70 | browser-bench-chromium-all-smoke.json |
-| moyodb / worker_roundtrip_noop | 5.48 | 182.53 | 181.40 | 188.60 | 188.60 | browser-bench-chromium-all-smoke.json |
-| moyodb / worker_roundtrip_small_payload | 4.37 | 228.93 | 229.30 | 230.50 | 230.50 | browser-bench-chromium-all-smoke.json |
-| moyodb / worker_roundtrip_256b_payload | 4.17 | 239.57 | 238.00 | 249.10 | 249.10 | browser-bench-chromium-all-smoke.json |
-| moyodb / worker_roundtrip_64kb_payload | 68.49 | 14.60 | 14.70 | 15.40 | 15.40 | browser-bench-chromium-all-smoke.json |
-| moyodb / worker_binary_transfer_64kb | 184.05 | 5.43 | 4.70 | 7.10 | 7.10 | browser-bench-chromium-all-smoke.json |
-| moyodb / noop_wasm_call_100k | 303.03 | 3.30 | 3.30 | 3.60 | 3.60 | browser-bench-chromium-all-smoke.json |
-| moyodb / encode_decode_10k_256b | 76.73 | 13.03 | 13.00 | 13.20 | 13.20 | browser-bench-chromium-all-smoke.json |
-| moyodb / sdk_put_1k_single_calls | 0.48 | 2084.73 | 2088.50 | 2092.90 | 2092.90 | browser-bench-chromium-all-smoke.json |
-| moyodb / sdk_bulk_put_10k | 2.47 | 404.87 | 406.20 | 419.20 | 419.20 | browser-bench-chromium-all-smoke.json |
-| moyodb / engine_stage_put_10k_rollback | 35.01 | 28.57 | 28.60 | 30.70 | 30.70 | browser-bench-chromium-all-smoke.json |
-| moyodb / engine_bulk_put_10k | 2.42 | 413.47 | 409.90 | 427.10 | 427.10 | browser-bench-chromium-all-smoke.json |
-| indexeddb / indexeddb_bulk_put_10k | 1.16 | 859.43 | 802.10 | 1185.00 | 1185.00 | browser-bench-chromium-all-smoke.json |
-| moyodb / open_empty_db | 29.44 | 33.97 | 34.30 | 35.50 | 35.50 | browser-bench-chromium-all-smoke.json |
-| indexeddb / open_empty_db | 3750.00 | 0.27 | 0.30 | 0.30 | 0.30 | browser-bench-chromium-all-smoke.json |
-| moyodb / bulk_insert_10k | 0.75 | 1334.00 | 1335.60 | 1357.60 | 1357.60 | browser-bench-chromium-all-smoke.json |
-| indexeddb / bulk_insert_10k | 0.60 | 1662.67 | 1768.80 | 1813.00 | 1813.00 | browser-bench-chromium-all-smoke.json |
-| moyodb / point_get_random_10k | 0.81 | 1237.83 | 1225.20 | 1277.60 | 1277.60 | browser-bench-chromium-all-smoke.json |
-| indexeddb / point_get_random_10k | 7.46 | 134.00 | 123.30 | 155.70 | 155.70 | browser-bench-chromium-all-smoke.json |
-| moyodb / point_get_random_10k_bulk | 5.93 | 168.77 | 155.20 | 200.30 | 200.30 | browser-bench-chromium-all-smoke.json |
-| indexeddb / point_get_random_10k_bulk | 7.19 | 139.00 | 138.30 | 141.40 | 141.40 | browser-bench-chromium-all-smoke.json |
-| moyodb / range_scan_100 | 167.60 | 5.97 | 6.00 | 6.20 | 6.20 | browser-bench-chromium-all-smoke.json |
-| indexeddb / range_scan_100 | 370.37 | 2.70 | 2.70 | 2.90 | 2.90 | browser-bench-chromium-all-smoke.json |
-| moyodb / small_tx_1000_commits | 0.24 | 4124.30 | 4032.60 | 4380.30 | 4380.30 | browser-bench-chromium-all-smoke.json |
-| indexeddb / small_tx_1000_commits | 0.97 | 1030.30 | 959.60 | 1233.30 | 1233.30 | browser-bench-chromium-all-smoke.json |
-| moyodb / worker_roundtrip_overhead | 1.55 | 646.60 | 650.70 | 657.20 | 657.20 | browser-bench-chromium-all-smoke.json |
+| moyodb / noop_js_loop_1m | 322.58 | 3.10 | 3.10 | 3.20 | 3.20 | browser-bench-chromium-all-smoke.json |
+| moyodb / noop_worker_roundtrip_10k | 5.70 | 175.43 | 175.80 | 177.20 | 177.20 | browser-bench-chromium-all-smoke.json |
+| moyodb / worker_roundtrip_noop | 5.74 | 174.20 | 172.50 | 177.90 | 177.90 | browser-bench-chromium-all-smoke.json |
+| moyodb / worker_roundtrip_small_payload | 4.52 | 221.30 | 220.10 | 228.80 | 228.80 | browser-bench-chromium-all-smoke.json |
+| moyodb / worker_roundtrip_256b_payload | 4.55 | 219.67 | 219.70 | 221.20 | 221.20 | browser-bench-chromium-all-smoke.json |
+| moyodb / worker_roundtrip_64kb_payload | 71.94 | 13.90 | 13.30 | 15.30 | 15.30 | browser-bench-chromium-all-smoke.json |
+| moyodb / worker_binary_transfer_64kb | 176.47 | 5.67 | 4.80 | 7.70 | 7.70 | browser-bench-chromium-all-smoke.json |
+| moyodb / noop_wasm_call_100k | 205.48 | 4.87 | 5.00 | 5.00 | 5.00 | browser-bench-chromium-all-smoke.json |
+| moyodb / encode_decode_10k_256b | 71.77 | 13.93 | 12.70 | 16.60 | 16.60 | browser-bench-chromium-all-smoke.json |
+| moyodb / sdk_put_1k_single_calls | 1.95 | 513.83 | 514.50 | 522.20 | 522.20 | browser-bench-chromium-all-smoke.json |
+| moyodb / sdk_bulk_put_10k | 14.70 | 68.03 | 68.00 | 69.40 | 69.40 | browser-bench-chromium-all-smoke.json |
+| moyodb / engine_stage_put_10k_rollback | 105.26 | 9.50 | 9.60 | 9.90 | 9.90 | browser-bench-chromium-all-smoke.json |
+| moyodb / engine_bulk_put_10k | 17.67 | 56.60 | 55.70 | 58.40 | 58.40 | browser-bench-chromium-all-smoke.json |
+| indexeddb / indexeddb_bulk_put_10k | 6.40 | 156.13 | 156.20 | 157.10 | 157.10 | browser-bench-chromium-all-smoke.json |
+| moyodb / open_empty_db | 32.86 | 30.43 | 31.40 | 32.20 | 32.20 | browser-bench-chromium-all-smoke.json |
+| indexeddb / open_empty_db | 1071.43 | 0.93 | 1.00 | 1.20 | 1.20 | browser-bench-chromium-all-smoke.json |
+| moyodb / bulk_insert_10k | 5.28 | 189.33 | 189.30 | 189.50 | 189.50 | browser-bench-chromium-all-smoke.json |
+| indexeddb / bulk_insert_10k | 6.56 | 152.47 | 150.20 | 158.90 | 158.90 | browser-bench-chromium-all-smoke.json |
+| moyodb / point_get_random_10k | 1.21 | 826.30 | 825.10 | 835.60 | 835.60 | browser-bench-chromium-all-smoke.json |
+| indexeddb / point_get_random_10k | 2.27 | 439.83 | 441.10 | 441.70 | 441.70 | browser-bench-chromium-all-smoke.json |
+| moyodb / point_get_random_10k_pipelined | 1.60 | 624.97 | 624.30 | 628.10 | 628.10 | browser-bench-chromium-all-smoke.json |
+| indexeddb / point_get_random_10k_pipelined | 8.12 | 123.10 | 122.40 | 126.90 | 126.90 | browser-bench-chromium-all-smoke.json |
+| moyodb / point_get_random_10k_bulk | 1.99 | 503.43 | 502.00 | 508.40 | 508.40 | browser-bench-chromium-all-smoke.json |
+| moyodb / range_scan_100 | 750.00 | 1.33 | 1.30 | 1.40 | 1.40 | browser-bench-chromium-all-smoke.json |
+| indexeddb / range_scan_100 | 1363.64 | 0.73 | 0.70 | 0.80 | 0.80 | browser-bench-chromium-all-smoke.json |
+| moyodb / reverse_scan_limit_1 | 1764.71 | 0.57 | 0.60 | 0.70 | 0.70 | browser-bench-chromium-all-smoke.json |
+| indexeddb / reverse_scan_limit_1 | 4285.71 | 0.23 | 0.20 | 0.30 | 0.30 | browser-bench-chromium-all-smoke.json |
+| moyodb / small_tx_1000_commits | 1.98 | 504.57 | 507.30 | 513.50 | 513.50 | browser-bench-chromium-all-smoke.json |
+| indexeddb / small_tx_1000_commits | 9.65 | 103.67 | 99.70 | 113.60 | 113.60 | browser-bench-chromium-all-smoke.json |
+| moyodb / worker_roundtrip_overhead | 3.60 | 278.00 | 274.00 | 289.40 | 289.40 | browser-bench-chromium-all-smoke.json |

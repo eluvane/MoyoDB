@@ -8,7 +8,7 @@
     "require-repository": "warning",
     "require-keywords": "warning",
     "require-engines": "warning",
-    "valid-values-license": ["error", ["MIT OR Apache-2.0"]],
+    "valid-values-license": ["error", ["SEE LICENSE IN LICENSE"]],
     "prefer-alphabetical-dependencies": "error",
     "prefer-alphabetical-devDependencies": "error",
     "no-duplicate-properties": "error"

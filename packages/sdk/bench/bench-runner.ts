@@ -19,7 +19,9 @@ const RUNNERS: Record<BenchEngine, WorkloadRunner> = {
     indexeddb: indexedDbBaseline
 };
 
-type ViteImportMeta = ImportMeta & { env?: { MODE?: string; DEV?: boolean; PROD?: boolean } };
+type ViteImportMeta = Omit<ImportMeta, 'env'> & {
+    env?: { MODE?: string; DEV?: boolean; PROD?: boolean };
+};
 type IndexedDbFactoryWithDatabases = IDBFactory & {
     databases?: () => Promise<Array<{ name?: string | null }>>;
 };
@@ -36,11 +38,16 @@ export interface BenchmarkStorageCleanupResult {
     errors: string[];
 }
 
+// MoyoDB has no relaxed mode: every commit flushes WAL, main file, and manifest
+// before it resolves. IndexedDB is therefore measured with `strict` by default.
+const MOYODB_DURABILITY = 'strict: WAL, main file, and manifest are flushed before commit resolves';
+
 export const defaultBenchOptions: BenchOptions = {
     engines: ['moyodb', 'indexeddb'],
     profile: 'smoke',
     dbNamePrefix: 'moyodb-bench',
-    persistentContext: false
+    persistentContext: false,
+    indexedDbDurability: 'strict'
 };
 
 export async function runBenchmarkSuite(options: Partial<BenchOptions> = {}): Promise<BenchReport> {
@@ -49,10 +56,12 @@ export async function runBenchmarkSuite(options: Partial<BenchOptions> = {}): Pr
         ...options,
         engines: options.engines ?? defaultBenchOptions.engines,
         dbNamePrefix: options.dbNamePrefix ?? defaultBenchOptions.dbNamePrefix,
-        persistentContext: options.persistentContext ?? defaultBenchOptions.persistentContext
+        persistentContext: options.persistentContext ?? defaultBenchOptions.persistentContext,
+        indexedDbDurability: options.indexedDbDurability ?? defaultBenchOptions.indexedDbDurability
     };
+    const indexedDbDurability = normalized.indexedDbDurability ?? 'strict';
     const generatedAt = new Date().toISOString();
-    const environment = await detectBenchEnvironment(generatedAt, normalized.persistentContext ?? false);
+    const environment = await detectBenchEnvironment(generatedAt, normalized);
     const browser = environment.browser;
     const workloads = selectWorkloads(normalized.profile, normalized.workloadNames);
     const results: BenchResult[] = [];
@@ -63,16 +72,15 @@ export async function runBenchmarkSuite(options: Partial<BenchOptions> = {}): Pr
             const warmupCount = normalized.warmupCountOverride ?? workload.warmupCount;
             const sampleCount = normalized.sampleCountOverride ?? workload.sampleCount;
             results.push(
-                await runOneWorkload(
-                    runner,
-                    workload,
+                await runOneWorkload(runner, workload, {
                     browser,
-                    generatedAt,
+                    timestamp: generatedAt,
                     warmupCount,
                     sampleCount,
-                    normalized.dbNamePrefix ?? 'moyodb-bench',
-                    normalized.workloadTimeoutMs
-                )
+                    dbNamePrefix: normalized.dbNamePrefix ?? 'moyodb-bench',
+                    workloadTimeoutMs: normalized.workloadTimeoutMs,
+                    indexedDbDurability
+                })
             );
         }
     }
@@ -91,7 +99,10 @@ export async function runBenchmarkSuite(options: Partial<BenchOptions> = {}): Pr
             'Setup/preload/data generation/open/delete are outside the timed region unless the workload name explicitly says open/init or the notes say otherwise.',
             'MoyoDB browser measurements include SDK, Worker, WASM, and OPFS overhead unless a diagnostic workload isolates a lower layer.',
             'Native Rust microbenchmarks measure the engine core only. Browser benchmarks measure SDK/WASM/Worker/OPFS overhead. Do not compare them as if they measure the same path.',
-            'IndexedDB is measured with the same record counts, key/value sizes, batch sizes, and transaction boundaries for comparable workloads.'
+            'IndexedDB is measured with the same record counts, binary keys, values, random access order, batch sizes, and transaction boundaries for comparable workloads.',
+            `Durability: IndexedDB readwrite transactions use durability "${indexedDbDurability}"; MoyoDB commits are ${MOYODB_DURABILITY}.`,
+            'Random reads are reported per request mode: sequential rows keep one request outstanding, pipelined rows issue every request before awaiting, bulk rows use one getMany call (MoyoDB only).',
+            'After each timed sample, the data read or written is checked against the deterministic dataset outside the timed region; matching content checksums are recorded per sample.'
         ]
     };
 }
@@ -116,23 +127,30 @@ export async function clearBenchmarkStorage(
     return result;
 }
 
+interface WorkloadRunSettings {
+    browser: BrowserInfo;
+    timestamp: string;
+    warmupCount: number;
+    sampleCount: number;
+    dbNamePrefix: string;
+    workloadTimeoutMs?: number;
+    indexedDbDurability: IDBTransactionDurability;
+}
+
 async function runOneWorkload(
     runner: WorkloadRunner,
     workload: WorkloadSpec,
-    browser: BrowserInfo,
-    timestamp: string,
-    warmupCount: number,
-    sampleCount: number,
-    dbNamePrefix: string,
-    workloadTimeoutMs?: number
+    settings: WorkloadRunSettings
 ): Promise<BenchResult> {
+    const { warmupCount, sampleCount, dbNamePrefix, workloadTimeoutMs } = settings;
     const warmupSamples: number[] = [];
     const rawSamples: number[] = [];
-    const base: Omit<BenchResult, 'status' | 'warmupSamples' | 'rawSamples'> = {
+    const contentChecksums: Array<string | null> = [];
+    const base: Omit<BenchResult, 'status' | 'warmupSamples' | 'rawSamples' | 'contentChecksums'> = {
         engine: runner.engine,
         workloadName: workload.name,
-        browser,
-        timestamp,
+        browser: settings.browser,
+        timestamp: settings.timestamp,
         recordCount: workload.recordCount,
         keySize: workload.keySize,
         valueSize: workload.valueSize,
@@ -142,6 +160,13 @@ async function runOneWorkload(
         sampleCount,
         notes: workload.notes
     };
+    const sampleContext = (phase: 'warmup' | 'sample', index: number): SampleContext => ({
+        engine: runner.engine,
+        dbName: `${dbNamePrefix}-${runner.engine}-${workload.name}-${phase}-${index}-${Date.now()}`,
+        workload,
+        sampleIndex: index,
+        indexedDbDurability: settings.indexedDbDurability
+    });
 
     if (!workload.supports.includes(runner.engine)) {
         console.info(`[bench] skip ${runner.engine}/${workload.name}`);
@@ -150,6 +175,7 @@ async function runOneWorkload(
             status: 'skipped',
             warmupSamples,
             rawSamples,
+            contentChecksums,
             notes: `${workload.notes} Not applicable to ${runner.engine}.`
         };
     }
@@ -157,16 +183,7 @@ async function runOneWorkload(
     try {
         console.info(`[bench] start ${runner.engine}/${workload.name} warmups=${warmupCount} samples=${sampleCount}`);
         for (let i = 0; i < warmupCount; i += 1) {
-            const elapsed = await runPreparedSample(
-                runner,
-                {
-                    engine: runner.engine,
-                    dbName: `${dbNamePrefix}-${runner.engine}-${workload.name}-warmup-${i}-${Date.now()}`,
-                    workload,
-                    sampleIndex: i
-                },
-                workloadTimeoutMs
-            );
+            const { elapsed } = await runPreparedSample(runner, sampleContext('warmup', i), workloadTimeoutMs);
             warmupSamples.push(elapsed);
             console.info(
                 `[bench] warmup ${runner.engine}/${workload.name} ${i + 1}/${warmupCount}: ${elapsed.toFixed(2)}ms`
@@ -174,17 +191,13 @@ async function runOneWorkload(
             await yieldToBrowser();
         }
         for (let i = 0; i < sampleCount; i += 1) {
-            const elapsed = await runPreparedSample(
+            const { elapsed, checksum } = await runPreparedSample(
                 runner,
-                {
-                    engine: runner.engine,
-                    dbName: `${dbNamePrefix}-${runner.engine}-${workload.name}-sample-${i}-${Date.now()}`,
-                    workload,
-                    sampleIndex: i
-                },
+                sampleContext('sample', i),
                 workloadTimeoutMs
             );
             rawSamples.push(elapsed);
+            contentChecksums.push(checksum);
             console.info(
                 `[bench] sample ${runner.engine}/${workload.name} ${i + 1}/${sampleCount}: ${elapsed.toFixed(2)}ms`
             );
@@ -196,6 +209,7 @@ async function runOneWorkload(
             status: 'ok',
             warmupSamples,
             rawSamples,
+            contentChecksums,
             stats: computeStats(rawSamples)
         };
     } catch (error) {
@@ -206,6 +220,7 @@ async function runOneWorkload(
                 status: 'skipped',
                 warmupSamples,
                 rawSamples,
+                contentChecksums,
                 notes: `${workload.notes} ${error.message}`
             };
         }
@@ -217,14 +232,15 @@ async function runOneWorkload(
             status: 'error',
             warmupSamples,
             rawSamples,
+            contentChecksums,
             error: error instanceof Error ? `${error.name}: ${error.message}` : String(error)
         };
     }
 }
 
-async function detectBenchEnvironment(timestamp: string, persistentContext: boolean): Promise<BenchEnvironment> {
+async function detectBenchEnvironment(timestamp: string, options: BenchOptions): Promise<BenchEnvironment> {
     const browser = detectBrowserInfo();
-    const nav = navigator as Navigator & {
+    const nav = navigator as Omit<Navigator, 'storage' | 'locks'> & {
         locks?: unknown;
         storage?: StorageManager & { getDirectory?: unknown };
     };
@@ -240,17 +256,39 @@ async function detectBenchEnvironment(timestamp: string, persistentContext: bool
         os: browser.platform,
         secureContext: globalThis.isSecureContext,
         webdriver: Boolean(nav.webdriver),
+        gitSha: options.gitSha ?? 'unknown',
         sdkBuildMode: sdkMode,
-        wasmBuildMode:
-            'not introspected at runtime; use npm run build:wasm:release before publishing benchmark numbers',
+        wasmBuildMode: await detectWasmBuildProfile(),
         backendPath: syncAccessHandleSupported ? 'OPFS SyncAccessHandle in a dedicated Worker' : 'unavailable',
+        indexedDbDurability: options.indexedDbDurability ?? 'strict',
+        moyoDbDurability: MOYODB_DURABILITY,
         opfsSupported,
         syncAccessHandleSupported,
         locksSupported: Boolean(nav.locks),
         broadcastChannelSupported: typeof globalThis.BroadcastChannel !== 'undefined',
         workerSupported: typeof globalThis.Worker === 'function',
-        persistentContext
+        persistentContext: options.persistentContext ?? false
     };
+}
+
+type EngineBuildModule = {
+    default: (options: { module_or_path: string }) => Promise<unknown>;
+    buildProfile?: () => string;
+};
+
+/** Asks the same engine artifact the SDK worker loads whether it was built with debug assertions. */
+async function detectWasmBuildProfile(): Promise<string> {
+    try {
+        const moduleUrl = new URL('/engine/moyodb_engine.js', window.location.href).href;
+        const wasmUrl = new URL('/engine/moyodb_engine_bg.wasm', window.location.href).href;
+        const engine = (await import(/* @vite-ignore */ moduleUrl)) as EngineBuildModule;
+        await engine.default({ module_or_path: wasmUrl });
+        return typeof engine.buildProfile === 'function'
+            ? engine.buildProfile()
+            : 'unknown: engine build predates buildProfile()';
+    } catch (error) {
+        return `unknown: ${formatError(error)}`;
+    }
 }
 
 function detectBrowserInfo(): BrowserInfo {
@@ -260,7 +298,7 @@ function detectBrowserInfo(): BrowserInfo {
             brands?: Array<{ brand: string; version: string }>;
         };
     };
-    const ua = nav.userAgent ?? 'unknown';
+    const ua = nav.userAgent;
     const brand = nav.userAgentData?.brands?.find((item) => !/Not.?A.?Brand/i.test(item.brand));
     const parsed = parseUserAgent(ua);
     return {
@@ -273,7 +311,7 @@ function detectBrowserInfo(): BrowserInfo {
 
 async function estimateStorage(): Promise<StorageEstimate | undefined> {
     try {
-        return await navigator.storage?.estimate?.();
+        return await navigator.storage.estimate();
     } catch {
         return undefined;
     }
@@ -337,7 +375,7 @@ async function clearBenchmarkOpfs(prefixes: string[], result: BenchmarkStorageCl
 
     let stackdb: IterableFileSystemDirectoryHandle | null = null;
     try {
-        stackdb = (await root.getDirectoryHandle('stackdb', { create: false })) as IterableFileSystemDirectoryHandle;
+        stackdb = await root.getDirectoryHandle('stackdb', { create: false });
     } catch (error) {
         if (!(error instanceof DOMException && error.name === 'NotFoundError')) {
             result.errors.push(`OPFS stackdb open failed: ${formatError(error)}`);
@@ -402,17 +440,42 @@ function formatError(error: unknown): string {
     return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
 }
 
-function parseUserAgent(ua: string): { name: string; version: string } {
-    const patterns: Array<[string, RegExp]> = [
-        ['Firefox', /Firefox\/(\d+(?:\.\d+)?)/],
-        ['Chromium', /Chrom(?:e|ium)\/(\d+(?:\.\d+)?)/],
-        ['Safari', /Version\/(\d+(?:\.\d+)?).*Safari\//]
-    ];
-    for (const [name, pattern] of patterns) {
-        const match = pattern.exec(ua);
-        if (match) {
-            return { name, version: match[1] };
+function readVersionToken(source: string, token: string): string | null {
+    const start = source.indexOf(token);
+    if (start < 0) {
+        return null;
+    }
+    let index = start + token.length;
+    const digits = () => {
+        const from = index;
+        while (index < source.length && source[index] >= '0' && source[index] <= '9') {
+            index += 1;
         }
+        return index > from;
+    };
+    if (!digits()) {
+        return null;
+    }
+    if (source[index] === '.') {
+        index += 1;
+        if (!digits()) {
+            return null;
+        }
+    }
+    return source.slice(start + token.length, index);
+}
+function parseUserAgent(ua: string): { name: string; version: string } {
+    const firefox = readVersionToken(ua, 'Firefox/');
+    if (firefox) {
+        return { name: 'Firefox', version: firefox };
+    }
+    const chromium = readVersionToken(ua, 'Chromium/') ?? readVersionToken(ua, 'Chrome/');
+    if (chromium) {
+        return { name: 'Chromium', version: chromium };
+    }
+    const safari = readVersionToken(ua, 'Version/');
+    if (safari && ua.includes('Safari/')) {
+        return { name: 'Safari', version: safari };
     }
     return { name: 'unknown', version: 'unknown' };
 }
@@ -468,7 +531,7 @@ async function runPreparedSample(
     runner: WorkloadRunner,
     ctx: SampleContext,
     timeoutMs: number | undefined
-): Promise<number> {
+): Promise<{ elapsed: number; checksum: string | null }> {
     const cleanup = await withOptionalTimeout(
         Promise.resolve(runner.prepare?.(ctx)),
         timeoutMs,
@@ -481,7 +544,13 @@ async function runPreparedSample(
             timeoutMs,
             `${runner.engine}/${ctx.workload.name} sample timed out after ${timeoutMs}ms`
         );
-        return performance.now() - started;
+        const elapsed = performance.now() - started;
+        const checksum = await withOptionalTimeout(
+            Promise.resolve(runner.verify?.(ctx) ?? null),
+            timeoutMs,
+            `${runner.engine}/${ctx.workload.name} verification timed out after ${timeoutMs}ms`
+        );
+        return { elapsed, checksum };
     } finally {
         await cleanup?.();
         await runner.cleanup?.(ctx);
@@ -501,7 +570,7 @@ function withOptionalTimeout<T>(promise: Promise<T>, timeoutMs: number | undefin
             },
             (error) => {
                 clearTimeout(timeout);
-                reject(error);
+                reject(error instanceof Error ? error : new Error('benchmark step failed'));
             }
         );
     });

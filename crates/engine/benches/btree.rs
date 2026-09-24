@@ -1,4 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, Criterion};
 use moyodb_engine::btree::{build_tree, lookup, scan, RangeSpec};
 use moyodb_engine::pager::Pager;
 use moyodb_engine::storage::memory::MemoryBackend;

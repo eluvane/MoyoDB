@@ -55,7 +55,7 @@ test('openDB rejects invalid option shapes before spawning a worker', async ({ p
     await prepareMoyoDbPage(page);
     const errorName = await page.evaluate(async (name) => {
         try {
-            await window.moyodb.openDB(name, { ownerWaitMs: -1 } as any);
+            await window.moyodb.openDB(name, { ownerWaitMs: -1 });
             return 'NO_ERROR';
         } catch (error) {
             return (error as Error).name;
@@ -101,7 +101,7 @@ test('openDB and deleteDB validate database names before touching worker state',
             message: string;
         }> = [];
         try {
-            await window.moyodb.openDB('' as any);
+            await window.moyodb.openDB('');
             outcomes.push({ name: 'NO_ERROR', message: '' });
         } catch (error) {
             outcomes.push({
@@ -110,7 +110,7 @@ test('openDB and deleteDB validate database names before touching worker state',
             });
         }
         try {
-            await window.moyodb.deleteDB({ bad: true } as any);
+            await window.moyodb.deleteDB({ bad: true } as unknown as string);
             outcomes.push({ name: 'NO_ERROR', message: '' });
         } catch (error) {
             outcomes.push({
@@ -136,7 +136,7 @@ test('openDB rejects null option bags with InvalidOpenOptionsError', async ({ pa
     await prepareMoyoDbPage(page);
     const result = await page.evaluate(async (name) => {
         try {
-            await window.moyodb.openDB(name, null as any);
+            await window.moyodb.openDB(name, null as unknown as Parameters<typeof window.moyodb.openDB>[1]);
             return { name: 'NO_ERROR', message: '' };
         } catch (error) {
             return {

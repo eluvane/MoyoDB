@@ -1,12 +1,13 @@
 #[cfg(target_arch = "wasm32")]
 mod wasm {
     use crate::btree::{KvPair, RangeSpec};
+    use crate::catalog::ChangeFeedPolicy;
     use crate::change_feed::ChangeFeedOptions;
     use crate::engine::{DbStats, Engine, Failpoint, OpenConfig};
     use crate::error::EngineError;
     use crate::storage::backend::FileSet;
     use crate::storage::opfs::OpfsBackend;
-    use crate::txn::{BatchOp, BatchOpOutcome, TxMode};
+    use crate::txn::{BatchOp, BatchOpOutcome, BatchOpRef, TxMode};
     use crate::value::StoreCompression;
     use js_sys::{Array, Object, Reflect, Uint8Array};
     use serde::{Deserialize, Serialize};
@@ -14,11 +15,32 @@ mod wasm {
 
     const PACKED_BATCH_OP_DELETE: u8 = 0;
     const PACKED_BATCH_OP_PUT: u8 = 1;
+    /// Length marker for a missing value in packed `getMany` output.
+    const PACKED_MISSING_VALUE: u32 = u32::MAX;
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[serde(default)]
     struct WasmOpenOptions {
         create_if_missing: Option<bool>,
         cache_pages: Option<usize>,
+        checkpoint_wal_bytes: Option<u64>,
+        checkpoint_dirty_pages: Option<usize>,
+    }
+
+    impl WasmOpenOptions {
+        fn config(&self) -> OpenConfig {
+            let defaults = OpenConfig::default();
+            OpenConfig {
+                create_if_missing: self.create_if_missing.unwrap_or(defaults.create_if_missing),
+                cache_pages: self.cache_pages.unwrap_or(defaults.cache_pages),
+                checkpoint_wal_bytes: self
+                    .checkpoint_wal_bytes
+                    .unwrap_or(defaults.checkpoint_wal_bytes),
+                checkpoint_dirty_pages: self
+                    .checkpoint_dirty_pages
+                    .unwrap_or(defaults.checkpoint_dirty_pages),
+            }
+        }
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +126,13 @@ mod wasm {
         }
     }
 
+    fn outcome_flag(outcome: &BatchOpOutcome) -> u8 {
+        match outcome {
+            BatchOpOutcome::Put { baseline_exists } => u8::from(*baseline_exists),
+            BatchOpOutcome::Delete { deleted } => u8::from(*deleted),
+        }
+    }
+
     #[derive(Debug, Clone, Serialize)]
     struct WasmKvPair {
         #[serde(with = "serde_bytes")]
@@ -145,14 +174,30 @@ mod wasm {
         js_value_from_serializable(&WasmRebuildTargetInfo { generation_name })
     }
 
+    /// Publishes `generation_name` as the active generation. With
+    /// `expected_current` set, the swap fails unless the control file still
+    /// names that generation (or is absent, for `null`), and the written
+    /// control file is read back and verified before this resolves.
     #[wasm_bindgen(js_name = swapActiveGeneration)]
     pub async fn swap_active_generation(
         name: String,
         generation_name: String,
+        expected_current: Option<String>,
     ) -> std::result::Result<(), JsValue> {
-        OpfsBackend::swap_active_generation(&name, &generation_name)
+        OpfsBackend::swap_active_generation(&name, &generation_name, expected_current)
             .await
             .map_err(js_error)
+    }
+
+    /// Active generation from the control file, or `null` for the legacy
+    /// layout. A corrupt control file is an error, never `null`.
+    #[wasm_bindgen(js_name = readActiveGeneration)]
+    pub async fn read_active_generation(name: String) -> std::result::Result<JsValue, JsValue> {
+        Ok(OpfsBackend::read_active_generation(&name)
+            .await
+            .map_err(js_error)?
+            .map(|generation| JsValue::from_str(&generation))
+            .unwrap_or(JsValue::NULL))
     }
 
     #[wasm_bindgen(js_name = cleanupInactiveEntries)]
@@ -167,6 +212,17 @@ mod wasm {
         Ok(OpfsBackend::db_directory_size(&name)
             .await
             .map_err(js_error)? as f64)
+    }
+
+    /// `"debug"` or `"release"`; benchmark reports record which build they
+    /// measured instead of trusting the build script that was supposed to run.
+    #[wasm_bindgen(js_name = buildProfile)]
+    pub fn build_profile() -> String {
+        if cfg!(debug_assertions) {
+            "debug".into()
+        } else {
+            "release".into()
+        }
     }
 
     impl WasmEngine {
@@ -185,17 +241,15 @@ mod wasm {
             files: FileSet<OpfsBackend>,
             open: &WasmOpenOptions,
         ) -> std::result::Result<(), JsValue> {
-            let engine = Engine::open(
-                name,
-                files,
-                OpenConfig {
-                    create_if_missing: open.create_if_missing.unwrap_or(true),
-                    cache_pages: open.cache_pages.unwrap_or(256),
-                },
-            )
-            .map_err(js_error)?;
+            let engine = Engine::open(name, files, open.config()).map_err(js_error)?;
             self.inner = Some(engine);
             Ok(())
+        }
+
+        fn inner_mut(&mut self) -> std::result::Result<&mut Engine<OpfsBackend>, JsValue> {
+            self.inner
+                .as_mut()
+                .ok_or_else(|| js_error(EngineError::Closed))
         }
     }
 
@@ -213,9 +267,8 @@ mod wasm {
             options: JsValue,
         ) -> std::result::Result<(), JsValue> {
             self.ensure_not_open()?;
-            let open: WasmOpenOptions =
-                serde_wasm_bindgen::from_value(options).map_err(js_error_from_display)?;
-            let files = OpfsBackend::open_db(&name, open.create_if_missing.unwrap_or(true))
+            let open: WasmOpenOptions = parse_optional_options(options)?;
+            let files = OpfsBackend::open_db(&name, open.config().create_if_missing)
                 .await
                 .map_err(js_error)?;
             self.finish_open(&name, files, &open)
@@ -229,25 +282,68 @@ mod wasm {
             options: JsValue,
         ) -> std::result::Result<(), JsValue> {
             self.ensure_not_open()?;
-            let open: WasmOpenOptions =
-                serde_wasm_bindgen::from_value(options).map_err(js_error_from_display)?;
+            let open: WasmOpenOptions = parse_optional_options(options)?;
             let files = OpfsBackend::open_generation(
                 &name,
                 &generation_name,
-                open.create_if_missing.unwrap_or(true),
+                open.config().create_if_missing,
             )
             .await
             .map_err(js_error)?;
             self.finish_open(&name, files, &open)
         }
 
+        /// Checkpoints (when healthy) and closes. The handle is released even
+        /// when closing fails, so a retry never reuses a half-closed engine.
         #[wasm_bindgen]
         pub fn close(&mut self) -> std::result::Result<(), JsValue> {
-            if let Some(engine) = self.inner.as_mut() {
-                engine.close().map_err(js_error)?;
+            match self.inner.take() {
+                Some(mut engine) => engine.close().map_err(js_error),
+                None => Ok(()),
             }
-            self.inner = None;
-            Ok(())
+        }
+
+        /// Closes without a checkpoint. Used for an engine whose files are
+        /// about to be replaced or whose memory is not trusted.
+        #[wasm_bindgen]
+        pub fn abandon(&mut self) -> std::result::Result<(), JsValue> {
+            match self.inner.take() {
+                Some(mut engine) => engine.abandon().map_err(js_error),
+                None => Ok(()),
+            }
+        }
+
+        #[wasm_bindgen]
+        pub fn recover(&mut self) -> std::result::Result<JsValue, JsValue> {
+            let report = self.inner_mut()?.recover().map_err(js_error)?;
+            js_value_from_serializable(&report)
+        }
+
+        #[wasm_bindgen]
+        pub fn health(&mut self) -> std::result::Result<JsValue, JsValue> {
+            let health = self.inner_mut()?.health().clone();
+            js_value_from_serializable(&health)
+        }
+
+        #[wasm_bindgen]
+        pub fn needs_recovery(&mut self) -> std::result::Result<bool, JsValue> {
+            Ok(self.inner_mut()?.needs_recovery())
+        }
+
+        #[wasm_bindgen]
+        pub fn checkpoint(&mut self) -> std::result::Result<(), JsValue> {
+            self.inner_mut()?.checkpoint().map_err(js_error)
+        }
+
+        /// Streams this database into `target`, a freshly opened empty
+        /// generation. Returns the txid the target was published at.
+        #[wasm_bindgen]
+        pub fn compact_into(
+            &mut self,
+            target: &mut WasmEngine,
+        ) -> std::result::Result<u64, JsValue> {
+            let target = target.inner_mut()?;
+            self.inner_mut()?.compact_into(target).map_err(js_error)
         }
 
         #[wasm_bindgen]
@@ -302,11 +398,11 @@ mod wasm {
             &mut self,
             tx_id: u64,
             store: String,
-            key: Vec<u8>,
+            key: &[u8],
         ) -> std::result::Result<JsValue, JsValue> {
             match self
                 .inner_mut()?
-                .get(tx_id, &store, &key)
+                .get(tx_id, &store, key)
                 .map_err(js_error)?
             {
                 Some(bytes) => Ok(Uint8Array::from(bytes.as_slice()).into()),
@@ -319,9 +415,9 @@ mod wasm {
             &mut self,
             tx_id: u64,
             store: String,
-            key: Vec<u8>,
+            key: &[u8],
         ) -> std::result::Result<bool, JsValue> {
-            self.inner_mut()?.has(tx_id, &store, &key).map_err(js_error)
+            self.inner_mut()?.has(tx_id, &store, key).map_err(js_error)
         }
 
         #[wasm_bindgen]
@@ -339,19 +435,22 @@ mod wasm {
             Ok(uint8_array_options_to_js_array(values).into())
         }
 
+        /// Keys arrive packed; values leave packed as
+        /// `u32 count | count x u32 length (u32::MAX = missing) | bytes`,
+        /// one buffer instead of one JS array per value.
         #[wasm_bindgen]
         pub fn get_many_packed(
             &mut self,
             tx_id: u64,
             store: String,
-            keys: Uint8Array,
-        ) -> std::result::Result<JsValue, JsValue> {
+            keys: &[u8],
+        ) -> std::result::Result<Vec<u8>, JsValue> {
             let keys = parse_packed_binary_list(keys, "packed getMany")?;
             let values = self
                 .inner_mut()?
                 .get_many(tx_id, &store, &keys)
                 .map_err(js_error)?;
-            Ok(uint8_array_options_to_js_array(values).into())
+            pack_optional_values(&values)
         }
 
         #[wasm_bindgen]
@@ -359,13 +458,13 @@ mod wasm {
             &mut self,
             tx_id: u64,
             store: String,
-            key: Vec<u8>,
-            value: Vec<u8>,
+            key: &[u8],
+            value: &[u8],
             options: JsValue,
-        ) -> std::result::Result<(), JsValue> {
+        ) -> std::result::Result<bool, JsValue> {
             let options: WasmPutOptions = parse_optional_options(options)?;
             self.inner_mut()?
-                .put_with_ttl(tx_id, &store, &key, &value, options.ttl)
+                .put_reporting_baseline(tx_id, &store, key, value, options.ttl)
                 .map_err(js_error)
         }
 
@@ -393,14 +492,15 @@ mod wasm {
             }
         }
 
+        /// Returns one byte per entry: 1 if the key existed before the put.
         #[wasm_bindgen]
         pub fn put_many_packed(
             &mut self,
             tx_id: u64,
             store: String,
-            entries: Uint8Array,
+            entries: &[u8],
             options: JsValue,
-        ) -> std::result::Result<JsValue, JsValue> {
+        ) -> std::result::Result<Vec<u8>, JsValue> {
             let entries = parse_packed_binary_pairs(entries)?;
             let options: WasmPutOptions = parse_optional_options(options)?;
             let report =
@@ -408,7 +508,11 @@ mod wasm {
                     .put_many_with_ttl_report(tx_id, &store, &entries, options.ttl);
             match report.error {
                 Some(error) => Err(js_error_with_partial(error, &report.completed)),
-                None => js_value_from_serializable(&report.completed),
+                None => Ok(report
+                    .completed
+                    .iter()
+                    .map(|flag| u8::from(*flag))
+                    .collect()),
             }
         }
 
@@ -417,10 +521,10 @@ mod wasm {
             &mut self,
             tx_id: u64,
             store: String,
-            key: Vec<u8>,
+            key: &[u8],
         ) -> std::result::Result<bool, JsValue> {
             self.inner_mut()?
-                .delete(tx_id, &store, &key)
+                .delete(tx_id, &store, key)
                 .map_err(js_error)
         }
 
@@ -441,18 +545,23 @@ mod wasm {
             }
         }
 
+        /// Returns one byte per key: 1 if the key existed and was deleted.
         #[wasm_bindgen]
         pub fn delete_many_packed(
             &mut self,
             tx_id: u64,
             store: String,
-            keys: Uint8Array,
-        ) -> std::result::Result<JsValue, JsValue> {
+            keys: &[u8],
+        ) -> std::result::Result<Vec<u8>, JsValue> {
             let keys = parse_packed_binary_list(keys, "packed deleteMany")?;
             let report = self.inner_mut()?.delete_many_report(tx_id, &store, &keys);
             match report.error {
                 Some(error) => Err(js_error_with_partial(error, &report.completed)),
-                None => js_value_from_serializable(&report.completed),
+                None => Ok(report
+                    .completed
+                    .iter()
+                    .map(|flag| u8::from(*flag))
+                    .collect()),
             }
         }
 
@@ -475,20 +584,26 @@ mod wasm {
             }
         }
 
+        /// Returns one byte per op: for puts whether the key existed before,
+        /// for deletes whether a key was deleted. The op kinds are the caller's.
         #[wasm_bindgen]
         pub fn apply_batch_packed(
             &mut self,
             tx_id: u64,
             store: String,
-            ops: Uint8Array,
-        ) -> std::result::Result<JsValue, JsValue> {
+            ops: &[u8],
+        ) -> std::result::Result<Vec<u8>, JsValue> {
             let ops = parse_packed_batch_ops(ops)?;
-            let report = self.inner_mut()?.apply_batch_report(tx_id, &store, &ops);
-            let completed: Vec<WasmBatchOpOutcome> =
-                report.completed.into_iter().map(Into::into).collect();
+            let report = self
+                .inner_mut()?
+                .apply_batch_refs_report(tx_id, &store, &ops);
             match report.error {
-                Some(error) => Err(js_error_with_partial(error, &completed)),
-                None => js_value_from_serializable(&completed),
+                Some(error) => {
+                    let completed: Vec<WasmBatchOpOutcome> =
+                        report.completed.into_iter().map(Into::into).collect();
+                    Err(js_error_with_partial(error, &completed))
+                }
+                None => Ok(report.completed.iter().map(outcome_flag).collect()),
             }
         }
 
@@ -530,14 +645,32 @@ mod wasm {
         }
 
         #[wasm_bindgen]
+        pub fn change_feed_policy(&mut self) -> std::result::Result<JsValue, JsValue> {
+            let policy = self.inner_mut()?.change_feed_policy();
+            js_value_from_serializable(&policy)
+        }
+
+        #[wasm_bindgen]
+        pub fn set_change_feed_policy(
+            &mut self,
+            tx_id: u64,
+            policy: JsValue,
+        ) -> std::result::Result<(), JsValue> {
+            let policy: ChangeFeedPolicy =
+                serde_wasm_bindgen::from_value(policy).map_err(js_error_from_display)?;
+            self.inner_mut()?
+                .set_change_feed_policy(tx_id, policy)
+                .map_err(js_error)
+        }
+
+        #[wasm_bindgen]
         pub fn get_schema_version(&mut self) -> std::result::Result<u64, JsValue> {
             Ok(self.inner_mut()?.schema_version())
         }
 
         #[wasm_bindgen]
-        pub fn export_snapshot(&mut self) -> std::result::Result<Uint8Array, JsValue> {
-            let bytes = self.inner_mut()?.export_snapshot().map_err(js_error)?;
-            Ok(Uint8Array::from(bytes.as_slice()))
+        pub fn export_snapshot(&mut self) -> std::result::Result<Vec<u8>, JsValue> {
+            self.inner_mut()?.export_snapshot().map_err(js_error)
         }
 
         #[wasm_bindgen]
@@ -547,8 +680,8 @@ mod wasm {
         }
 
         #[wasm_bindgen]
-        pub fn import_snapshot(&mut self, data: Vec<u8>) -> std::result::Result<u64, JsValue> {
-            self.inner_mut()?.import_snapshot(&data).map_err(js_error)
+        pub fn import_snapshot(&mut self, data: &[u8]) -> std::result::Result<u64, JsValue> {
+            self.inner_mut()?.import_snapshot(data).map_err(js_error)
         }
 
         #[wasm_bindgen]
@@ -590,12 +723,6 @@ mod wasm {
             self.inner_mut()?.set_failpoint(parsed);
             Ok(())
         }
-
-        fn inner_mut(&mut self) -> std::result::Result<&mut Engine<OpfsBackend>, JsValue> {
-            self.inner
-                .as_mut()
-                .ok_or_else(|| js_error_from_display("engine not open"))
-        }
     }
 
     fn js_value_from_serializable<T: Serialize>(
@@ -622,15 +749,15 @@ mod wasm {
         Ok(out)
     }
 
-    fn parse_packed_binary_list(
-        value: Uint8Array,
+    /// Splits a packed list into slices of the input; nothing is copied.
+    fn parse_packed_binary_list<'a>(
+        bytes: &'a [u8],
         what: &str,
-    ) -> std::result::Result<Vec<Vec<u8>>, JsValue> {
-        let bytes = value.to_vec();
+    ) -> std::result::Result<Vec<&'a [u8]>, JsValue> {
         if bytes.len() < 4 {
             return Err(js_error_from_display(format!("invalid {what} payload")));
         }
-        let count = read_u32_le(&bytes, 0, what)?;
+        let count = read_u32_le(bytes, 0, what)?;
         let metadata_bytes = checked_byte_count(count, 4, what)?;
         let payload_offset = checked_add_usize(4, metadata_bytes, what)?;
         if payload_offset > bytes.len() {
@@ -643,7 +770,7 @@ mod wasm {
         let mut metadata_offset = 4;
         let mut read_offset = payload_offset;
         for _ in 0..count {
-            let byte_length = read_u32_le(&bytes, metadata_offset, what)?;
+            let byte_length = read_u32_le(bytes, metadata_offset, what)?;
             metadata_offset += 4;
             let end = checked_add_usize(read_offset, byte_length, what)?;
             if end > bytes.len() {
@@ -651,7 +778,7 @@ mod wasm {
                     "{what} item exceeds payload length"
                 )));
             }
-            items.push(bytes[read_offset..end].to_vec());
+            items.push(&bytes[read_offset..end]);
             read_offset = end;
         }
         if read_offset != bytes.len() {
@@ -663,14 +790,13 @@ mod wasm {
     }
 
     fn parse_packed_binary_pairs(
-        value: Uint8Array,
-    ) -> std::result::Result<Vec<(Vec<u8>, Vec<u8>)>, JsValue> {
-        let bytes = value.to_vec();
+        bytes: &[u8],
+    ) -> std::result::Result<Vec<(&[u8], &[u8])>, JsValue> {
         let what = "packed putMany";
         if bytes.len() < 4 {
             return Err(js_error_from_display("invalid packed putMany payload"));
         }
-        let item_count = read_u32_le(&bytes, 0, what)?;
+        let item_count = read_u32_le(bytes, 0, what)?;
         if item_count % 2 != 0 {
             return Err(js_error_from_display(
                 "packed putMany payload has an odd item count",
@@ -689,8 +815,8 @@ mod wasm {
         let mut metadata_offset = 4;
         let mut read_offset = payload_offset;
         for _ in 0..entry_count {
-            let key_length = read_u32_le(&bytes, metadata_offset, what)?;
-            let value_length = read_u32_le(&bytes, metadata_offset + 4, what)?;
+            let key_length = read_u32_le(bytes, metadata_offset, what)?;
+            let value_length = read_u32_le(bytes, metadata_offset + 4, what)?;
             metadata_offset += 8;
             let key_end = checked_add_usize(read_offset, key_length, what)?;
             if key_end > bytes.len() {
@@ -704,10 +830,7 @@ mod wasm {
                     "packed putMany value exceeds payload length",
                 ));
             }
-            entries.push((
-                bytes[read_offset..key_end].to_vec(),
-                bytes[key_end..value_end].to_vec(),
-            ));
+            entries.push((&bytes[read_offset..key_end], &bytes[key_end..value_end]));
             read_offset = value_end;
         }
         if read_offset != bytes.len() {
@@ -718,13 +841,12 @@ mod wasm {
         Ok(entries)
     }
 
-    fn parse_packed_batch_ops(value: Uint8Array) -> std::result::Result<Vec<BatchOp>, JsValue> {
-        let bytes = value.to_vec();
+    fn parse_packed_batch_ops(bytes: &[u8]) -> std::result::Result<Vec<BatchOpRef<'_>>, JsValue> {
         let what = "packed batch";
         if bytes.len() < 4 {
             return Err(js_error_from_display("invalid packed batch payload"));
         }
-        let count = read_u32_le(&bytes, 0, what)?;
+        let count = read_u32_le(bytes, 0, what)?;
         let metadata_bytes = checked_byte_count(count, 9, what)?;
         let payload_offset = checked_add_usize(4, metadata_bytes, what)?;
         if payload_offset > bytes.len() {
@@ -738,8 +860,8 @@ mod wasm {
         let mut read_offset = payload_offset;
         for _ in 0..count {
             let kind = bytes[metadata_offset];
-            let key_length = read_u32_le(&bytes, metadata_offset + 1, what)?;
-            let value_length = read_u32_le(&bytes, metadata_offset + 5, what)?;
+            let key_length = read_u32_le(bytes, metadata_offset + 1, what)?;
+            let value_length = read_u32_le(bytes, metadata_offset + 5, what)?;
             metadata_offset += 9;
 
             let key_end = checked_add_usize(read_offset, key_length, what)?;
@@ -748,7 +870,7 @@ mod wasm {
                     "packed batch key exceeds payload length",
                 ));
             }
-            let key = bytes[read_offset..key_end].to_vec();
+            let key = &bytes[read_offset..key_end];
             read_offset = key_end;
 
             if kind == PACKED_BATCH_OP_DELETE {
@@ -757,7 +879,7 @@ mod wasm {
                         "packed delete operation has a value payload",
                     ));
                 }
-                ops.push(BatchOp::Delete { key });
+                ops.push(BatchOpRef::Delete { key });
                 continue;
             }
 
@@ -772,9 +894,9 @@ mod wasm {
                     "packed batch value exceeds payload length",
                 ));
             }
-            ops.push(BatchOp::Put {
+            ops.push(BatchOpRef::Put {
                 key,
-                value: bytes[read_offset..value_end].to_vec(),
+                value: &bytes[read_offset..value_end],
             });
             read_offset = value_end;
         }
@@ -784,6 +906,29 @@ mod wasm {
             ));
         }
         Ok(ops)
+    }
+
+    fn pack_optional_values(values: &[Option<Vec<u8>>]) -> std::result::Result<Vec<u8>, JsValue> {
+        let what = "packed getMany output";
+        let count = u32::try_from(values.len())
+            .map_err(|_| js_error_from_display(format!("{what} has too many values")))?;
+        let payload_len: usize = values.iter().flatten().map(Vec::len).sum();
+        let mut out = Vec::with_capacity(4 + values.len() * 4 + payload_len);
+        out.extend_from_slice(&count.to_le_bytes());
+        for value in values {
+            let len = match value {
+                Some(bytes) => u32::try_from(bytes.len())
+                    .ok()
+                    .filter(|len| *len != PACKED_MISSING_VALUE)
+                    .ok_or_else(|| js_error_from_display(format!("{what} value too large")))?,
+                None => PACKED_MISSING_VALUE,
+            };
+            out.extend_from_slice(&len.to_le_bytes());
+        }
+        for bytes in values.iter().flatten() {
+            out.extend_from_slice(bytes);
+        }
+        Ok(out)
     }
 
     fn read_u32_le(bytes: &[u8], offset: usize, what: &str) -> std::result::Result<usize, JsValue> {

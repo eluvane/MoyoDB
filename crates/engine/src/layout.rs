@@ -3,7 +3,7 @@ use crate::checksum::checksum_with_zeroed_region;
 use crate::error::{EngineError, Result};
 use serde::{Deserialize, Serialize};
 use std::mem::size_of;
-use zerocopy::{AsBytes, FromBytes, FromZeroes};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 pub const PAGE_SIZE: usize = 4096;
 pub const SUPERBLOCK_SLOT_SIZE: usize = 4096;
@@ -74,7 +74,7 @@ impl WalTag {
 }
 
 #[repr(C, packed)]
-#[derive(AsBytes, FromBytes, FromZeroes, Clone, Copy, Default)]
+#[derive(FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned, Clone, Copy, Default)]
 pub struct SuperblockHeader {
     pub magic: [u8; 8],
     pub format_version: u32,
@@ -89,7 +89,7 @@ pub struct SuperblockHeader {
 }
 
 #[repr(C, packed)]
-#[derive(AsBytes, FromBytes, FromZeroes, Clone, Copy, Default)]
+#[derive(FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned, Clone, Copy, Default)]
 pub struct PageHeader {
     pub magic: [u8; 4],
     pub checksum: u32,
@@ -104,7 +104,7 @@ pub struct PageHeader {
 }
 
 #[repr(C, packed)]
-#[derive(AsBytes, FromBytes, FromZeroes, Clone, Copy, Default)]
+#[derive(FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned, Clone, Copy, Default)]
 pub struct WalRecordHeader {
     pub magic: [u8; 4],
     pub tag: u8,
@@ -116,7 +116,7 @@ pub struct WalRecordHeader {
 }
 
 #[repr(C, packed)]
-#[derive(AsBytes, FromBytes, FromZeroes, Clone, Copy, Default)]
+#[derive(FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned, Clone, Copy, Default)]
 pub struct WalPageImageBodyHeader {
     pub txid: u64,
     pub page_id: u64,
@@ -125,7 +125,7 @@ pub struct WalPageImageBodyHeader {
 }
 
 #[repr(C, packed)]
-#[derive(AsBytes, FromBytes, FromZeroes, Clone, Copy, Default)]
+#[derive(FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned, Clone, Copy, Default)]
 pub struct WalCommitBody {
     pub txid: u64,
     pub new_catalog_root_page_id: u64,

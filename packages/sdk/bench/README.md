@@ -21,12 +21,14 @@ The Playwright benchmark test is skipped during normal `npm run test:e2e`. It ru
 
 Optional environment variables:
 
-- `MOYODB_BENCH_PROFILE=smoke|standard|full`
+- `MOYODB_BENCH_PROFILE=smoke|standard|full` (`full` is the practical suite, not the million-row rows)
 - `MOYODB_BENCH_ENGINE=all|moyodb|indexeddb`
 - `MOYODB_BENCH_WORKLOADS=bulk_insert_1m_batched_10000,random_get_10k_from_1m_bulk`
 - `MOYODB_BENCH_SAMPLE_COUNT=1`
 - `MOYODB_BENCH_WARMUP_COUNT=0`
 - `MOYODB_BENCH_WORKLOAD_TIMEOUT_MS=300000`
+- `MOYODB_BENCH_IDB_DURABILITY=strict|relaxed|default` (default `strict`, matching MoyoDB's flush-per-commit)
+- `MOYODB_BENCH_GIT_SHA=<sha>` overrides the revision the launcher reads from `git` (or `GITHUB_SHA` in CI)
 - `MOYODB_CHROMIUM_EXECUTABLE_PATH=/path/to/chromium` for local systems without Playwright-managed browsers
 - `MOYODB_DISABLE_VIDEO=1` for environments that do not have Playwright's bundled ffmpeg
 
@@ -42,7 +44,7 @@ Use the page controls to run `smoke`, `standard`, or `full` profiles and export 
 
 ## Timing rules
 
-Every workload has an optional `prepare()` step and a measured `run()` step.
+Every workload has an optional `prepare()` step, a measured `run()` step, and an untimed `verify()` step that runs before cleanup.
 
 The measured region uses `performance.now()` inside the browser page and excludes:
 
@@ -88,21 +90,14 @@ The diagnostic names are intentionally explicit. Do not publish one of them as a
 Representative write/read/scan rows include:
 
 - `open_empty_db`
-- `bulk_insert_10k`, `bulk_insert_100k`, `bulk_insert_1m`
-- `bulk_insert_1m_batched_1000`
-- `bulk_insert_1m_batched_10000`
-- `bulk_insert_1m_single_tx`
-- `cold_insert_1m_single_tx` compatibility alias for older result files
-- `sdk_put_10k_single_calls` heavy public SDK single-call diagnostic, excluded from default smoke
-- `point_get_random_10k`, `point_get_random_100k`, `point_get_random_1m`
-- `point_get_random_1m_preloaded` compatibility alias for older result files
-- `random_get_10k_from_1m`
-- `random_get_10k_from_1m_bulk`
-- `range_scan_100`, `range_scan_1000`, `range_scan_10000`, `range_scan_1000_from_1m`
-- `small_tx_1000_commits`
-- `batch_tx_100k_values_256b`
+- `bulk_insert_10k` (automatic). `bulk_insert_100k`, `bulk_insert_1m`, `bulk_insert_1m_batched_1000`, `bulk_insert_1m_batched_10000`, `bulk_insert_1m_single_tx`, and `cold_insert_1m_single_tx` are opt-in (`manual`)
+- `sdk_put_10k_single_calls` opt-in. Ten thousand separate commits ran for about an hour on one thread
+- `point_get_random_10k` (sequential), `point_get_random_10k_pipelined`, and `point_get_random_10k_bulk` (MoyoDB only) are automatic. `point_get_random_100k` and `point_get_random_1m` are opt-in
+- `point_get_random_1m_preloaded`, `random_get_10k_from_1m`, `random_get_10k_from_1m_pipelined`, `random_get_10k_from_1m_bulk`, `range_scan_1000_from_1m`, `batch_tx_100k_values_256b`, and `cold_open_after_100k` are opt-in
+- `range_scan_100`, `range_scan_1000`, `range_scan_10000` run against a 10k-row database
+- `reverse_scan_limit_1` reads the last row with a reverse scan bounded to one result
+- `small_tx_1000_commits` is one sample
 - `large_value_64kb`, `large_value_1mb`
-- `cold_open_after_100k`
 - `recovery_after_dirty_close`
 - `snapshot_export_import`
 - `worker_roundtrip_overhead`
@@ -113,7 +108,26 @@ The `bulk_insert_1m_single_tx`/`cold_insert_1m_single_tx` row is a pathological 
 
 IndexedDB is the browser's standard transactional object store. MoyoDB explores a lower-level OPFS-backed storage-engine design for workloads where predictable batch performance and recovery behavior matter.
 
-For comparable workloads, the IndexedDB baseline uses the same record count, fixed-width string keys with the same UTF-8 byte length as MoyoDB keys, value size, batch size, warmup count, measured sample count, and transaction boundaries. It opens the DB and generates/preloads test data outside read/scan measured regions. It does not intentionally slow IndexedDB down.
+For comparable workloads, both engines use:
+
+- the same binary keys (IndexedDB orders binary keys bytewise, like MoyoDB) and the same deterministic values;
+- the same random index sequence per sample, generated once in `workloads.ts`;
+- the same record count, value size, batch size, warmup count, measured sample count, and transaction boundaries;
+- explicit durability: IndexedDB readwrite transactions pass `{ durability }` (default `strict`), and MoyoDB always flushes WAL, main file, and manifest before a commit resolves.
+
+Random reads are split by request mode, because issuing requests one at a time and queueing them all measure different things:
+
+| Mode       | MoyoDB                                 | IndexedDB                                           |
+| ---------- | -------------------------------------- | --------------------------------------------------- |
+| sequential | `await tx.get()` per key               | next `store.get()` issued from the previous success |
+| pipelined  | all `tx.get()` calls, then `await` all | all `store.get()` requests queued at once           |
+| bulk       | one `tx.getMany()`                     | not applicable: IndexedDB has no multi-key get      |
+
+Range scans use each engine's bulk range API (`tx.scan` versus `getAllKeys` + `getAll`). The reverse scan uses `tx.scan({ reverse: true, limit: 1 })` versus a `prev` cursor stopped after one row.
+
+After every timed sample, `verify()` checks the data against the deterministic dataset: read and scan results in full, and write samples by reading back up to 1,024 evenly spaced records. A mismatch fails the sample. Each result stores one content checksum per measured sample, and the report's content-parity table flags workloads where the engines disagree.
+
+Data generation, opening the database, and preload stay outside the measured regions. The baseline does not intentionally slow IndexedDB down.
 
 ## WebKit/Safari handling
 
@@ -124,7 +138,10 @@ The MoyoDB OPFS path requires `FileSystemSyncAccessHandle` in a dedicated Worker
 Each report records:
 
 - browser name/version, user agent, platform, timestamp, and webdriver/headless hints;
-- SDK build mode, WASM build-mode note, backend path, persistent-context flag;
+- the git revision (with a `-dirty` suffix for uncommitted tracked changes);
+- SDK build mode, the WASM build profile reported at runtime by the engine's `buildProfile()`, backend path, persistent-context flag;
+- IndexedDB and MoyoDB durability settings;
+- per-sample content checksums;
 - OPFS, Worker, BroadcastChannel, Web Locks, and SyncAccessHandle support flags;
 - workload name, record count, key size, value size, batch size, transaction boundary;
 - warmup samples, measured samples, p50/p95/p99/min/max/mean;

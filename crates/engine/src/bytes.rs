@@ -3,6 +3,10 @@ use crate::error::{EngineError, Result};
 pub const MAX_STORE_NAME_BYTES: usize = 255;
 pub const MAX_KEY_BYTES: usize = 1024;
 pub const MAX_VALUE_BYTES: usize = 8 * 1024 * 1024;
+/// Upper bound for any value stored in a tree: a user value plus the TTL
+/// envelope, or a change-log payload (header, store name, key and value).
+pub const MAX_STORED_VALUE_BYTES: usize =
+    MAX_VALUE_BYTES + MAX_KEY_BYTES + MAX_STORE_NAME_BYTES + 64;
 
 fn checked_end(offset: usize, width: usize, what: &str) -> Result<usize> {
     offset

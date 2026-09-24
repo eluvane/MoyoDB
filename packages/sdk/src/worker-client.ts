@@ -1,4 +1,4 @@
-import type { WorkerApi, WorkerOpenRequest } from './worker-api';
+import type { AutocommitCommand, IndexScanPage, WorkerApi, WorkerOpenRequest } from './worker-api';
 import type {
     BatchOp,
     ChangeFeed,
@@ -24,6 +24,7 @@ import {
     isWorkerProtocolResponseMessage,
     prepareWorkerCommandPayload,
     workerProtocolError,
+    type AutocommitArgs,
     type WorkerCommand,
     type WorkerCommandArgs,
     type WorkerCommandResult,
@@ -31,6 +32,7 @@ import {
 } from './worker-protocol';
 
 interface PendingRequest {
+    /** Command whose response format the result is decoded with. */
     command: WorkerCommand;
     resolve: (value: unknown) => void;
     reject: (error: Error) => void;
@@ -113,6 +115,14 @@ export class WorkerProtocolClient implements WorkerApi {
         return this.request('rollback', [txId]);
     }
 
+    autocommit<M extends AutocommitCommand>(
+        mode: TxMode,
+        command: M,
+        args: AutocommitArgs<M>
+    ): Promise<WorkerCommandResult<M>> {
+        return this.send('autocommit', [mode, command, args as unknown[]], command) as Promise<WorkerCommandResult<M>>;
+    }
+
     createStore(txId: number, name: string, options?: CreateStoreOptions): Promise<void> {
         return this.request('createStore', [txId, name, options]);
     }
@@ -172,6 +182,17 @@ export class WorkerProtocolClient implements WorkerApi {
 
     scanByIndex(txId: number, store: string, indexName: string, range: Range): Promise<ScanItem[]> {
         return this.request('scanByIndex', [txId, store, indexName, range]);
+    }
+
+    scanByIndexPage(
+        txId: number,
+        store: string,
+        indexName: string,
+        range: Range,
+        cursor: Uint8Array | null,
+        limit: number
+    ): Promise<IndexScanPage> {
+        return this.request('scanByIndexPage', [txId, store, indexName, range, cursor, limit]);
     }
 
     getIndexes(): Promise<IndexDef[]> {
@@ -235,6 +256,14 @@ export class WorkerProtocolClient implements WorkerApi {
     }
 
     async request<M extends WorkerCommand>(command: M, args: WorkerCommandArgs<M>): Promise<WorkerCommandResult<M>> {
+        return (await this.send(command, args, command)) as WorkerCommandResult<M>;
+    }
+
+    private async send<M extends WorkerCommand>(
+        command: M,
+        args: WorkerCommandArgs<M>,
+        responseCommand: WorkerCommand
+    ): Promise<unknown> {
         this.ensureOpen();
         await this.ready;
         this.ensureOpen();
@@ -248,7 +277,7 @@ export class WorkerProtocolClient implements WorkerApi {
             command,
             args: prepared.args
         } as WorkerProtocolRequestMessage;
-        return await new Promise<WorkerCommandResult<M>>((resolve, reject) => {
+        return await new Promise<unknown>((resolve, reject) => {
             const timeout =
                 this.requestTimeoutMs > 0
                     ? setTimeout(() => {
@@ -262,8 +291,8 @@ export class WorkerProtocolClient implements WorkerApi {
                       }, this.requestTimeoutMs)
                     : null;
             this.pending.set(id, {
-                command,
-                resolve: (value) => resolve(value as WorkerCommandResult<M>),
+                command: responseCommand,
+                resolve: (value) => resolve(value),
                 reject,
                 timeout
             });

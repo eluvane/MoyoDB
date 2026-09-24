@@ -22,11 +22,15 @@ pub struct ChangeFeedOptions {
     pub limit: Option<usize>,
 }
 
+/// `Clear` and `Drop` are store-level records with an empty key: one record
+/// replaces a delete per key, so clearing a large store stays O(1) in the log.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ChangeKind {
     Put,
     Delete,
+    Clear,
+    Drop,
 }
 
 impl ChangeKind {
@@ -34,6 +38,8 @@ impl ChangeKind {
         match self {
             ChangeKind::Put => 1,
             ChangeKind::Delete => 2,
+            ChangeKind::Clear => 3,
+            ChangeKind::Drop => 4,
         }
     }
 
@@ -41,10 +47,16 @@ impl ChangeKind {
         match tag {
             1 => Ok(Self::Put),
             2 => Ok(Self::Delete),
+            3 => Ok(Self::Clear),
+            4 => Ok(Self::Drop),
             other => Err(EngineError::Corruption(format!(
                 "unknown change log kind tag {other}"
             ))),
         }
+    }
+
+    pub fn is_store_level(self) -> bool {
+        matches!(self, ChangeKind::Clear | ChangeKind::Drop)
     }
 }
 
@@ -127,6 +139,7 @@ pub fn encode_change_record_payload(
 
     match (kind, value) {
         (ChangeKind::Put, Some(_)) | (ChangeKind::Delete, None) => {}
+        (ChangeKind::Clear | ChangeKind::Drop, None) if key.is_empty() => {}
         (ChangeKind::Put, None) => {
             return Err(EngineError::Serialization(
                 "change log put record is missing a value".into(),
@@ -135,6 +148,11 @@ pub fn encode_change_record_payload(
         (ChangeKind::Delete, Some(_)) => {
             return Err(EngineError::Serialization(
                 "change log delete record unexpectedly included a value".into(),
+            ))
+        }
+        (ChangeKind::Clear | ChangeKind::Drop, _) => {
+            return Err(EngineError::Serialization(
+                "store-level change records carry no key or value".into(),
             ))
         }
     }
@@ -218,10 +236,15 @@ pub fn decode_change_record_payload(txid: TxId, payload: &[u8]) -> Result<Change
 
     let value = match kind {
         ChangeKind::Put => Some(payload[key_end..value_end].to_vec()),
-        ChangeKind::Delete => {
+        ChangeKind::Delete | ChangeKind::Clear | ChangeKind::Drop => {
             if value_len != 0 {
                 return Err(EngineError::Corruption(
-                    "change log delete record unexpectedly stored value bytes".into(),
+                    "change log record unexpectedly stored value bytes".into(),
+                ));
+            }
+            if kind.is_store_level() && key_len != 0 {
+                return Err(EngineError::Corruption(
+                    "store-level change record unexpectedly stored a key".into(),
                 ));
             }
             None

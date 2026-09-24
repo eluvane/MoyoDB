@@ -12,7 +12,7 @@ test('db.subscribe(callback) emits one callback per touched store with shared tx
                 store: string;
                 changes: Array<{
                     key: string;
-                    kind: 'put' | 'delete';
+                    kind: 'put' | 'delete' | 'clear' | 'drop';
                 }>;
                 txnId: number;
             }> = [];
@@ -62,7 +62,7 @@ test('db.subscribe(storeName, callback) filters by store and unsubscribe stops d
                 store: string;
                 changes: Array<{
                     key: string;
-                    kind: 'put' | 'delete';
+                    kind: 'put' | 'delete' | 'clear' | 'drop';
                 }>;
                 txnId: number;
             }> = [];
@@ -110,7 +110,7 @@ test('db.subscribe(storeName, keyPrefix, callback) filters matching keys inside 
                 store: string;
                 changes: Array<{
                     key: string;
-                    kind: 'put' | 'delete';
+                    kind: 'put' | 'delete' | 'clear' | 'drop';
                 }>;
                 txnId: number;
             }>((resolve) => {
@@ -160,52 +160,73 @@ test('BroadcastChannel publishes detailed commit payloads across tabs', async ({
         }
     }, dbName);
     const eventPromise = observer.evaluate((name) => {
+        const changeKind = (value: unknown): 'put' | 'delete' => {
+            if (value === 'put' || value === 'delete') {
+                return value;
+            }
+            throw new Error('invalid commit change');
+        };
         return new Promise<{
             txid: number;
             stores: Array<{
                 store: string;
                 changes: Array<{
                     key: string;
-                    kind: 'put' | 'delete';
+                    kind: 'put' | 'delete' | 'clear' | 'drop';
                 }>;
             }>;
         }>((resolve) => {
             const channel = new BroadcastChannel(`db:${name}:events`);
-            channel.onmessage = (event) => {
+            channel.onmessage = (event: MessageEvent<unknown>) => {
                 const payload = event.data;
-                if (
-                    payload?.type !== 'commit_applied' ||
-                    typeof payload?.txid !== 'number' ||
-                    !Array.isArray(payload?.stores)
-                ) {
+                if (typeof payload !== 'object' || payload === null) {
                     return;
                 }
-                const stores: Array<{
-                    store: string;
-                    changes: Array<{
-                        key: string;
-                        kind: 'put' | 'delete';
-                    }>;
-                }> = payload.stores.map(
-                    (storeEvent: {
-                        store: string;
-                        changes: Array<{
-                            key: Uint8Array;
-                            kind: 'put' | 'delete';
-                        }>;
-                    }) => ({
+                if (!('type' in payload) || payload.type !== 'commit_applied') {
+                    return;
+                }
+                if (!('txid' in payload) || typeof payload.txid !== 'number') {
+                    return;
+                }
+                if (!('stores' in payload) || !Array.isArray(payload.stores)) {
+                    return;
+                }
+                const txid = payload.txid;
+                const stores = payload.stores.map((storeEvent: unknown) => {
+                    if (typeof storeEvent !== 'object' || storeEvent === null) {
+                        throw new Error('invalid commit store event');
+                    }
+                    if (!('store' in storeEvent) || typeof storeEvent.store !== 'string') {
+                        throw new Error('invalid commit store event');
+                    }
+                    if (!('changes' in storeEvent) || !Array.isArray(storeEvent.changes)) {
+                        throw new Error('invalid commit store event');
+                    }
+                    return {
                         store: storeEvent.store,
-                        changes: storeEvent.changes.map((change) => ({
-                            key: window.moyodb.utf8Decode(change.key),
-                            kind: change.kind
-                        }))
-                    })
-                );
+                        changes: storeEvent.changes.map((change: unknown) => {
+                            if (typeof change !== 'object' || change === null) {
+                                throw new Error('invalid commit change');
+                            }
+                            if (!('key' in change) || !(change.key instanceof Uint8Array)) {
+                                throw new Error('invalid commit change');
+                            }
+                            if (!('kind' in change)) {
+                                throw new Error('invalid commit change');
+                            }
+                            const kind = changeKind(change.kind);
+                            return {
+                                key: window.moyodb.utf8Decode(change.key),
+                                kind
+                            };
+                        })
+                    };
+                });
                 const users = stores.find((entry) => entry.store === 'users');
                 if (!users || users.changes.length === 0) {
                     return;
                 }
-                resolve({ txid: payload.txid, stores });
+                resolve({ txid, stores });
                 channel.close();
             };
         });

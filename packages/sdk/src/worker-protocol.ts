@@ -1,4 +1,4 @@
-import type { WorkerApi } from './worker-api';
+import type { AutocommitCommand, IndexScanPage, WorkerApi } from './worker-api';
 import type { BatchOp } from './types';
 import { isRecord } from './internal';
 
@@ -15,6 +15,7 @@ export const WORKER_COMMANDS = [
     'begin',
     'commit',
     'rollback',
+    'autocommit',
     'createStore',
     'dropStore',
     'clearStore',
@@ -29,6 +30,7 @@ export const WORKER_COMMANDS = [
     'scan',
     'getByIndex',
     'scanByIndex',
+    'scanByIndexPage',
     'getIndexes',
     'reconcileIndexes',
     'listStores',
@@ -54,6 +56,33 @@ type WorkerMethod<M extends WorkerCommand> = WorkerApi[M] extends (...args: infe
 
 export type WorkerCommandArgs<M extends WorkerCommand> = WorkerMethod<M>['args'];
 export type WorkerCommandResult<M extends WorkerCommand> = WorkerMethod<M>['result'];
+/** Arguments of an autocommit command without the leading transaction id. */
+export type AutocommitArgs<M extends AutocommitCommand> =
+    WorkerCommandArgs<M> extends [number, ...infer Rest] ? Rest : never;
+
+export const AUTOCOMMIT_COMMANDS = [
+    'get',
+    'getMany',
+    'has',
+    'put',
+    'putMany',
+    'delete',
+    'deleteMany',
+    'applyBatch',
+    'scan',
+    'getByIndex',
+    'scanByIndex',
+    'createStore',
+    'dropStore',
+    'clearStore'
+] as const satisfies readonly AutocommitCommand[];
+
+const AUTOCOMMIT_COMMAND_SET = new Set<string>(AUTOCOMMIT_COMMANDS);
+
+export function isAutocommitCommand(value: unknown): value is AutocommitCommand {
+    return typeof value === 'string' && AUTOCOMMIT_COMMAND_SET.has(value);
+}
+
 export type PackedBatchOpKey = {
     kind: 'put' | 'delete';
     key: Uint8Array;
@@ -65,6 +94,9 @@ const PACKED_BINARY_LIST_V1 = 'moyodb:packed-binary-list:v1';
 const PACKED_NULLABLE_BINARY_LIST_V1 = 'moyodb:packed-nullable-binary-list:v1';
 const PACKED_SCAN_ROWS_V1 = 'moyodb:packed-scan-rows:v1';
 const PACKED_BATCH_OPS_V1 = 'moyodb:packed-batch-ops:v1';
+// Engine-native getMany output: u32 count | count x u32 length (u32::MAX =
+// missing) | concatenated values, all little-endian. Forwarded without repacking.
+const PACKED_OPTIONAL_VALUES_V1 = 'moyodb:packed-optional-values:v1';
 const BATCH_OP_DELETE = 0;
 const BATCH_OP_PUT = 1;
 const U32_MAX = 0xffff_ffff;
@@ -89,6 +121,16 @@ interface PackedScanRowsV1 {
 interface PackedBatchOpsV1 {
     __moyodbPacked: typeof PACKED_BATCH_OPS_V1;
     bytes: Uint8Array;
+}
+
+export interface PackedOptionalValuesV1 {
+    __moyodbPacked: typeof PACKED_OPTIONAL_VALUES_V1;
+    bytes: Uint8Array;
+}
+
+interface PackedIndexScanPage {
+    rows: PackedScanRowsV1 | IndexScanPage['rows'];
+    cursor: Uint8Array | null;
 }
 
 export type WorkerProtocolReadyMessage = {
@@ -182,7 +224,7 @@ export function serializeWorkerError(error: unknown): SerializedWorkerError {
         return {
             name,
             code,
-            message: stringOrUndefined(error.message) ?? String(error),
+            message: stringOrUndefined(error.message) ?? 'Unknown error',
             stack: stringOrUndefined(error.stack)
         };
     }
@@ -223,6 +265,19 @@ export function prepareWorkerCommandPayload<M extends WorkerCommand>(
     command: M,
     args: WorkerCommandArgs<M>
 ): { args: PreparedWorkerCommandArgs<M>; transfer: Transferable[] } {
+    if (command === 'autocommit') {
+        const [mode, inner, innerArgs] = args as WorkerCommandArgs<'autocommit'>;
+        if (isAutocommitCommand(inner) && Array.isArray(innerArgs)) {
+            // Inner arguments are packed exactly as for the transaction-scoped
+            // command; the placeholder transaction id is stripped again.
+            const prepared = prepareWorkerCommandPayload(inner, [0, ...innerArgs] as never);
+            return {
+                args: [mode, inner, (prepared.args as unknown[]).slice(1)],
+                transfer: prepared.transfer
+            };
+        }
+    }
+
     if (command === 'importSnapshot') {
         const data = args[0];
         if (data instanceof Uint8Array) {
@@ -274,6 +329,14 @@ export function decodeWorkerCommandPayload<M extends WorkerCommand>(
     command: M,
     args: PreparedWorkerCommandArgs<M>
 ): WorkerCommandArgs<M> {
+    if (command === 'autocommit') {
+        const [mode, inner, innerArgs] = args as WorkerCommandArgs<'autocommit'>;
+        if (isAutocommitCommand(inner) && Array.isArray(innerArgs)) {
+            const decoded = decodeWorkerCommandPayload(inner, [0, ...innerArgs]) as unknown[];
+            return [mode, inner, decoded.slice(1)] as WorkerCommandArgs<M>;
+        }
+    }
+
     if (command === 'getMany' || command === 'deleteMany') {
         const [txId, store, keys] = args as WorkerCommandArgs<'getMany'> | WorkerCommandArgs<'deleteMany'>;
         if (isPackedBinaryList(keys)) {
@@ -295,7 +358,7 @@ export function decodeWorkerCommandPayload<M extends WorkerCommand>(
         }
     }
 
-    return args as WorkerCommandArgs<M>;
+    return args;
 }
 
 export function packedBinaryListBytes(value: unknown): Uint8Array | null {
@@ -326,10 +389,67 @@ export function unpackPackedBatchOpKeys(bytes: Uint8Array): PackedBatchOpKey[] {
     return unpackBatchOpKeys({ __moyodbPacked: PACKED_BATCH_OPS_V1, bytes });
 }
 
+export function packedOptionalValues(bytes: Uint8Array): PackedOptionalValuesV1 {
+    return { __moyodbPacked: PACKED_OPTIONAL_VALUES_V1, bytes };
+}
+
+export function unpackPackedOptionalValues(bytes: Uint8Array): Array<Uint8Array | null> {
+    if (!(bytes instanceof Uint8Array) || bytes.byteLength < 4) {
+        throw workerProtocolError('WorkerProtocolError', 'invalid packed optional-values payload');
+    }
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const count = view.getUint32(0, true);
+    const metadataBytes = checkedByteCount(count, 4, 'packed optional-values metadata');
+    const payloadOffset = checkedAdd(4, metadataBytes, 'packed optional-values header');
+    if (payloadOffset > bytes.byteLength) {
+        throw workerProtocolError('WorkerProtocolError', 'packed optional-values metadata exceeds payload length');
+    }
+    const items = new Array<Uint8Array | null>(count);
+    let readOffset = payloadOffset;
+    for (let index = 0; index < count; index += 1) {
+        const byteLength = view.getUint32(4 + index * 4, true);
+        if (byteLength === U32_MAX) {
+            items[index] = null;
+            continue;
+        }
+        const end = readOffset + byteLength;
+        if (end > bytes.byteLength) {
+            throw workerProtocolError('WorkerProtocolError', 'packed optional-values item exceeds payload length');
+        }
+        items[index] = bytes.subarray(readOffset, end);
+        readOffset = end;
+    }
+    if (readOffset !== bytes.byteLength) {
+        throw workerProtocolError('WorkerProtocolError', 'packed optional-values payload has trailing bytes');
+    }
+    return items;
+}
+
 export function prepareWorkerResponsePayload<M extends WorkerCommand>(
     command: M,
     result: WorkerCommandResult<M>
-): { result: WorkerCommandResult<M> | unknown; transfer: Transferable[] } {
+): { result: unknown; transfer: Transferable[] } {
+    if (command === 'getMany' && isPackedOptionalValues(result)) {
+        return {
+            result,
+            transfer: collectDirectBinaryTransferable(result.bytes)
+        };
+    }
+
+    if (command === 'scanByIndexPage') {
+        const page = result as WorkerCommandResult<'scanByIndexPage'>;
+        if (isRecord(page) && Array.isArray(page.rows)) {
+            const packed = page.rows.length > 0 ? packScanRows(page.rows) : null;
+            const response: PackedIndexScanPage = { rows: packed ?? page.rows, cursor: page.cursor };
+            const transfer = packed ? [packed.bytes.buffer] : collectTransferablesForValue(page.rows);
+            const cursorBuffer = directBinaryTransferable(page.cursor);
+            return {
+                result: response,
+                transfer: cursorBuffer === null ? transfer : [...transfer, cursorBuffer]
+            };
+        }
+    }
+
     if (command === 'getMany') {
         const values = result as WorkerCommandResult<'getMany'>;
         if (Array.isArray(values) && values.length > 0) {
@@ -348,7 +468,7 @@ export function prepareWorkerResponsePayload<M extends WorkerCommand>(
     }
 
     if (command === 'scan' || command === 'scanByIndex') {
-        const rows = result as WorkerCommandResult<'scan'> | WorkerCommandResult<'scanByIndex'>;
+        const rows = result as WorkerCommandResult<'scan'>;
         if (Array.isArray(rows) && rows.length > 0) {
             const packed = packScanRows(rows);
             if (packed) {
@@ -392,14 +512,24 @@ export function decodeWorkerResponsePayload<M extends WorkerCommand>(
     result: unknown
 ): WorkerCommandResult<M> {
     if (command === 'getMany' && isPackedNullableBinaryList(result)) {
-        return unpackNullableBinaryList(result) as WorkerCommandResult<M>;
+        return unpackNullableBinaryList(result);
+    }
+
+    if (command === 'getMany' && isPackedOptionalValues(result)) {
+        return unpackPackedOptionalValues(result.bytes) as WorkerCommandResult<M>;
+    }
+
+    if (command === 'scanByIndexPage' && isRecord(result)) {
+        const rows = isPackedScanRows(result.rows) ? unpackScanRows(result.rows) : result.rows;
+        const cursor = result.cursor instanceof Uint8Array ? result.cursor : null;
+        return { rows, cursor } as WorkerCommandResult<M>;
     }
 
     if ((command === 'scan' || command === 'scanByIndex') && isPackedScanRows(result)) {
-        return unpackScanRows(result) as WorkerCommandResult<M>;
+        return unpackScanRows(result);
     }
 
-    return result as WorkerCommandResult<M>;
+    return result;
 }
 
 export function collectTransferablesForValue(value: unknown): Transferable[] {
@@ -477,7 +607,7 @@ function collectTransferableBuffers(value: unknown, buffers: Set<ArrayBuffer>, s
     if (typeof value !== 'object') {
         return;
     }
-    const object = value as object;
+    const object = value;
     if (seen.has(object)) {
         return;
     }
@@ -502,7 +632,7 @@ function packBinaryPairs(entries: Array<[Uint8Array, Uint8Array]>): PackedBinary
     const metadataBytes = checkedByteCount(count, 4, 'packed putMany metadata');
     let payloadBytes = 0;
     for (let index = 0; index < entryCount; index += 1) {
-        const entry = entries[index]!;
+        const entry = entries[index];
         const key = entry[0];
         const value = entry[1];
         if (!(key instanceof Uint8Array) || !(value instanceof Uint8Array)) {
@@ -523,7 +653,7 @@ function packBinaryPairs(entries: Array<[Uint8Array, Uint8Array]>): PackedBinary
     let metadataOffset = 4;
     let writeOffset = payloadOffset;
     for (let index = 0; index < entryCount; index += 1) {
-        const entry = entries[index]!;
+        const entry = entries[index];
         const key = entry[0];
         const value = entry[1];
         const keyLength = key.byteLength;
@@ -548,7 +678,7 @@ function packBinaryList(items: Uint8Array[]): PackedBinaryListV1 {
     const metadataBytes = checkedByteCount(count, 4, 'packed binary-list metadata');
     let payloadBytes = 0;
     for (let index = 0; index < count; index += 1) {
-        const item = items[index]!;
+        const item = items[index];
         if (!(item instanceof Uint8Array)) {
             throw workerProtocolError('WorkerProtocolError', 'binary-list payload item is not a Uint8Array');
         }
@@ -566,7 +696,7 @@ function packBinaryList(items: Uint8Array[]): PackedBinaryListV1 {
     let metadataOffset = 4;
     let writeOffset = payloadOffset;
     for (let index = 0; index < count; index += 1) {
-        const item = items[index]!;
+        const item = items[index];
         const itemLength = item.byteLength;
         view.setUint32(metadataOffset, itemLength, true);
         metadataOffset += 4;
@@ -804,7 +934,7 @@ function packScanRows(rows: Array<{ key: Uint8Array; value: Uint8Array }>): Pack
     const metadataBytes = checkedByteCount(count, 8, 'packed scan row metadata');
     let payloadBytes = 0;
     for (let index = 0; index < count; index += 1) {
-        const row = rows[index]!;
+        const row = rows[index];
         if (!isRecord(row) || !(row.key instanceof Uint8Array) || !(row.value instanceof Uint8Array)) {
             throw workerProtocolError('WorkerProtocolError', 'scan row payload key/value is not a Uint8Array');
         }
@@ -826,7 +956,7 @@ function packScanRows(rows: Array<{ key: Uint8Array; value: Uint8Array }>): Pack
     let metadataOffset = 4;
     let writeOffset = payloadOffset;
     for (let index = 0; index < count; index += 1) {
-        const row = rows[index]!;
+        const row = rows[index];
         const key = row.key;
         const value = row.value;
         const keyLength = key.byteLength;
@@ -890,13 +1020,7 @@ function packBatchOps(ops: Array<BatchOp>): PackedBatchOpsV1 {
     const metadataBytes = checkedByteCount(count, 9, 'packed batch metadata');
     let payloadBytes = 0;
     for (let index = 0; index < count; index += 1) {
-        const op = ops[index]!;
-        if (op.kind !== 'put' && op.kind !== 'delete') {
-            throw workerProtocolError(
-                'WorkerProtocolError',
-                `unknown batch operation kind: ${String((op as { kind?: unknown }).kind)}`
-            );
-        }
+        const op = ops[index];
         if (!(op.key instanceof Uint8Array)) {
             throw workerProtocolError('WorkerProtocolError', 'batch operation key is not a Uint8Array');
         }
@@ -924,7 +1048,7 @@ function packBatchOps(ops: Array<BatchOp>): PackedBatchOpsV1 {
     let metadataOffset = 4;
     let writeOffset = payloadOffset;
     for (let index = 0; index < count; index += 1) {
-        const op = ops[index]!;
+        const op = ops[index];
         const key = op.key;
         const keyLength = key.byteLength;
         const valueLength = op.kind === 'put' ? op.value.byteLength : 0;
@@ -1067,6 +1191,10 @@ function isPackedScanRows(value: unknown): value is PackedScanRowsV1 {
 
 function isPackedBatchOps(value: unknown): value is PackedBatchOpsV1 {
     return isRecord(value) && value.__moyodbPacked === PACKED_BATCH_OPS_V1 && value.bytes instanceof Uint8Array;
+}
+
+function isPackedOptionalValues(value: unknown): value is PackedOptionalValuesV1 {
+    return isRecord(value) && value.__moyodbPacked === PACKED_OPTIONAL_VALUES_V1 && value.bytes instanceof Uint8Array;
 }
 
 function checkedByteCount(count: number, itemBytes: number, what: string): number {

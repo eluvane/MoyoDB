@@ -18,6 +18,8 @@ const warmupCountOverride = normalizeOptionalCount(proc?.env?.MOYODB_BENCH_WARMU
 const workloadTimeoutMs = normalizeOptionalCount(proc?.env?.MOYODB_BENCH_WORKLOAD_TIMEOUT_MS);
 const testTimeoutMs = normalizeOptionalCount(proc?.env?.MOYODB_BENCH_TEST_TIMEOUT_MS);
 const effectiveWorkloadTimeoutMs = workloadTimeoutMs ?? (profile === 'smoke' ? 30_000 : undefined);
+const gitSha = proc?.env?.MOYODB_BENCH_GIT_SHA ?? proc?.env?.GITHUB_SHA ?? 'unknown';
+const indexedDbDurability = normalizeDurability(proc?.env?.MOYODB_BENCH_IDB_DURABILITY);
 
 test.describe('browser benchmark smoke', () => {
     test.skip(!shouldRunBench, 'benchmark smoke is opt-in; use npm run bench:browser, bench:indexeddb, or bench:opfs');
@@ -26,7 +28,7 @@ test.describe('browser benchmark smoke', () => {
         test.setTimeout(testTimeoutMs ?? (profile === 'smoke' ? 300_000 : 0));
         page.on('console', (message) => {
             if (message.type() === 'info' && message.text().startsWith('[bench]')) {
-                console.log(message.text());
+                console.info(message.text());
             }
         });
         const engines =
@@ -44,7 +46,9 @@ test.describe('browser benchmark smoke', () => {
                 sampleCountOverride,
                 warmupCountOverride,
                 workloadTimeoutMs,
-                persistentContext
+                persistentContext,
+                gitSha,
+                indexedDbDurability
             }) => {
                 if (!window.moyodbBench) {
                     throw new Error('benchmark runner did not initialize');
@@ -57,6 +61,8 @@ test.describe('browser benchmark smoke', () => {
                     warmupCountOverride,
                     workloadTimeoutMs,
                     persistentContext,
+                    gitSha,
+                    indexedDbDurability,
                     dbNamePrefix: `playwright-${Date.now()}`
                 });
             },
@@ -67,7 +73,9 @@ test.describe('browser benchmark smoke', () => {
                 sampleCountOverride,
                 warmupCountOverride,
                 workloadTimeoutMs: effectiveWorkloadTimeoutMs,
-                persistentContext: false
+                persistentContext: false,
+                gitSha,
+                indexedDbDurability
             }
         );
 
@@ -107,6 +115,10 @@ function normalizeBenchProfile(value: string | undefined): BenchProfile {
         return value;
     }
     return 'smoke';
+}
+
+function normalizeDurability(value: string | undefined): IDBTransactionDurability {
+    return value === 'relaxed' || value === 'default' ? value : 'strict';
 }
 
 function normalizeWorkloadNames(value: string | undefined): string[] | undefined {

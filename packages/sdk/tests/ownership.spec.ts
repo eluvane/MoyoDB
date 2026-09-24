@@ -1,5 +1,13 @@
 import { test, expect } from '@playwright/test';
 import { requireMoyoDbCapabilities, uniqueDbName } from './support';
+
+declare global {
+    interface Window {
+        __heldDb?: {
+            close: () => Promise<void>;
+        };
+    }
+}
 test('second tab cannot acquire ownership while first owner is open', async ({ browser }) => {
     const dbName = uniqueDbName('ownership');
     const context = await browser.newContext();
@@ -10,7 +18,7 @@ test('second tab cannot acquire ownership while first owner is open', async ({ b
     await requireMoyoDbCapabilities(page1);
     await page1.evaluate(async (name) => {
         const db = await window.moyodb.openDB(name);
-        (window as any).__heldDb = db;
+        window.__heldDb = db;
     }, dbName);
     const errorName = await page2.evaluate(async (name) => {
         try {
@@ -23,7 +31,10 @@ test('second tab cannot acquire ownership while first owner is open', async ({ b
     }, dbName);
     expect(errorName).toBe('DatabaseBusyError');
     await page1.evaluate(async () => {
-        const db = (window as any).__heldDb;
+        const db = window.__heldDb;
+        if (!db) {
+            throw new Error('missing held database');
+        }
         await db.close();
     });
     const reopened = await page2.evaluate(async (name) => {
@@ -47,8 +58,8 @@ test('BroadcastChannel receives commit_applied event', async ({ browser }) => {
     const eventPromise = page2.evaluate((name) => {
         return new Promise((resolve) => {
             const channel = new BroadcastChannel(`db:${name}:events`);
-            channel.onmessage = (event) => {
-                if (event.data?.type === 'commit_applied') {
+            channel.onmessage = (event: MessageEvent<{ type?: string }>) => {
+                if (event.data.type === 'commit_applied') {
                     resolve(event.data);
                     channel.close();
                 }

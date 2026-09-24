@@ -85,9 +85,9 @@ self.onmessage = async () => {
 
         const result = {
             secure: globalThis.isSecureContext,
-            storage: !!navigator?.storage,
-            getDirectory: typeof navigator?.storage?.getDirectory === 'function',
-            locks: !!navigator?.locks,
+            storage: Boolean(navigator.storage),
+            getDirectory: typeof navigator.storage.getDirectory === 'function',
+            locks: Boolean(navigator.locks),
             broadcast: typeof BroadcastChannel !== 'undefined',
             syncHandle: false
         };
@@ -114,6 +114,6 @@ export function uniqueDbName(prefix: string): string {
 }
 export async function prepareMoyoDbPage(page: Page): Promise<void> {
     await page.goto('/');
-    await page.waitForFunction(() => typeof window.moyodb?.openDB === 'function');
+    await page.waitForFunction(() => typeof window.moyodb.openDB === 'function');
     await requireMoyoDbCapabilities(page);
 }

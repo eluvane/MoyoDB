@@ -28,26 +28,23 @@ test('large value survives overflow pages', async ({ page }) => {
     const roundtrip = await page.evaluate(
         async ({ name, size }) => {
             const db = await window.moyodb.openDB(name);
+            await db.createStore('blob');
+            const value = new Uint8Array(size);
+            for (let i = 0; i < value.length; i += 1) {
+                value[i] = i % 251;
+            }
+            await db.put('blob', window.moyodb.utf8Encode('big'), value);
+            await db.close();
+            const reopened = await window.moyodb.openDB(name);
             try {
-                await db.createStore('blob');
-                const value = new Uint8Array(size);
-                for (let i = 0; i < value.length; i += 1) {
-                    value[i] = i % 251;
-                }
-                await db.put('blob', window.moyodb.utf8Encode('big'), value);
-                await db.close();
-                const reopened = await window.moyodb.openDB(name);
-                try {
-                    const loaded = await reopened.get('blob', window.moyodb.utf8Encode('big'));
-                    return {
-                        len: loaded?.length ?? 0,
-                        first: loaded?.[0] ?? -1,
-                        last: loaded?.[loaded.length - 1] ?? -1
-                    };
-                } finally {
-                    await reopened.close();
-                }
+                const loaded = await reopened.get('blob', window.moyodb.utf8Encode('big'));
+                return {
+                    len: loaded?.length ?? 0,
+                    first: loaded?.[0] ?? -1,
+                    last: loaded?.[loaded.length - 1] ?? -1
+                };
             } finally {
+                await reopened.close();
             }
         },
         { name: dbName, size }

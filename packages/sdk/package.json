@@ -1,6 +1,6 @@
 {
   "name": "@moyodb/sdk",
-  "version": "0.0.0-alpha.3",
+  "version": "1.0.0",
   "private": false,
   "type": "module",
   "scripts": {
@@ -22,16 +22,17 @@
     "prepare:dist": "node scripts/prepare-dist.mjs"
   },
   "devDependencies": {
-    "@playwright/test": "1.61.1",
+    "@playwright/test": "1.63.0",
     "@typescript/native": "npm:typescript@7.0.2",
     "typescript": "npm:@typescript/typescript6@6.0.2",
-    "vite": "7.3.6"
+    "vite": "8.3.0"
   },
   "description": "Experimental Rust/WASM transactional key-value storage engine SDK for browser apps, backed by OPFS.",
-  "license": "MIT OR Apache-2.0",
+  "license": "SEE LICENSE IN LICENSE",
+  "author": "Eluvane <keiko1337@proton.me>",
   "repository": {
     "type": "git",
-    "url": "https://github.com/moyodb/moyodb.git"
+    "url": "https://github.com/eluvane/MoyoDB.git"
   },
   "keywords": [
     "moyodb",
@@ -52,6 +53,7 @@
   "sideEffects": false,
   "files": [
     "dist",
+    "LICENSE",
     "README.md"
   ],
   "exports": {
@@ -61,12 +63,12 @@
     }
   },
   "types": "./dist/index.d.ts",
-  "homepage": "https://github.com/moyodb/moyodb#readme",
+  "homepage": "https://github.com/eluvane/MoyoDB#readme",
   "bugs": {
-    "url": "https://github.com/moyodb/moyodb/issues"
+    "url": "https://github.com/eluvane/MoyoDB/issues"
   },
   "engines": {
-    "node": ">=22.0.0",
+    "node": "^22.22.2 || >=24.15.0",
     "npm": ">=10.0.0"
   }
 }

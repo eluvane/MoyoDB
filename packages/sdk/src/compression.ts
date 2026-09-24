@@ -77,7 +77,7 @@ function ensureCompressionRuntime(): void {
 function crc32(bytes: Uint8Array): number {
     let crc = 0xffffffff;
     for (const byte of bytes) {
-        crc = (crc >>> 8) ^ CRC32_TABLE[(crc ^ byte) & 0xff]!;
+        crc = (crc >>> 8) ^ CRC32_TABLE[(crc ^ byte) & 0xff];
     }
     return (crc ^ 0xffffffff) >>> 0;
 }
@@ -108,8 +108,8 @@ function readEnvelopeHeader(magic: Uint8Array, bytes: Uint8Array): EnvelopeHeade
     }
     const view = new DataView(bytes.buffer, bytes.byteOffset, ENVELOPE_HEADER_SIZE);
     return {
-        version: bytes[8]!,
-        kindTag: bytes[9]!,
+        version: bytes[8],
+        kindTag: bytes[9],
         rawLength: view.getUint32(10, true),
         payloadChecksum: view.getUint32(14, true)
     };
@@ -157,14 +157,8 @@ async function readBoundedStream(
     const chunks: Uint8Array[] = [];
     let totalBytes = 0;
     try {
-        while (true) {
-            const { value, done } = await reader.read();
-            if (done) {
-                break;
-            }
-            if (value === undefined) {
-                continue;
-            }
+        for (let next = await reader.read(); !next.done; next = await reader.read()) {
+            const value = next.value;
             totalBytes += value.byteLength;
             if (maxOutputBytes !== undefined && totalBytes > maxOutputBytes) {
                 await reader.cancel(`decompressed ${label} exceeded ${maxOutputBytes} bytes`);

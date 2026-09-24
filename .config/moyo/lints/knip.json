@@ -1,6 +1,6 @@
 {
   "$schema": "https://unpkg.com/knip@latest/schema.json",
-  "ignoreBinaries": ["lake", "python", "gitleaks", "semgrep", "wasm-pack", "playwright", "osv-scanner"],
+  "ignoreBinaries": ["lake", "gitleaks", "semgrep", "wasm-pack", "osv-scanner"],
   "ignoreDependencies": ["actionlint", "@typescript/native"],
   "ignoreIssues": {
     "packages/sdk/src/compression.ts": ["exports"],

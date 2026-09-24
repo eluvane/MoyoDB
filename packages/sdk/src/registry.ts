@@ -1,7 +1,7 @@
 import { WorkerProtocolClient } from './worker-client';
-import type { DebugFailpoint, OpenOptions } from './types';
+import type { ChangeFeedSettings, DebugFailpoint, OpenOptions } from './types';
 import { InvalidOpenOptionsError, normalizeError } from './errors';
-import { withTimeout } from './internal';
+import { isRecord, withTimeout } from './internal';
 const VALID_FAILPOINTS = new Set<Exclude<DebugFailpoint, null>>([
     'after_wal_flush',
     'after_main_flush',
@@ -21,6 +21,14 @@ interface PersistenceBridgeResponse {
     id: number;
     granted: boolean;
 }
+function isPersistenceBridgeRequest(value: unknown): value is PersistenceBridgeRequest {
+    return (
+        isRecord(value) &&
+        value.type === PERSISTENCE_BRIDGE_REQUEST &&
+        typeof value.id === 'number' &&
+        (value.op === 'persist' || value.op === 'persisted')
+    );
+}
 interface MainThreadPersistenceBridge {
     close(): void;
 }
@@ -30,7 +38,9 @@ export interface NormalizedOpenOptions {
     requestPersistence: boolean;
     cachePages: number;
     debugFailpoint: DebugFailpoint;
+    changeFeed: Required<ChangeFeedSettings> | null;
 }
+const DEFAULT_CHANGE_FEED_RETAIN_TXIDS = 100_000;
 export interface RegistryEntry {
     dbName: string;
     refs: number;
@@ -43,7 +53,7 @@ export interface RegistryEntry {
     handleInvalidationListeners: Set<() => void>;
 }
 const registry = new Map<string, RegistryEntry>();
-function requirePlainOptionsObject(options: OpenOptions): asserts options is OpenOptions {
+function requirePlainOptionsObject(options: unknown): asserts options is OpenOptions {
     if (options === null || typeof options !== 'object' || Array.isArray(options)) {
         throw new InvalidOpenOptionsError('open options must be an object');
     }
@@ -78,6 +88,26 @@ function normalizeFailpoint(value: unknown): DebugFailpoint {
     }
     return value as Exclude<DebugFailpoint, null>;
 }
+function normalizeChangeFeed(value: unknown): Required<ChangeFeedSettings> | null {
+    if (value === undefined) {
+        return null;
+    }
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+        throw new InvalidOpenOptionsError('changeFeed must be an object');
+    }
+    const settings = value as ChangeFeedSettings;
+    const enabled = normalizeBoolean(settings.enabled, 'changeFeed.enabled', true);
+    let retainTxids: number | null = DEFAULT_CHANGE_FEED_RETAIN_TXIDS;
+    if (settings.retainTxids === null) {
+        retainTxids = null;
+    } else if (settings.retainTxids !== undefined) {
+        retainTxids = normalizeNonNegativeInteger(settings.retainTxids, 'changeFeed.retainTxids', 0);
+        if (retainTxids === 0) {
+            throw new InvalidOpenOptionsError('changeFeed.retainTxids must be positive; disable the feed instead');
+        }
+    }
+    return { enabled, retainTxids };
+}
 function normalizeOptions(options: OpenOptions = {}): NormalizedOpenOptions {
     requirePlainOptionsObject(options);
     return {
@@ -85,8 +115,12 @@ function normalizeOptions(options: OpenOptions = {}): NormalizedOpenOptions {
         ownerWaitMs: normalizeNonNegativeInteger(options.ownerWaitMs, 'ownerWaitMs', 0),
         requestPersistence: normalizeBoolean(options.requestPersistence, 'requestPersistence', true),
         cachePages: normalizeCachePages(options.cachePages),
-        debugFailpoint: normalizeFailpoint(options.debugFailpoint)
+        debugFailpoint: normalizeFailpoint(options.debugFailpoint),
+        changeFeed: normalizeChangeFeed(options.changeFeed)
     };
+}
+function sameChangeFeed(left: NormalizedOpenOptions['changeFeed'], right: NormalizedOpenOptions['changeFeed']) {
+    return left?.enabled === right?.enabled && left?.retainTxids === right?.retainTxids;
 }
 function assertCompatibleOptions(dbName: string, current: NormalizedOpenOptions, next: NormalizedOpenOptions) {
     if (current.cachePages !== next.cachePages) {
@@ -94,17 +128,22 @@ function assertCompatibleOptions(dbName: string, current: NormalizedOpenOptions,
             `database ${dbName} is already open in this tab with cachePages=${current.cachePages}; requested cachePages=${next.cachePages}`
         );
     }
+    if (next.changeFeed !== null && !sameChangeFeed(current.changeFeed, next.changeFeed)) {
+        throw new InvalidOpenOptionsError(
+            `database ${dbName} is already open in this tab with a different changeFeed policy`
+        );
+    }
 }
 async function queryPersistentStorageState(): Promise<boolean> {
-    const storage = globalThis.navigator?.storage;
-    if (typeof storage?.persisted !== 'function') {
+    const storage = globalThis.navigator.storage;
+    if (typeof storage.persisted !== 'function') {
         return false;
     }
     return await withTimeout(storage.persisted(), 1000, false);
 }
 async function requestPersistentStorageGrant(): Promise<boolean> {
-    const storage = globalThis.navigator?.storage;
-    if (typeof storage?.persist !== 'function') {
+    const storage = globalThis.navigator.storage;
+    if (typeof storage.persist !== 'function') {
         return false;
     }
     return await withTimeout(storage.persist(), 1000, false);
@@ -122,9 +161,9 @@ async function handlePersistenceBridgeRequest(port: MessagePort, request: Persis
 function createMainThreadPersistenceBridge(worker: Worker): MainThreadPersistenceBridge {
     const channel = new MessageChannel();
     const port = channel.port1;
-    port.addEventListener('message', (event: MessageEvent<PersistenceBridgeRequest>) => {
+    port.addEventListener('message', (event: MessageEvent<unknown>) => {
         const data = event.data;
-        if (!data || data.type !== PERSISTENCE_BRIDGE_REQUEST) {
+        if (!isPersistenceBridgeRequest(data)) {
             return;
         }
         void handlePersistenceBridgeRequest(port, data);

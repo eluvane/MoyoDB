@@ -21,7 +21,7 @@ This directory is the canonical home for repository quality tooling. Root files 
 | Area                   | Local command                                              | Canonical config                                                                                                   |
 | ---------------------- | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
 | Prettier               | `npm run format:prettier`, `npm run format:check:prettier` | `.config/moyo/formatters/prettier.json`, `.config/moyo/formatters/prettierignore`                                  |
-| Biome                  | `npm run format:check:biome`, `npm run lint:biome`         | `.config/moyo/formatters/biome.jsonc`                                                                              |
+| Biome                  | `npm run lint:biome` (format and lint in one `biome ci`)   | `.config/moyo/formatters/biome.jsonc`                                                                              |
 | Taplo/TOML             | `npm run format:toml`, `npm run lint:toml`                 | `.config/moyo/formatters/taplo.toml`                                                                               |
 | rustfmt                | `npm run format:rust`, `npm run format:check:rust`         | `.config/moyo/formatters/rustfmt.toml`                                                                             |
 | ESLint                 | `npm run lint:eslint`                                      | `.config/moyo/lints/eslint.config.mjs`, `.config/moyo/typescript/tsconfig.eslint.json`                             |
@@ -124,4 +124,6 @@ Lean checks follow the project-local best-practices baseline supplied with this 
 - `lake build --wfail`;
 - `lake lint --builtin-lint`;
 - `lake env leanchecker --fresh MoyoDbProofs`;
-- committed exported proof artifacts checked for drift.
+- committed exported trace artifacts checked for drift.
+
+These gates establish that the Lean package builds without holes or custom axioms. They do not widen what its theorems cover: the package is an executable specification of an abstract model (association-list store, record-list WAL, write-batch transactions), and its traces are conformance scenarios for the Rust engine. Durability of the real engine is exercised by the crash-matrix and fault-injection tests, not by Lean.

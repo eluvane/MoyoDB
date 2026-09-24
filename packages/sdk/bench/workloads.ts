@@ -181,10 +181,10 @@ export const WORKLOADS: WorkloadSpec[] = [
         '10,000 db.put calls; each call opens/scopes/commits one SDK transaction',
         0,
         1,
-        'Heavy diagnostic: public SDK single-call overhead. This is intentionally not a bulk insert path and is excluded from the default smoke profile.',
+        'Opt-in only. 10,000 separate commits on one thread; cost grows much faster than the record count. Pass this name via MOYODB_BENCH_WORKLOADS.',
         false,
         ['moyodb'],
-        ['diagnostic', 'sdk']
+        ['diagnostic', 'sdk', 'manual']
     ),
     workload(
         'sdk_bulk_put_10k',
@@ -281,10 +281,10 @@ export const WORKLOADS: WorkloadSpec[] = [
         'one readwrite transaction per batch of 1,000 puts',
         1,
         5,
-        'Longer batch insert workload. Test data and empty DB setup are outside the measured region.',
+        'Opt-in only. 100 commits into a growing tree, repeated per sample. Pass this name via MOYODB_BENCH_WORKLOADS.',
         false,
         ['moyodb', 'indexeddb'],
-        ['write']
+        ['write', 'manual']
     ),
     workload(
         'bulk_insert_1m',
@@ -298,7 +298,7 @@ export const WORKLOADS: WorkloadSpec[] = [
         'Heavy launch benchmark. Test data and empty DB setup are outside the measured region.',
         false,
         ['moyodb', 'indexeddb'],
-        ['write', 'full']
+        ['write', 'full', 'manual']
     ),
     workload(
         'bulk_insert_1m_batched_1000',
@@ -309,10 +309,10 @@ export const WORKLOADS: WorkloadSpec[] = [
         'one readwrite transaction per batch of 1,000 puts',
         0,
         3,
-        '1M insert with smaller commit batches. Test data and empty DB setup are outside the measured region.',
+        'Opt-in only. 1M insert with smaller commit batches. Pass this name via MOYODB_BENCH_WORKLOADS.',
         false,
         ['moyodb', 'indexeddb'],
-        ['write', 'full']
+        ['write', 'full', 'manual']
     ),
     workload(
         'bulk_insert_1m_batched_10000',
@@ -323,10 +323,10 @@ export const WORKLOADS: WorkloadSpec[] = [
         'one readwrite transaction per batch of 10,000 puts',
         0,
         3,
-        '1M insert with larger commit batches. Test data and empty DB setup are outside the measured region.',
+        'Opt-in only. 1M insert with larger commit batches. Pass this name via MOYODB_BENCH_WORKLOADS.',
         false,
         ['moyodb', 'indexeddb'],
-        ['write', 'full']
+        ['write', 'full', 'manual']
     ),
     workload(
         'bulk_insert_1m_single_tx',
@@ -340,7 +340,7 @@ export const WORKLOADS: WorkloadSpec[] = [
         'Pathological large single-transaction probe. Data generation/open/delete are outside measurement; do not use as the headline browser result without the batched rows.',
         false,
         ['moyodb', 'indexeddb'],
-        ['write', 'full', 'pathological']
+        ['write', 'full', 'pathological', 'manual']
     ),
     workload(
         'cold_insert_1m_single_tx',
@@ -354,7 +354,7 @@ export const WORKLOADS: WorkloadSpec[] = [
         'Deprecated compatibility row for old reports. The measured region no longer includes data generation, open, or cleanup.',
         false,
         ['moyodb'],
-        ['write', 'full', 'pathological']
+        ['write', 'full', 'pathological', 'manual']
     ),
 
     workload(
@@ -363,13 +363,27 @@ export const WORKLOADS: WorkloadSpec[] = [
         16,
         256,
         1_000,
-        'setup/preload outside measurement; measured region performs 10,000 single tx.get calls inside one readonly transaction',
+        'setup/preload outside measurement; one readonly transaction; sequential: each of 10,000 gets is issued only after the previous one resolved',
         1,
         5,
-        'Random point reads after a 10k-row setup. This measures per-call SDK/Worker/WASM overhead.',
+        'Sequential point-read latency after a 10k-row setup. Both engines keep exactly one request outstanding.',
         true,
         ['moyodb', 'indexeddb'],
-        ['read']
+        ['read', 'sequential']
+    ),
+    workload(
+        'point_get_random_10k_pipelined',
+        10_000,
+        16,
+        256,
+        1_000,
+        'setup/preload outside measurement; one readonly transaction; pipelined: all 10,000 single-key gets are issued before any result is awaited',
+        1,
+        5,
+        'Pipelined point-read throughput after a 10k-row setup. IndexedDB queues store.get requests; MoyoDB issues tx.get calls concurrently.',
+        true,
+        ['moyodb', 'indexeddb'],
+        ['read', 'pipelined']
     ),
     workload(
         'point_get_random_10k_bulk',
@@ -380,9 +394,9 @@ export const WORKLOADS: WorkloadSpec[] = [
         'setup/preload outside measurement; measured region performs one getMany over 10,000 random keys',
         1,
         5,
-        'Bulk random point reads after a 10k-row setup. This measures the recommended public bulk read path.',
+        'Bulk random point reads after a 10k-row setup. IndexedDB has no multi-key get, so compare this row with point_get_random_10k_pipelined for the IndexedDB best case.',
         true,
-        ['moyodb', 'indexeddb'],
+        ['moyodb'],
         ['read', 'bulk']
     ),
     workload(
@@ -394,10 +408,10 @@ export const WORKLOADS: WorkloadSpec[] = [
         'setup/preload outside measurement; measured region performs 10,000 single tx.get calls inside one readonly transaction',
         1,
         5,
-        'Random point reads after a 100k-row setup. This measures per-call SDK/Worker/WASM overhead.',
+        'Opt-in only. Random point reads after a 100k-row setup. Pass this name via MOYODB_BENCH_WORKLOADS.',
         false,
         ['moyodb', 'indexeddb'],
-        ['read']
+        ['read', 'manual']
     ),
     workload(
         'point_get_random_1m',
@@ -411,7 +425,7 @@ export const WORKLOADS: WorkloadSpec[] = [
         'Heavy random-read benchmark after 1M-row setup. Preload is not included in raw samples.',
         false,
         ['moyodb', 'indexeddb'],
-        ['read', 'full']
+        ['read', 'full', 'manual']
     ),
     workload(
         'point_get_random_1m_preloaded',
@@ -425,7 +439,7 @@ export const WORKLOADS: WorkloadSpec[] = [
         'Deprecated compatibility row for old reports. Preload, key generation, open, and cleanup are outside the timed region.',
         false,
         ['moyodb'],
-        ['read', 'full']
+        ['read', 'full', 'manual']
     ),
     workload(
         'random_get_10k_from_1m',
@@ -433,13 +447,27 @@ export const WORKLOADS: WorkloadSpec[] = [
         16,
         256,
         5_000,
-        'setup/preload outside measurement; measured region performs 10,000 single random gets',
+        'setup/preload outside measurement; measured region performs 10,000 sequential single random gets',
         0,
         3,
-        'Layered read workload: 1M-row preload outside timed region, 10k individual SDK gets measured.',
+        'Layered read workload: 1M-row preload outside timed region, 10k sequential gets measured.',
         false,
         ['moyodb', 'indexeddb'],
-        ['read', 'full']
+        ['read', 'sequential', 'full', 'manual']
+    ),
+    workload(
+        'random_get_10k_from_1m_pipelined',
+        1_000_000,
+        16,
+        256,
+        5_000,
+        'setup/preload outside measurement; measured region issues 10,000 single random gets before awaiting any of them',
+        0,
+        3,
+        'Layered read workload: same keys as the sequential row, pipelined in both engines.',
+        false,
+        ['moyodb', 'indexeddb'],
+        ['read', 'pipelined', 'full', 'manual']
     ),
     workload(
         'random_get_10k_from_1m_bulk',
@@ -450,10 +478,10 @@ export const WORKLOADS: WorkloadSpec[] = [
         'setup/preload outside measurement; measured region performs one getMany over 10,000 random keys',
         0,
         3,
-        'Layered read workload: same keys as single-get row, but one bulk read call to isolate Worker roundtrip overhead.',
+        'Layered read workload: same keys as the sequential row, one bulk read call. IndexedDB has no multi-key get; compare with the pipelined row.',
         false,
-        ['moyodb', 'indexeddb'],
-        ['read', 'bulk', 'full']
+        ['moyodb'],
+        ['read', 'bulk', 'full', 'manual']
     ),
 
     workload(
@@ -465,18 +493,32 @@ export const WORKLOADS: WorkloadSpec[] = [
         'setup/preload outside measurement; measurement scans 100 contiguous keys',
         1,
         5,
-        'Range scan over 100 rows.',
+        'Range scan over 100 rows. Both engines use their bulk range API: MoyoDB tx.scan, IndexedDB getAllKeys + getAll on the same range.',
         true,
         ['moyodb', 'indexeddb'],
         ['scan']
     ),
     workload(
-        'range_scan_1000',
-        100_000,
+        'reverse_scan_limit_1',
+        10_000,
         16,
         256,
         1_000,
-        'setup/preload outside measurement; measurement scans 1,000 contiguous keys',
+        'setup/preload outside measurement; measurement reads the last key of the store with a reverse scan limited to one row',
+        1,
+        5,
+        'Reverse bounded scan: MoyoDB tx.scan({ reverse: true, limit: 1 }), IndexedDB openCursor(null, "prev") stopped after one row.',
+        true,
+        ['moyodb', 'indexeddb'],
+        ['scan', 'reverse']
+    ),
+    workload(
+        'range_scan_1000',
+        10_000,
+        16,
+        256,
+        1_000,
+        'setup/preload outside measurement; measurement scans 1,000 contiguous keys from a 10k-row DB',
         1,
         5,
         'Range scan over 1,000 rows.',
@@ -486,11 +528,11 @@ export const WORKLOADS: WorkloadSpec[] = [
     ),
     workload(
         'range_scan_10000',
-        100_000,
+        10_000,
         16,
         256,
         1_000,
-        'setup/preload outside measurement; measurement scans 10,000 contiguous keys',
+        'setup/preload outside measurement; measurement scans 10,000 contiguous keys from a 10k-row DB',
         1,
         3,
         'Range scan over 10,000 rows.',
@@ -510,7 +552,7 @@ export const WORKLOADS: WorkloadSpec[] = [
         'Layered scan workload with 1M-row preload outside timed region.',
         false,
         ['moyodb', 'indexeddb'],
-        ['scan', 'full']
+        ['scan', 'full', 'manual']
     ),
 
     workload(
@@ -520,9 +562,9 @@ export const WORKLOADS: WorkloadSpec[] = [
         128,
         1,
         '1,000 independent readwrite commits; keys/values and empty DB setup outside measurement',
+        0,
         1,
-        5,
-        'Small transaction commit overhead.',
+        'Small transaction commit overhead. One sample: each commit is its own OPFS flush.',
         true,
         ['moyodb', 'indexeddb'],
         ['write']
@@ -536,10 +578,10 @@ export const WORKLOADS: WorkloadSpec[] = [
         '20 readwrite transactions of 5,000 puts each; data/setup outside measurement',
         1,
         5,
-        'Large batch write with 256-byte values.',
+        'Opt-in only. 100k values in 20 commits. Pass this name via MOYODB_BENCH_WORKLOADS.',
         false,
         ['moyodb', 'indexeddb'],
-        ['write']
+        ['write', 'manual']
     ),
 
     workload(
@@ -580,10 +622,10 @@ export const WORKLOADS: WorkloadSpec[] = [
         'setup/preload/close outside measurement; timed region opens populated database and performs one verification read',
         1,
         5,
-        'Cold open measurement after a 100k-row setup.',
+        'Opt-in only. Cold open after a 100k-row setup. Pass this name via MOYODB_BENCH_WORKLOADS.',
         false,
         ['moyodb', 'indexeddb'],
-        ['open']
+        ['open', 'manual']
     ),
     workload(
         'recovery_after_dirty_close',
@@ -665,6 +707,9 @@ export function selectWorkloads(profile: BenchProfile, workloadNames?: string[])
         return WORKLOADS.filter((workload) => requested.has(workload.name));
     }
     return WORKLOADS.filter((workload) => {
+        if (workload.tags?.includes('manual')) {
+            return false;
+        }
         if (profile === 'smoke') {
             return workload.smoke === true;
         }
@@ -675,7 +720,7 @@ export function selectWorkloads(profile: BenchProfile, workloadNames?: string[])
     });
 }
 
-export function keyString(index: number, keySize: number): string {
+function keyString(index: number, keySize: number): string {
     if (keySize <= 0) {
         return '';
     }
@@ -687,7 +732,7 @@ export function keyString(index: number, keySize: number): string {
     return `${raw}${'_'.repeat(keySize - raw.length)}`;
 }
 
-export function keyBytes(index: number, keySize: number): Uint8Array {
+export function keyBytes(index: number, keySize: number): Uint8Array<ArrayBuffer> {
     return new TextEncoder().encode(keyString(index, keySize));
 }
 
@@ -701,14 +746,47 @@ export function valueBytes(index: number, valueSize: number): Uint8Array {
     return value;
 }
 
+function rangeScanCount(name: string): number | null {
+    const prefix = 'range_scan_';
+    if (!name.startsWith(prefix)) {
+        return null;
+    }
+    let index = prefix.length;
+    const start = index;
+    while (index < name.length && name[index] >= '0' && name[index] <= '9') {
+        index += 1;
+    }
+    if (index === start) {
+        return null;
+    }
+    const count = Number(name.slice(start, index));
+    if (index === name.length) {
+        return count;
+    }
+    const from = '_from_';
+    if (!name.startsWith(from, index)) {
+        return null;
+    }
+    index += from.length;
+    const fromStart = index;
+    while (index < name.length && name[index] >= '0' && name[index] <= '9') {
+        index += 1;
+    }
+    if (index === fromStart) {
+        return null;
+    }
+    if (index < name.length && (name[index] === 'k' || name[index] === 'm')) {
+        index += 1;
+    }
+    return index === name.length ? count : null;
+}
 export function scanWindow(workload: WorkloadSpec): { start: number; count: number } {
-    const match = /^range_scan_(\d+)(?:_from_\d+[km]?)?$/.exec(workload.name);
-    const count = match ? Number(match[1]) : Math.min(100, workload.recordCount);
+    const count = rangeScanCount(workload.name) ?? Math.min(100, workload.recordCount);
     const start = Math.max(0, Math.floor((workload.recordCount - count) / 2));
     return { start, count };
 }
 
-export function randomReadCount(workload: WorkloadSpec): number {
+function randomReadCount(workload: WorkloadSpec): number {
     const explicit = /^random_get_(\d+)(k|m)?_/.exec(workload.name);
     if (explicit) {
         const value = Number(explicit[1]);
@@ -739,15 +817,134 @@ export function isRandomGetWorkload(name: string): boolean {
     return name.startsWith('point_get_random_') || name.startsWith('random_get_');
 }
 
-export function isBulkRandomGetWorkload(name: string): boolean {
-    return name.endsWith('_bulk');
+export type ReadRequestMode = 'sequential' | 'pipelined' | 'bulk';
+
+export function readRequestMode(name: string): ReadRequestMode {
+    if (name.endsWith('_bulk')) {
+        return 'bulk';
+    }
+    return name.endsWith('_pipelined') ? 'pipelined' : 'sequential';
 }
 
 export function isRangeScanWorkload(name: string): boolean {
     return name.startsWith('range_scan_');
 }
 
-export class DeterministicRng {
+export function isReverseScanWorkload(name: string): boolean {
+    return name === 'reverse_scan_limit_1';
+}
+
+export function isPreloadedReadWorkload(name: string): boolean {
+    return isRandomGetWorkload(name) || isRangeScanWorkload(name) || isReverseScanWorkload(name);
+}
+
+/** Record indices every engine reads for one sample, in request order. */
+export function randomReadIndices(workload: WorkloadSpec, sampleIndex: number): number[] {
+    const rng = new DeterministicRng(0x5eed0000 ^ sampleIndex ^ workload.recordCount);
+    const readCount = randomReadCount(workload);
+    const indices: number[] = [];
+    for (let i = 0; i < readCount; i += 1) {
+        indices.push(rng.nextInt(workload.recordCount));
+    }
+    return indices;
+}
+
+/** Record indices a scan workload must return, in result order. */
+export function scanResultIndices(workload: WorkloadSpec): number[] {
+    if (isReverseScanWorkload(workload.name)) {
+        return [workload.recordCount - 1];
+    }
+    const { start, count } = scanWindow(workload);
+    return Array.from({ length: count }, (_, offset) => start + offset);
+}
+
+const WRITE_VERIFICATION_SAMPLE = 1024;
+
+/** Evenly spaced record indices, including the first and last, read back after a write sample. */
+export function writeVerificationIndices(workload: WorkloadSpec): number[] {
+    const count = workload.recordCount;
+    if (count <= WRITE_VERIFICATION_SAMPLE) {
+        return Array.from({ length: count }, (_, index) => index);
+    }
+    const step = (count - 1) / (WRITE_VERIFICATION_SAMPLE - 1);
+    return Array.from({ length: WRITE_VERIFICATION_SAMPLE }, (_, index) => Math.round(index * step));
+}
+
+export type VerificationKind = 'point-read' | 'scan' | 'write' | 'none';
+
+export function verificationKind(name: string): VerificationKind {
+    if (isRandomGetWorkload(name)) {
+        return 'point-read';
+    }
+    if (isRangeScanWorkload(name) || isReverseScanWorkload(name)) {
+        return 'scan';
+    }
+    if (
+        isBulkInsertWorkload(name) ||
+        isSdkPutSingleCallsWorkload(name) ||
+        name === 'small_tx_1000_commits' ||
+        name === 'sdk_bulk_put_10k' ||
+        name === 'indexeddb_bulk_put_10k'
+    ) {
+        return 'write';
+    }
+    return 'none';
+}
+
+/** Order-sensitive FNV-1a over length-prefixed byte strings; `null` is its own marker. */
+export class ContentChecksum {
+    #hash = 0x811c9dc5;
+    #items = 0;
+
+    add(bytes: Uint8Array | null): void {
+        const length = bytes ? bytes.length : 0xffffffff;
+        this.#mix(length & 0xff);
+        this.#mix((length >>> 8) & 0xff);
+        this.#mix((length >>> 16) & 0xff);
+        this.#mix((length >>> 24) & 0xff);
+        if (bytes) {
+            for (const byte of bytes) {
+                this.#mix(byte);
+            }
+        }
+        this.#items += 1;
+    }
+
+    digest(): string {
+        return `${this.#items}:${this.#hash.toString(16).padStart(8, '0')}`;
+    }
+
+    #mix(byte: number): void {
+        this.#hash = Math.imul(this.#hash ^ byte, 0x01000193) >>> 0;
+    }
+}
+
+export function expectedValuesChecksum(workload: WorkloadSpec, indices: number[]): string {
+    const checksum = new ContentChecksum();
+    for (const index of indices) {
+        checksum.add(valueBytes(index, workload.valueSize));
+    }
+    return checksum.digest();
+}
+
+export function expectedRowsChecksum(workload: WorkloadSpec, indices: number[]): string {
+    const checksum = new ContentChecksum();
+    for (const index of indices) {
+        checksum.add(keyBytes(index, workload.keySize));
+        checksum.add(valueBytes(index, workload.valueSize));
+    }
+    return checksum.digest();
+}
+
+export function assertChecksum(label: string, actual: ContentChecksum, expected: string): string {
+    const digest = actual.digest();
+    if (digest !== expected) {
+        throw new Error(`${label} content checksum mismatch: got ${digest}, expected ${expected}`);
+    }
+    return digest;
+}
+
+class DeterministicRng {
     #state: number;
 
     constructor(seed: number) {

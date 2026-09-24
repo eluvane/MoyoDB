@@ -1,4 +1,4 @@
-use crate::catalog::CatalogMap;
+use crate::catalog::{CatalogMap, ChangeFeedPolicy};
 use crate::error::{EngineError, Result};
 use crate::layout::StoreMetadata;
 use crate::value::StoredValue;
@@ -72,6 +72,23 @@ pub enum BatchOp {
     Delete { key: Vec<u8> },
 }
 
+/// Borrowed form of [`BatchOp`], so packed payloads can be applied without
+/// copying every key and value out of the transport buffer first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchOpRef<'a> {
+    Put { key: &'a [u8], value: &'a [u8] },
+    Delete { key: &'a [u8] },
+}
+
+impl<'a> From<&'a BatchOp> for BatchOpRef<'a> {
+    fn from(op: &'a BatchOp) -> Self {
+        match op {
+            BatchOp::Put { key, value } => BatchOpRef::Put { key, value },
+            BatchOp::Delete { key } => BatchOpRef::Delete { key },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum BatchOpOutcome {
@@ -138,6 +155,7 @@ pub struct ReadwriteTx {
     pub snapshot: Snapshot,
     pub stores: BTreeMap<String, StagedStore>,
     pub staged_schema_version: Option<u64>,
+    pub staged_change_feed_policy: Option<ChangeFeedPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,6 +191,7 @@ impl TransactionState {
                 snapshot,
                 stores: BTreeMap::new(),
                 staged_schema_version: None,
+                staged_change_feed_policy: None,
             }),
         }
     }

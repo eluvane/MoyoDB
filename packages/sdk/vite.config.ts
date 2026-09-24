@@ -1,12 +1,12 @@
 import { defineConfig } from 'vite';
 
-const entry = decodeURIComponent(new URL('./src/index.ts', import.meta.url).pathname).replace(/^\/([A-Za-z]:)/, '$1');
+const entry = decodeURIComponent(new URL('./src/index.ts', import.meta.url).pathname).replace(/^\/([A-Z]:)/i, '$1');
 
 export default defineConfig({
     build: {
         lib: {
             entry,
-            name: 'MoyoDB',
+            formats: ['es'],
             fileName: 'moyodb-sdk'
         },
         sourcemap: true,

@@ -38,6 +38,10 @@ pub enum EngineError {
     InjectedFailure(String),
     #[error("change feed compacted: {0}")]
     ChangeFeedCompacted(String),
+    #[error("recovery required: {0}")]
+    RecoveryRequired(String),
+    #[error("database is closed")]
+    Closed,
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -62,6 +66,8 @@ impl EngineError {
             EngineError::Serialization(_) => "SerializationError",
             EngineError::InjectedFailure(_) => "InjectedFailureError",
             EngineError::ChangeFeedCompacted(_) => "ChangeFeedCompactedError",
+            EngineError::RecoveryRequired(_) => "RecoveryRequiredError",
+            EngineError::Closed => "DatabaseClosedError",
             EngineError::Internal(_) => "InternalError",
         }
     }

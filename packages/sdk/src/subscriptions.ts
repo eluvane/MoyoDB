@@ -145,11 +145,15 @@ export class SubscriptionHub {
                     continue;
                 }
                 let changes: DbChange[];
-                if (entry.keyPrefix === null) {
+                const keyPrefix = entry.keyPrefix;
+                if (keyPrefix === null) {
                     changes = cloneChanges(storeEvent.changes);
                 } else {
                     changes = cloneChanges(
-                        storeEvent.changes.filter((change) => hasKeyPrefix(change.key, entry.keyPrefix!))
+                        storeEvent.changes.filter(
+                            (change) =>
+                                change.kind === 'clear' || change.kind === 'drop' || hasKeyPrefix(change.key, keyPrefix)
+                        )
                     );
                     if (changes.length === 0) {
                         continue;

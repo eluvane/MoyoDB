@@ -1,19 +1,28 @@
-import { openDB, type DB } from '../src/index';
+import { openDB, type DB, type ScanItem } from '../src/index';
 import type { SampleContext, WorkloadRunner, WorkloadSpec } from './types';
 import {
-    DeterministicRng,
+    assertChecksum,
+    ContentChecksum,
+    expectedRowsChecksum,
+    expectedValuesChecksum,
     isBulkInsertWorkload,
-    isBulkRandomGetWorkload,
+    isPreloadedReadWorkload,
     isRandomGetWorkload,
     isRangeScanWorkload,
+    isReverseScanWorkload,
     isSdkPutSingleCallsWorkload,
     isSingleTransactionInsertWorkload,
     keyBytes,
     OPFS_DIAGNOSTIC_BYTES,
-    randomReadCount,
+    randomReadIndices,
+    type ReadRequestMode,
+    readRequestMode,
+    scanResultIndices,
     scanWindow,
     STORE_NAME,
-    valueBytes
+    valueBytes,
+    verificationKind,
+    writeVerificationIndices
 } from './workloads';
 
 type Entry = [Uint8Array, Uint8Array];
@@ -21,7 +30,10 @@ type Entry = [Uint8Array, Uint8Array];
 type PreparedMoyoSample = {
     db?: DB;
     entries?: Entry[][];
+    readIndices?: number[];
     readKeys?: Uint8Array[];
+    readValues?: Array<Uint8Array | null>;
+    scanRows?: ScanItem[];
     worker?: Worker;
     wasmDiagnosticDb?: string;
     rawOpfsFiles?: string[];
@@ -114,14 +126,15 @@ export const moyoDbBaseline: WorkloadRunner = {
             return () => cleanupPrepared(ctx.dbName);
         }
 
-        if (isRandomGetWorkload(ctx.workload.name) || isRangeScanWorkload(ctx.workload.name)) {
+        if (isPreloadedReadWorkload(ctx.workload.name)) {
             await deleteDBIfExists(ctx.dbName);
             prepared.db = await openEmptyDb(ctx.dbName);
             await prepared.db.createStore(STORE_NAME);
             const entries = buildEntryBatches(ctx.workload, ctx.workload.recordCount, effectiveBatchSize(ctx.workload));
             await bulkInsertPrepared(prepared.db, entries, shouldUseSingleTransactionPreload(ctx.workload));
             if (isRandomGetWorkload(ctx.workload.name)) {
-                prepared.readKeys = buildRandomReadKeys(ctx.workload, ctx.sampleIndex);
+                prepared.readIndices = randomReadIndices(ctx.workload, ctx.sampleIndex);
+                prepared.readKeys = prepared.readIndices.map((index) => keyBytes(index, ctx.workload.keySize));
             }
             preparedSamples.set(ctx.dbName, prepared);
             return () => cleanupPrepared(ctx.dbName);
@@ -181,6 +194,45 @@ export const moyoDbBaseline: WorkloadRunner = {
         await requireMoyoDbCapabilitiesForWorkload(ctx.workload);
         await runMoyoDbWorkload(ctx.dbName, ctx.workload, ctx.sampleIndex);
     },
+    async verify(ctx: SampleContext): Promise<string | null> {
+        const prepared = preparedSamples.get(ctx.dbName);
+        if (!prepared) {
+            return null;
+        }
+        switch (verificationKind(ctx.workload.name)) {
+            case 'point-read':
+                return assertChecksum(
+                    'MoyoDB point read',
+                    valuesChecksum(requireValue(prepared.readValues, 'read values', ctx.dbName)),
+                    expectedValuesChecksum(ctx.workload, requireValue(prepared.readIndices, 'read indices', ctx.dbName))
+                );
+            case 'scan':
+                return assertChecksum(
+                    'MoyoDB scan',
+                    rowsChecksum(requireValue(prepared.scanRows, 'scan rows', ctx.dbName)),
+                    expectedRowsChecksum(ctx.workload, scanResultIndices(ctx.workload))
+                );
+            case 'write': {
+                const indices = writeVerificationIndices(ctx.workload);
+                const tx = await requirePreparedDb(prepared, ctx.dbName).begin('readonly');
+                try {
+                    const values = await tx.getMany(
+                        STORE_NAME,
+                        indices.map((index) => keyBytes(index, ctx.workload.keySize))
+                    );
+                    return assertChecksum(
+                        'MoyoDB write read-back',
+                        valuesChecksum(values),
+                        expectedValuesChecksum(ctx.workload, indices)
+                    );
+                } finally {
+                    await tx.rollback();
+                }
+            }
+            case 'none':
+                return null;
+        }
+    },
     async cleanup(ctx: SampleContext): Promise<void> {
         await cleanupPrepared(ctx.dbName);
     }
@@ -212,7 +264,7 @@ async function requireMoyoDbCapabilitiesForWorkload(workload: WorkloadSpec): Pro
 }
 
 async function probeMoyoDbCapabilities(): Promise<void> {
-    const nav = navigator as Navigator & {
+    const nav = navigator as Omit<Navigator, 'storage' | 'locks'> & {
         locks?: unknown;
         storage?: StorageManager & { getDirectory?: unknown };
     };
@@ -358,22 +410,20 @@ async function runMoyoDbWorkload(dbName: string, workload: WorkloadSpec, sampleI
     if (isRandomGetWorkload(workload.name)) {
         const prepared = requirePrepared(dbName);
         const db = requirePreparedDb(prepared, dbName);
-        const keys = prepared.readKeys;
-        if (!keys) {
-            throw new Error(`prepared random read keys missing for ${dbName}`);
-        }
-        if (isBulkRandomGetWorkload(workload.name)) {
-            await randomPointGetsBulk(db, keys);
-        } else {
-            await randomPointGets(db, keys);
-        }
+        const keys = requireValue(prepared.readKeys, 'read keys', dbName);
+        prepared.readValues = await randomPointGets(db, keys, readRequestMode(workload.name));
         return;
     }
 
     if (isRangeScanWorkload(workload.name)) {
         const prepared = requirePrepared(dbName);
-        const db = requirePreparedDb(prepared, dbName);
-        await rangeScan(db, workload);
+        prepared.scanRows = await rangeScan(requirePreparedDb(prepared, dbName), workload);
+        return;
+    }
+
+    if (isReverseScanWorkload(workload.name)) {
+        const prepared = requirePrepared(dbName);
+        prepared.scanRows = await reverseScanFirst(requirePreparedDb(prepared, dbName));
         return;
     }
 
@@ -467,10 +517,14 @@ function requirePreparedDb(prepared: PreparedMoyoSample, name: string): DB {
 }
 
 function requirePreparedEntries(prepared: PreparedMoyoSample, name: string): Entry[][] {
-    if (!prepared.entries) {
-        throw new Error(`prepared MoyoDB entries missing for ${name}`);
+    return requireValue(prepared.entries, 'entries', name);
+}
+
+function requireValue<T>(value: T | undefined, what: string, name: string): T {
+    if (value === undefined) {
+        throw new Error(`prepared MoyoDB ${what} missing for ${name}`);
     }
-    return prepared.entries;
+    return value;
 }
 
 function effectiveBatchSize(workload: WorkloadSpec): number {
@@ -503,16 +557,6 @@ function buildRoundtripPayloads(workload: WorkloadSpec): Uint8Array[] {
         payloads.push(valueBytes(i, workload.valueSize));
     }
     return payloads;
-}
-
-function buildRandomReadKeys(workload: WorkloadSpec, sampleIndex: number): Uint8Array[] {
-    const rng = new DeterministicRng(0x0db00000 ^ sampleIndex ^ workload.recordCount);
-    const readCount = randomReadCount(workload);
-    const keys: Uint8Array[] = [];
-    for (let i = 0; i < readCount; i += 1) {
-        keys.push(keyBytes(rng.nextInt(workload.recordCount), workload.keySize));
-    }
-    return keys;
 }
 
 async function bulkInsertPrepared(db: DB, batches: Entry[][], singleTransaction: boolean): Promise<void> {
@@ -575,51 +619,62 @@ async function sdkBulkPut(dbName: string): Promise<void> {
     }
 }
 
-async function randomPointGets(db: DB, keys: Uint8Array[]): Promise<void> {
+async function randomPointGets(db: DB, keys: Uint8Array[], mode: ReadRequestMode): Promise<Array<Uint8Array | null>> {
     const tx = await db.begin('readonly');
     try {
+        if (mode === 'bulk') {
+            return await tx.getMany(STORE_NAME, keys);
+        }
+        if (mode === 'pipelined') {
+            return await Promise.all(keys.map((key) => tx.get(STORE_NAME, key)));
+        }
+        const values: Array<Uint8Array | null> = [];
         for (const key of keys) {
-            const value = await tx.get(STORE_NAME, key);
-            if (!value) {
-                throw new Error('MoyoDB random point read returned no value');
-            }
+            values.push(await tx.get(STORE_NAME, key));
         }
+        return values;
     } finally {
         await tx.rollback();
     }
 }
 
-async function randomPointGetsBulk(db: DB, keys: Uint8Array[]): Promise<void> {
-    const tx = await db.begin('readonly');
-    try {
-        const values = await tx.getMany(STORE_NAME, keys);
-        if (values.length !== keys.length) {
-            throw new Error(`MoyoDB bulk get count mismatch: ${values.length} != ${keys.length}`);
-        }
-        for (const value of values) {
-            if (!value) {
-                throw new Error('MoyoDB bulk random point read returned no value');
-            }
-        }
-    } finally {
-        await tx.rollback();
-    }
-}
-
-async function rangeScan(db: DB, workload: WorkloadSpec): Promise<void> {
+async function rangeScan(db: DB, workload: WorkloadSpec): Promise<ScanItem[]> {
     const { start, count } = scanWindow(workload);
     const tx = await db.begin('readonly');
     try {
-        const rows = await tx.scan(STORE_NAME, {
+        return await tx.scan(STORE_NAME, {
             gte: keyBytes(start, workload.keySize),
             lte: keyBytes(start + count - 1, workload.keySize)
         });
-        if (rows.length !== count) {
-            throw new Error(`MoyoDB range scan count mismatch: ${rows.length} != ${count}`);
-        }
     } finally {
         await tx.rollback();
     }
+}
+
+async function reverseScanFirst(db: DB): Promise<ScanItem[]> {
+    const tx = await db.begin('readonly');
+    try {
+        return await tx.scan(STORE_NAME, { reverse: true, limit: 1 });
+    } finally {
+        await tx.rollback();
+    }
+}
+
+function valuesChecksum(values: ReadonlyArray<Uint8Array | null>): ContentChecksum {
+    const checksum = new ContentChecksum();
+    for (const value of values) {
+        checksum.add(value);
+    }
+    return checksum;
+}
+
+function rowsChecksum(rows: readonly ScanItem[]): ContentChecksum {
+    const checksum = new ContentChecksum();
+    for (const row of rows) {
+        checksum.add(row.key);
+        checksum.add(row.value);
+    }
+    return checksum;
 }
 
 async function coldOpenAfterPrepared(dbName: string, workload: WorkloadSpec): Promise<void> {
@@ -707,8 +762,8 @@ function encodeDecodeDiagnostic(workload: WorkloadSpec): void {
     for (let i = 0; i < workload.recordCount; i += 1) {
         const key = keyBytes(i, workload.keySize);
         const value = valueBytes(i, workload.valueSize);
-        checksum ^= key[0] ?? 0;
-        checksum ^= value[0] ?? 0;
+        checksum ^= key[0];
+        checksum ^= value[0];
     }
     if (checksum === Number.MIN_SAFE_INTEGER) {
         throw new Error('unreachable encode/decode guard');
@@ -1041,24 +1096,31 @@ function postWorker<T = unknown>(
             worker.removeEventListener('message', onMessage);
             worker.removeEventListener('error', onError);
         };
-        const onMessage = (event: MessageEvent) => {
-            if (event.data?.id !== id && typeof payload === 'object') {
+        const onMessage = (event: MessageEvent<unknown>) => {
+            const data = event.data;
+            if (typeof data !== 'object' || data === null) {
+                cleanup();
+                resolve(data as T);
+                return;
+            }
+            const reply = data as { id?: unknown; ok?: unknown; error?: unknown; value?: T };
+            if (reply.id !== id && typeof payload === 'object') {
                 return;
             }
             cleanup();
-            if (event.data?.ok === false) {
-                reject(new Error(event.data.error ?? 'worker operation failed'));
+            if (reply.ok === false) {
+                reject(new Error(typeof reply.error === 'string' ? reply.error : 'worker operation failed'));
                 return;
             }
-            if (event.data?.id === id) {
-                resolve(event.data.value as T);
+            if (reply.id === id) {
+                resolve(reply.value as T);
                 return;
             }
-            resolve(event.data as T);
+            resolve(data as T);
         };
         const onError = (event: ErrorEvent) => {
             cleanup();
-            reject(event.error ?? new Error(event.message));
+            reject(event.error instanceof Error ? event.error : new Error(event.message));
         };
         worker.addEventListener('message', onMessage);
         worker.addEventListener('error', onError);

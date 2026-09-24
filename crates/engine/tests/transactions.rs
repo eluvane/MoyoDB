@@ -63,18 +63,34 @@ fn readonly_commit_is_rejected() {
 }
 
 #[test]
-fn failed_commit_releases_write_slot() {
+fn ambiguous_commit_requires_recovery_before_more_work() {
     let (_bundle, mut engine) = common::open_memory_engine("txn-failed-commit");
     let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
     engine.create_store(tx, "kv").unwrap();
     engine.put(tx, "kv", b"a", b"1").unwrap();
     engine.commit_tx(tx).unwrap();
+    let reader = engine.begin_tx(TxMode::Readonly).unwrap();
 
     engine.set_failpoint(Some(Failpoint::AfterWalFlush));
     let tx2 = engine.begin_tx(TxMode::Readwrite).unwrap();
     engine.put(tx2, "kv", b"b", b"2").unwrap();
     let err = engine.commit_tx(tx2).unwrap_err();
     assert!(matches!(err, EngineError::InjectedFailure(_)));
+    assert!(engine.needs_recovery());
+
+    let err = engine.begin_tx(TxMode::Readwrite).unwrap_err();
+    assert_eq!(err.code(), "RecoveryRequiredError");
+    let err = engine.get(reader, "kv", b"a").unwrap_err();
+    assert_eq!(err.code(), "RecoveryRequiredError");
+    engine.rollback_tx(reader).unwrap();
+
+    let report = engine.recover().unwrap();
+    assert!(report.pending_committed);
+    assert_eq!(report.pending_txid, Some(report.last_committed_txid));
+
+    let ro = engine.begin_tx(TxMode::Readonly).unwrap();
+    assert_eq!(engine.get(ro, "kv", b"b").unwrap(), Some(b"2".to_vec()));
+    engine.rollback_tx(ro).unwrap();
 
     let tx3 = engine.begin_tx(TxMode::Readwrite).unwrap();
     engine.put(tx3, "kv", b"c", b"3").unwrap();
@@ -184,6 +200,149 @@ fn small_update_reuses_untouched_leaf_runs() {
         Some(seed_value)
     );
     engine.rollback_tx(ro).unwrap();
+}
+
+#[test]
+fn retired_pages_are_reused_only_after_snapshots_move_on() {
+    let (_bundle, mut engine) = common::open_memory_engine("txn-page-reuse");
+    let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
+    engine.create_store(tx, "kv").unwrap();
+    for i in 0u32..2048 {
+        engine
+            .put(tx, "kv", &i.to_be_bytes(), &[0x11; 100])
+            .unwrap();
+    }
+    engine.commit_tx(tx).unwrap();
+
+    let update = |engine: &mut moyodb_engine::Engine<moyodb_engine::MemoryBackend>, byte: u8| {
+        let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
+        engine
+            .put(tx, "kv", &7u32.to_be_bytes(), &[byte; 100])
+            .unwrap();
+        engine.commit_tx(tx).unwrap();
+    };
+
+    for byte in 0..4 {
+        update(&mut engine, byte);
+    }
+    let settled = engine.stats().unwrap().next_page_id;
+    for byte in 4..32 {
+        update(&mut engine, byte);
+    }
+    let recycled = engine.stats().unwrap().next_page_id;
+    // Only change-log growth may extend the file; without reuse each of the
+    // 28 commits would append its whole root-to-leaf path and catalog.
+    assert!(
+        recycled - settled <= 6,
+        "steady single-key updates must recycle retired pages, file grew by {}",
+        recycled - settled
+    );
+
+    let reader = engine.begin_tx(TxMode::Readonly).unwrap();
+    for byte in 32..40 {
+        update(&mut engine, byte);
+    }
+    assert!(engine.stats().unwrap().next_page_id > recycled + 8);
+    assert_eq!(
+        engine.get(reader, "kv", &7u32.to_be_bytes()).unwrap(),
+        Some(vec![31; 100]),
+        "an open snapshot keeps reading the pages it started with"
+    );
+    engine.rollback_tx(reader).unwrap();
+}
+
+#[test]
+fn reverse_scan_with_limit_reads_from_the_end_and_merges_staged_writes() {
+    let (_bundle, mut engine) = common::open_memory_engine("txn-reverse-scan");
+    let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
+    engine.create_store(tx, "kv").unwrap();
+    for i in 0u32..3000 {
+        engine.put(tx, "kv", &i.to_be_bytes(), b"v").unwrap();
+    }
+    engine.commit_tx(tx).unwrap();
+
+    let ro = engine.begin_tx(TxMode::Readonly).unwrap();
+    let rows = engine
+        .scan(
+            ro,
+            "kv",
+            &ScanRange {
+                lt: Some(2000u32.to_be_bytes().to_vec()),
+                reverse: true,
+                limit: Some(3),
+                ..ScanRange::default()
+            },
+        )
+        .unwrap();
+    engine.rollback_tx(ro).unwrap();
+    let keys: Vec<Vec<u8>> = rows.into_iter().map(|row| row.key).collect();
+    assert_eq!(
+        keys,
+        vec![
+            1999u32.to_be_bytes().to_vec(),
+            1998u32.to_be_bytes().to_vec(),
+            1997u32.to_be_bytes().to_vec(),
+        ]
+    );
+
+    let rw = engine.begin_tx(TxMode::Readwrite).unwrap();
+    engine.delete(rw, "kv", &2999u32.to_be_bytes()).unwrap();
+    engine
+        .put(rw, "kv", &5000u32.to_be_bytes(), b"new")
+        .unwrap();
+    let rows = engine
+        .scan(
+            rw,
+            "kv",
+            &ScanRange {
+                reverse: true,
+                limit: Some(2),
+                ..ScanRange::default()
+            },
+        )
+        .unwrap();
+    engine.rollback_tx(rw).unwrap();
+    assert_eq!(rows[0].key, 5000u32.to_be_bytes().to_vec());
+    assert_eq!(rows[0].value, b"new".to_vec());
+    assert_eq!(rows[1].key, 2998u32.to_be_bytes().to_vec());
+}
+
+#[test]
+fn compact_into_streams_live_rows_into_a_fresh_database() {
+    let (_source_bundle, mut source) = common::open_memory_engine("txn-compact");
+    let tx = source.begin_tx(TxMode::Readwrite).unwrap();
+    source.create_store(tx, "kv").unwrap();
+    for i in 0u32..1500 {
+        source.put(tx, "kv", &i.to_be_bytes(), &[0x22; 64]).unwrap();
+    }
+    source.put(tx, "kv", b"large", &vec![0x33; 20_000]).unwrap();
+    source
+        .put_with_ttl(tx, "kv", b"expiring", b"soon", Some(1))
+        .unwrap();
+    let source_txid = source.commit_tx(tx).unwrap();
+    sleep(Duration::from_millis(5));
+
+    let target_bundle = moyodb_engine::MemoryBundle::new();
+    let mut target = moyodb_engine::Engine::open(
+        "txn-compact",
+        target_bundle.files(),
+        moyodb_engine::OpenConfig::default(),
+    )
+    .unwrap();
+    let published = source.compact_into(&mut target).unwrap();
+    assert_eq!(published, source_txid + 1);
+    drop(target);
+
+    let mut reopened = common::reopen_memory_engine("txn-compact", &target_bundle);
+    let ro = reopened.begin_tx(TxMode::Readonly).unwrap();
+    let rows = common::scan_all(&mut reopened, ro, "kv");
+    assert_eq!(rows.len(), 1501);
+    assert_eq!(
+        reopened.get(ro, "kv", b"large").unwrap(),
+        Some(vec![0x33; 20_000])
+    );
+    assert_eq!(reopened.get(ro, "kv", b"expiring").unwrap(), None);
+    reopened.rollback_tx(ro).unwrap();
 }
 
 #[test]
@@ -311,12 +470,16 @@ fn empty_write_batch_still_validates_transaction_mode_and_store() {
     engine.commit_tx(tx).unwrap();
 
     let ro = engine.begin_tx(TxMode::Readonly).unwrap();
-    let err = engine.put_many(ro, "kv", &[]).unwrap_err();
+    let err = engine
+        .put_many::<Vec<u8>, Vec<u8>>(ro, "kv", &[])
+        .unwrap_err();
     assert!(matches!(err, EngineError::ReadonlyTransaction));
     engine.rollback_tx(ro).unwrap();
 
     let rw = engine.begin_tx(TxMode::Readwrite).unwrap();
-    let err = engine.delete_many(rw, "missing", &[]).unwrap_err();
+    let err = engine
+        .delete_many::<Vec<u8>>(rw, "missing", &[])
+        .unwrap_err();
     assert!(matches!(err, EngineError::StoreNotFound(name) if name == "missing"));
     engine.rollback_tx(rw).unwrap();
 }

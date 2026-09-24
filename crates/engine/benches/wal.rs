@@ -1,4 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, Criterion};
 use moyodb_engine::layout::PAGE_SIZE;
 use moyodb_engine::storage::memory::MemoryBackend;
 use moyodb_engine::wal::{append_commit_record, append_page_image_record, CommitRecord};

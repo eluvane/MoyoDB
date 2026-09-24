@@ -6,7 +6,7 @@ test('managed indexes are hidden from catalog and support exact + range lookups'
     const result = await page.evaluate(async (name) => {
         const encode = window.moyodb.utf8Encode;
         const decode = window.moyodb.utf8Decode;
-        const decodeJson = window.moyodb.jsonDecode as <T>(bytes: Uint8Array) => T;
+        const decodeJson = window.moyodb.jsonDecode;
         const db = await window.moyodb.openDB(name, {
             version: 1,
             indexes: [
@@ -88,7 +88,7 @@ test('managed indexes follow createStore, put, clearStore, and dropStore semanti
     await prepareMoyoDbPage(page);
     const result = await page.evaluate(async (name) => {
         const encode = window.moyodb.utf8Encode;
-        const decodeJson = window.moyodb.jsonDecode as <T>(bytes: Uint8Array) => T;
+        const decodeJson = window.moyodb.jsonDecode;
         const db = await window.moyodb.openDB(name, {
             version: 1,
             indexes: [{ store: 'users', name: 'byEmail', keyPath: 'email' }],
@@ -210,7 +210,7 @@ test('unique managed indexes reject duplicates without disturbing committed stat
     const result = await page.evaluate(async (name) => {
         const encode = window.moyodb.utf8Encode;
         const decode = window.moyodb.utf8Decode;
-        const decodeJson = window.moyodb.jsonDecode as <T>(bytes: Uint8Array) => T;
+        const decodeJson = window.moyodb.jsonDecode;
         const db = await window.moyodb.openDB(name, {
             version: 1,
             indexes: [{ store: 'users', name: 'byEmail', keyPath: 'email', unique: true }],
@@ -296,7 +296,7 @@ test('same-version reopen rejects index catalog drift', async ({ page }) => {
             await window.moyodb.openDB(name, {
                 version: 1,
                 indexes: [{ store: 'users', name: 'byHandle', keyPath: 'handle' }],
-                migrate: async () => {
+                migrate: () => {
                     throw new Error('should not run');
                 }
             });
@@ -316,7 +316,7 @@ test('managed index catalog survives snapshot import, reset, and rebuild', async
     const result = await page.evaluate(
         async ({ source, target }) => {
             const encode = window.moyodb.utf8Encode;
-            const decodeJson = window.moyodb.jsonDecode as <T>(bytes: Uint8Array) => T;
+            const decodeJson = window.moyodb.jsonDecode;
             const sourceDb = await window.moyodb.openDB(source, {
                 version: 1,
                 indexes: [{ store: 'users', name: 'byEmail', keyPath: 'email', unique: true }],

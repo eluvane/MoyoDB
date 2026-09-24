@@ -1,4 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use moyodb_engine::engine::{Engine, OpenConfig, TxMode};
 use moyodb_engine::storage::memory::MemoryBundle;
 

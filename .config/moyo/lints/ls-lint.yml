@@ -29,6 +29,7 @@ ls:
     .rs: snake_case
   crates/engine/js:
     .js: snake_case
+    .mjs: snake_case
 
   packages/sdk/src:
     .ts: kebab-case

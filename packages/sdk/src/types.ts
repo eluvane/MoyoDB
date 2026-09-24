@@ -1,7 +1,11 @@
 export type TxMode = 'readonly' | 'readwrite';
 export type TxId = number;
 export type DebugFailpoint = 'after_wal_flush' | 'after_main_flush' | 'before_superblock_flush' | null;
-export type ChangeKind = 'put' | 'delete';
+/**
+ * `clear` and `drop` are store-level changes: they carry an empty key and
+ * apply to every key of the store at that point of the transaction.
+ */
+export type ChangeKind = 'put' | 'delete' | 'clear' | 'drop';
 export type Unsubscribe = () => void;
 export type BatchOp =
     | {
@@ -42,6 +46,17 @@ export interface OpenOptions {
     version?: number;
     migrate?: MigrateHook;
     indexes?: IndexDef[];
+    /**
+     * Persistent change feed policy. When omitted, the policy stored in the
+     * database is kept (new databases keep the last 100 000 transactions).
+     */
+    changeFeed?: ChangeFeedSettings;
+}
+export interface ChangeFeedSettings {
+    /** Disabling drops the stored history; `changesSince` then only accepts the latest txid. */
+    enabled?: boolean;
+    /** Committed transactions kept in the log; `null` keeps everything. */
+    retainTxids?: number | null;
 }
 export interface PutOptions {
     ttl?: number;
@@ -83,7 +98,15 @@ export interface DbStats {
     active_txns: number;
     write_tx_open: boolean;
     cache_pages: number;
+    dirty_pages: number;
+    reusable_pages: number;
+    retired_pages: number;
+    health: EngineHealth;
 }
+export type EngineHealth =
+    | { state: 'healthy' }
+    | { state: 'recoveryRequired'; reason: string; pendingTxid: number | null }
+    | { state: 'closed' };
 export interface StorageInfo {
     dbSize: number;
     originUsage: number;
