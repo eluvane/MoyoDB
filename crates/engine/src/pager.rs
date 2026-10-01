@@ -18,11 +18,15 @@ pub struct Pager<B: FileBackend> {
     main: B,
     cache_pages: usize,
     cache: HashMap<u64, CacheEntry>,
+    // Only clean pages participate in eviction. Dirty pins must not be
+    // rotated or compacted on every insertion while a commit grows.
     lru: VecDeque<(u64, u64)>,
     next_generation: u64,
     // Exclusive upper bound for page ids reachable from committed state.
     page_limit: u64,
     dirty_count: usize,
+    #[cfg(test)]
+    lru_entries_examined: usize,
 }
 
 impl<B: FileBackend> Pager<B> {
@@ -35,6 +39,8 @@ impl<B: FileBackend> Pager<B> {
             next_generation: 1,
             page_limit: u64::MAX,
             dirty_count: 0,
+            #[cfg(test)]
+            lru_entries_examined: 0,
         }
     }
 
@@ -148,10 +154,19 @@ impl<B: FileBackend> Pager<B> {
         if self.dirty_count == 0 {
             return;
         }
-        for entry in self.cache.values_mut() {
-            entry.dirty = false;
+        for (page_id, entry) in &mut self.cache {
+            if entry.dirty {
+                entry.dirty = false;
+                entry.generation = self.next_generation;
+                self.next_generation = self.next_generation.wrapping_add(1).max(1);
+                self.lru.push_back((*page_id, entry.generation));
+            }
         }
         self.dirty_count = 0;
+        // The caller has durably checkpointed these images. They are now
+        // evictable, including when no subsequent cache miss occurs.
+        self.evict_if_needed(0);
+        self.compact_lru_if_needed();
     }
 
     /// Forgets every cached page, dirty ones included. Used when in-memory
@@ -187,6 +202,10 @@ impl<B: FileBackend> Pager<B> {
                 _ => {}
             }
             entry.dirty = dirty;
+            if dirty {
+                // Invalidate a clean entry's old queue records immediately.
+                entry.generation = 0;
+            }
             self.touch(page_id);
             return;
         }
@@ -197,7 +216,7 @@ impl<B: FileBackend> Pager<B> {
         if dirty {
             self.dirty_count += 1;
         }
-        let generation = self.bump_generation();
+        let generation = if dirty { 0 } else { self.bump_generation() };
         self.cache.insert(
             page_id,
             CacheEntry {
@@ -206,14 +225,21 @@ impl<B: FileBackend> Pager<B> {
                 dirty,
             },
         );
-        self.lru.push_back((page_id, generation));
-        // Dirty pages pin the cache. Without this exception, eviction walks
-        // those pins and drops the page inserted by this call before the caller reads it.
+        if !dirty {
+            self.lru.push_back((page_id, generation));
+        }
+        // Protect a freshly loaded clean page when dirty pins exceed the budget.
         self.evict_if_needed(page_id);
         self.compact_lru_if_needed();
     }
 
     fn touch(&mut self, page_id: u64) {
+        let Some(entry) = self.cache.get(&page_id) else {
+            return;
+        };
+        if entry.dirty || self.lru.back() == Some(&(page_id, entry.generation)) {
+            return;
+        }
         let generation = self.bump_generation();
         if let Some(entry) = self.cache.get_mut(&page_id) {
             entry.generation = generation;
@@ -229,27 +255,25 @@ impl<B: FileBackend> Pager<B> {
     }
 
     fn evict_if_needed(&mut self, protected_page_id: u64) {
-        let mut rotated = 0usize;
         while self.cache.len() > self.cache_pages {
-            if rotated >= self.lru.len() {
-                break;
-            }
             let Some((old_page_id, old_generation)) = self.lru.pop_front() else {
                 break;
             };
-            let pinned = match self.cache.get(&old_page_id) {
-                Some(entry) if entry.generation == old_generation => {
-                    entry.dirty || old_page_id == protected_page_id
-                }
+            #[cfg(test)]
+            {
+                self.lru_entries_examined += 1;
+            }
+            match self.cache.get(&old_page_id) {
+                Some(entry) if !entry.dirty && entry.generation == old_generation => {}
                 _ => continue,
-            };
-            if pinned {
+            }
+            if old_page_id == protected_page_id {
+                // The inserted page is the newest clean entry. There are no
+                // older eviction candidates left; do not walk the dirty pins.
                 self.lru.push_back((old_page_id, old_generation));
-                rotated += 1;
-                continue;
+                break;
             }
             self.cache.remove(&old_page_id);
-            rotated = 0;
         }
     }
 
@@ -258,10 +282,14 @@ impl<B: FileBackend> Pager<B> {
         if self.lru.len() <= compact_after {
             return;
         }
-        let mut compacted = VecDeque::with_capacity(self.cache.len());
+        let mut compacted = VecDeque::with_capacity(self.cache.len() - self.dirty_count);
         for (page_id, generation) in self.lru.drain(..) {
+            #[cfg(test)]
+            {
+                self.lru_entries_examined += 1;
+            }
             let is_current = match self.cache.get(&page_id) {
-                Some(entry) => entry.generation == generation,
+                Some(entry) => !entry.dirty && entry.generation == generation,
                 None => false,
             };
             if is_current {
@@ -319,6 +347,71 @@ mod tests {
         );
         pager.set_page_limit(2);
         assert!(pager.read_page(1).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn staging_and_reading_dirty_pages_does_no_lru_scan() -> Result<()> {
+        for pages in [64u64, 1024, 4096] {
+            let mut pager = Pager::new(MemoryBackend::new(), 16);
+            for page_id in 1..=pages {
+                pager.stage_page_image(page_id, encode_leaf_page(page_id, 0, 0, &[])?)?;
+            }
+            for page_id in 1..=pages {
+                pager.with_page(page_id, |_| Ok(()))?;
+            }
+            assert_eq!(pager.dirty_page_count(), pages as usize);
+            assert_eq!(pager.cache.len(), pages as usize);
+            assert!(pager.lru.is_empty());
+            assert_eq!(pager.lru_entries_examined, 0, "dirty pages={pages}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_mru_reads_do_not_append_queue_records() -> Result<()> {
+        let mut pager = Pager::new(MemoryBackend::new(), 16);
+        pager.write_page_image(1, &encode_leaf_page(1, 0, 0, &[])?)?;
+        let next_generation = pager.next_generation;
+        for _ in 0..10_000 {
+            pager.with_page(1, |_| Ok(()))?;
+        }
+        assert_eq!(pager.lru.len(), 1);
+        assert_eq!(pager.next_generation, next_generation);
+        assert_eq!(pager.lru_entries_examined, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_releases_pins_and_restaging_invalidates_clean_records() -> Result<()> {
+        let mut pager = Pager::new(MemoryBackend::new(), 2);
+        for page_id in 1..=8 {
+            pager.stage_page_image(page_id, encode_leaf_page(page_id, 0, 0, &[])?)?;
+        }
+        pager.write_back_dirty()?;
+        pager.flush()?;
+        pager.mark_dirty_clean();
+        assert!(!pager.has_dirty());
+        assert_eq!(pager.cache.len(), 2);
+        for page_id in 1..=8 {
+            assert_eq!(pager.read_page(page_id)?, encode_leaf_page(page_id, 0, 0, &[])?);
+        }
+        // Page 8 is clean and MRU. Its stale queue record must not evict it
+        // after it is dirtied again, even when every page is pinned.
+        for page_id in 8..=16 {
+            pager.stage_page_image(page_id, encode_leaf_page(page_id, 0, 0, &[])?)?;
+        }
+        assert_eq!(pager.dirty_page_count(), 9);
+        for page_id in 8..=16 {
+            assert!(pager.cache.get(&page_id).is_some_and(|entry| entry.dirty));
+        }
+        pager.write_back_dirty()?;
+        pager.flush()?;
+        pager.mark_dirty_clean();
+        assert_eq!(pager.cache.len(), 2);
+        for page_id in 8..=16 {
+            assert_eq!(pager.read_page(page_id)?, encode_leaf_page(page_id, 0, 0, &[])?);
+        }
         Ok(())
     }
 }
