@@ -1,3 +1,5 @@
+mod read_buffer;
+
 use crate::checksum::checksum_with_zeroed_region;
 use crate::error::{EngineError, Result};
 use crate::layout::{
@@ -8,6 +10,7 @@ use crate::layout::{
 use crate::page::verify_page_image;
 use crate::pager::Pager;
 use crate::storage::backend::FileBackend;
+use read_buffer::WalReadBuffer;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use zerocopy::IntoBytes;
@@ -126,8 +129,9 @@ pub struct WalTransaction {
 
 const PAGE_IMAGE_PAYLOAD_LEN: usize = WAL_PAGE_IMAGE_BODY_HEADER_SIZE + PAGE_SIZE;
 
-/// Streams the WAL one record at a time and returns every complete, valid
-/// transaction in order. Memory is bounded by one record, not the log size.
+/// Scans records through bounded, sequential read buffers. Header and payload
+/// share their buffered bytes; only records crossing a chunk boundary are copied.
+/// Returned transaction/page descriptors still grow with the committed log.
 ///
 /// A record that fails its checksum, a truncated record and an incomplete batch
 /// mark the end of the durable log. A committed batch whose contents are
@@ -137,6 +141,7 @@ const PAGE_IMAGE_PAYLOAD_LEN: usize = WAL_PAGE_IMAGE_BODY_HEADER_SIZE + PAGE_SIZ
 /// uncommitted tail is never applied, so its contents do not matter.
 pub fn scan_wal_index<B: FileBackend>(wal: &B) -> Result<Vec<WalTransaction>> {
     let len = wal.len()?;
+    let mut reader = WalReadBuffer::new(wal, len);
     let mut offset = 0u64;
     let mut committed: Vec<WalTransaction> = Vec::new();
     let mut pending_txid: Option<u64> = None;
@@ -144,12 +149,14 @@ pub fn scan_wal_index<B: FileBackend>(wal: &B) -> Result<Vec<WalTransaction>> {
     let mut pending_invalid: Option<EngineError> = None;
     let mut last_txid = 0u64;
 
-    while offset + WAL_RECORD_HEADER_SIZE as u64 <= len {
-        let header_bytes = wal.read_at(offset, WAL_RECORD_HEADER_SIZE)?;
-        if header_bytes[..4] != WAL_MAGIC {
-            break;
-        }
-        let header: WalRecordHeader = unsafe_read_struct(&header_bytes)?;
+    while len.saturating_sub(offset) >= WAL_RECORD_HEADER_SIZE as u64 {
+        let header: WalRecordHeader = {
+            let bytes = reader.read(offset, WAL_RECORD_HEADER_SIZE)?;
+            if bytes[..4] != WAL_MAGIC {
+                break;
+            }
+            unsafe_read_struct(&bytes)?
+        };
         let payload_len = u32::from_le(header.payload_len) as usize;
         let Ok(tag) = WalTag::from_u8(header.tag) else {
             break;
@@ -162,10 +169,10 @@ pub fn scan_wal_index<B: FileBackend>(wal: &B) -> Result<Vec<WalTransaction>> {
             break;
         }
         let total_len = wal_record_total_len(payload_len) as u64;
-        if offset + total_len > len {
+        if total_len > len - offset {
             break;
         }
-        let record = wal.read_at(offset, total_len as usize)?;
+        let record = reader.read(offset, total_len as usize)?;
         let expected = checksum_with_zeroed_region(&record, WAL_RECORD_CHECKSUM_OFFSET, 4);
         if expected != u32::from_le(header.checksum) {
             break;

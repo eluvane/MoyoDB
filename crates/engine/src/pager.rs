@@ -234,17 +234,15 @@ impl<B: FileBackend> Pager<B> {
     }
 
     fn touch(&mut self, page_id: u64) {
-        let Some(entry) = self.cache.get(&page_id) else {
+        let Some(entry) = self.cache.get_mut(&page_id) else {
             return;
         };
         if entry.dirty || self.lru.back() == Some(&(page_id, entry.generation)) {
             return;
         }
-        let generation = self.bump_generation();
-        if let Some(entry) = self.cache.get_mut(&page_id) {
-            entry.generation = generation;
-            self.lru.push_back((page_id, generation));
-        }
+        entry.generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        self.lru.push_back((page_id, entry.generation));
         self.compact_lru_if_needed();
     }
 
