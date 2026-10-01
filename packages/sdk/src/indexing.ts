@@ -185,7 +185,25 @@ export function indexRangeToPhysicalRange(range: Range = {}): Range {
     return physical;
 }
 export function extractLogicalIndexKey(def: NormalizedIndexDef, valueBytes: Uint8Array): Uint8Array | null {
-    const documentValue = decodeIndexedDocument(valueBytes);
+    return extractLogicalIndexKeyFromDocument(def, decodeIndexedDocument(valueBytes));
+}
+/**
+ * One synchronous mutation plan may extract several keys from the same bytes.
+ * Decode lazily to preserve per-definition validation order; never reuse this
+ * extractor across operations or an asynchronous boundary.
+ */
+export function createIndexKeyExtractor(valueBytes: Uint8Array): (def: NormalizedIndexDef) => Uint8Array | null {
+    let decoded = false;
+    let documentValue: unknown;
+    return (def) => {
+        if (!decoded) {
+            documentValue = decodeIndexedDocument(valueBytes);
+            decoded = true;
+        }
+        return extractLogicalIndexKeyFromDocument(def, documentValue);
+    };
+}
+function extractLogicalIndexKeyFromDocument(def: NormalizedIndexDef, documentValue: unknown): Uint8Array | null {
     if (def.compound) {
         const parts: Uint8Array[] = [];
         for (const keyPath of def.keyPath) {

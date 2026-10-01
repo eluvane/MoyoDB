@@ -25,6 +25,7 @@ import {
     INDEX_METADATA_STORE,
     cloneNormalizedIndexDefinitions,
     compareNormalizedIndexDefinitions,
+    createIndexKeyExtractor,
     decodeIndexEntryKey,
     decodeIndexMetadataValue,
     encodeIndexEntryKey,
@@ -228,6 +229,11 @@ interface TrackedStoreChanges {
     keys: Map<string, TrackedKeyChange>;
 }
 type TrackedTxnChanges = Map<string, TrackedStoreChanges>;
+// Published maps are immutable. A transaction detaches only on create/drop,
+// and owns that detached map until commit transfers it to the committed view.
+type StoreCompressionSnapshot =
+    | { owned: false; values: ReadonlyMap<string, CompressionOption> }
+    | { owned: true; values: Map<string, CompressionOption> };
 type MaintenanceOperation = 'compact' | 'rebuild';
 const EMPTY_RANGE: Range = {};
 const EMPTY_VALUE = new Uint8Array(0);
@@ -563,9 +569,9 @@ class DbWorker implements WorkerApi {
      */
     private txIndexSchemas = new Map<number, NormalizedIndexDef[]>();
     private txIndexSchemaChanged = new Set<number>();
-    private txStoreCompression = new Map<number, Map<string, CompressionOption>>();
+    private txStoreCompression = new Map<number, StoreCompressionSnapshot>();
     private committedIndexes: NormalizedIndexDef[] | null = null;
-    private committedStoreCompression: Map<string, CompressionOption> | null = null;
+    private committedStoreCompression: ReadonlyMap<string, CompressionOption> | null = null;
     private openOptions: WorkerOpenRequest['options'] | null = null;
     private maintenanceOperation: MaintenanceOperation | null = null;
     async open(request: WorkerOpenRequest): Promise<void> {
@@ -704,12 +710,12 @@ class DbWorker implements WorkerApi {
     begin(mode: TxMode): Promise<number> {
         this.recoverEngineIfNeeded();
         const indexSchema = this.loadCommittedIndexSchema();
-        const storeCompression = new Map(this.loadCommittedStoreCompression());
+        const storeCompression = this.loadCommittedStoreCompression();
         const txId = fromWasmU64(this.withEngine((engine) => engine.begin_tx(mode)));
         this.txChanges.set(txId, new Map<string, TrackedStoreChanges>());
         this.txModes.set(txId, mode);
         this.txIndexSchemas.set(txId, indexSchema);
-        this.txStoreCompression.set(txId, storeCompression);
+        this.txStoreCompression.set(txId, { owned: false, values: storeCompression });
         return Promise.resolve(txId);
     }
     commit(txId: number): Promise<number> {
@@ -738,7 +744,7 @@ class DbWorker implements WorkerApi {
             this.committedIndexes = cloneNormalizedIndexDefinitions(indexOverride);
         }
         if (txMode === 'readwrite' && storeCompressionSnapshot) {
-            this.committedStoreCompression = new Map(storeCompressionSnapshot);
+            this.committedStoreCompression = storeCompressionSnapshot.values;
         }
         this.cleanupTxState(txId);
         if (this.dbName && this.events) {
@@ -859,9 +865,11 @@ class DbWorker implements WorkerApi {
         }
         // Index maintenance needs the previous value to find its old index keys.
         const oldValue = await this.readStoreValue(txId, store, key);
+        const oldKeyFor = oldValue === null ? null : createIndexKeyExtractor(oldValue);
+        const newKeyFor = createIndexKeyExtractor(value);
         const plans = defs.map((def) => {
-            const oldLogicalKey = oldValue === null ? null : extractLogicalIndexKey(def, oldValue);
-            const newLogicalKey = extractLogicalIndexKey(def, value);
+            const oldLogicalKey = oldKeyFor === null ? null : oldKeyFor(def);
+            const newLogicalKey = newKeyFor(def);
             return {
                 def,
                 oldLogicalKey,
@@ -980,8 +988,8 @@ class DbWorker implements WorkerApi {
         // Only index maintenance needs the old value; otherwise the engine's
         // metadata answer is enough.
         const oldValue = defs.length === 0 ? null : await this.readStoreValue(txId, store, key);
-        const oldLogicalKeys =
-            oldValue === null ? [] : defs.map((def) => ({ def, logicalKey: extractLogicalIndexKey(def, oldValue) }));
+        const oldKeyFor = oldValue === null ? null : createIndexKeyExtractor(oldValue);
+        const oldLogicalKeys = oldKeyFor === null ? [] : defs.map((def) => ({ def, logicalKey: oldKeyFor(def) }));
         const deleted = this.withEngine((engine) => engine.delete(toWasmU64(txId), store, key));
         if (!deleted) {
             this.recordDeleteChange(txId, store, key, false);
@@ -1364,7 +1372,7 @@ class DbWorker implements WorkerApi {
         );
         this.txChanges.set(txId, new Map());
         this.txModes.set(txId, 'readwrite');
-        this.txStoreCompression.set(txId, new Map(this.loadCommittedStoreCompression()));
+        this.txStoreCompression.set(txId, { owned: false, values: this.loadCommittedStoreCompression() });
         try {
             await this.reconcileIndexes(txId, toPublicIndexDefinitions(normalized));
             this.withEngine((engine) => engine.commit_tx(toWasmU64(txId)), { allowDuringMaintenance: true });
@@ -1686,7 +1694,7 @@ class DbWorker implements WorkerApi {
     private allRawStoreNames(): string[] {
         return this.withEngine((engine) => engine.list_stores()) as string[];
     }
-    private loadCommittedStoreCompression(): Map<string, CompressionOption> {
+    private loadCommittedStoreCompression(): ReadonlyMap<string, CompressionOption> {
         if (this.committedStoreCompression) {
             return this.committedStoreCompression;
         }
@@ -1709,7 +1717,13 @@ class DbWorker implements WorkerApi {
         return loaded;
     }
     private ensureTxStoreCompression(txId: number): Map<string, CompressionOption> {
-        return getOrInsert(this.txStoreCompression, txId, () => new Map<string, CompressionOption>());
+        const snapshot = this.txStoreCompression.get(txId);
+        if (snapshot?.owned) {
+            return snapshot.values;
+        }
+        const values = new Map(snapshot?.values);
+        this.txStoreCompression.set(txId, { owned: true, values });
+        return values;
     }
     private recordStoreCompressionCreate(txId: number, store: string, compression: CompressionOption): void {
         if (isInternalStoreName(store)) {
@@ -1729,7 +1743,7 @@ class DbWorker implements WorkerApi {
         }
         const snapshot = this.txStoreCompression.get(txId);
         if (snapshot) {
-            return snapshot.get(store) ?? false;
+            return snapshot.values.get(store) ?? false;
         }
         return this.loadCommittedStoreCompression().get(store) ?? false;
     }
@@ -1973,8 +1987,16 @@ class DbWorker implements WorkerApi {
         const reverse = physical.reverse === true;
         let resumeAfter = cursor;
         const visible: ScanItem[] = [];
+        // Do not fetch a full chunk only to discard its tail at a small limit.
+        // Entirely stale chunks grow geometrically, avoiding one scan per stale
+        // row when a getByIndex/limit=1 must walk a long expired prefix.
+        let staleChunkFloor = 1;
         for (;;) {
-            const chunkRange: Range = { ...physical, limit: INDEX_SCAN_RAW_CHUNK_ROWS };
+            const chunkLimit = Math.min(
+                INDEX_SCAN_RAW_CHUNK_ROWS,
+                Math.max(limit - visible.length, staleChunkFloor)
+            );
+            const chunkRange: Range = { ...physical, limit: chunkLimit };
             if (resumeAfter !== null) {
                 if (reverse) {
                     delete chunkRange.lte;
@@ -1993,6 +2015,7 @@ class DbWorker implements WorkerApi {
                 }
                 throw error;
             }
+            const visibleBefore = visible.length;
             for (const row of rawRows) {
                 resumeAfter = row.key;
                 const resolved = await this.resolveVisibleIndexedRow(txId, def, row.key);
@@ -2004,9 +2027,11 @@ class DbWorker implements WorkerApi {
                     return { rows: visible, cursor: row.key.slice() };
                 }
             }
-            if (rawRows.length < INDEX_SCAN_RAW_CHUNK_ROWS) {
+            if (rawRows.length < chunkLimit) {
                 return { rows: visible, cursor: null };
             }
+            staleChunkFloor =
+                visible.length === visibleBefore ? Math.min(INDEX_SCAN_RAW_CHUNK_ROWS, chunkLimit * 2) : 1;
         }
     }
     private async resolveVisibleIndexedRow(
