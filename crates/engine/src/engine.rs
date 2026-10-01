@@ -1,3 +1,8 @@
+mod catalog_delta;
+
+#[cfg(test)]
+mod catalog_tests;
+
 use crate::btree::{
     apply_mutations, build_catalog_tree, build_tree_from_sorted, collect_keys_below, free_tree,
     lookup, lookup_prefix, materialize_pending_value, pending_value_prefix, BuiltTree, KvPair,
@@ -35,10 +40,12 @@ use crate::value::{
     VALUE_ENVELOPE_HEADER_SIZE,
 };
 use crate::wal::{append_transaction, CommitRecord};
+use catalog_delta::{CatalogDelta, CatalogUpdate};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::Bound;
+use std::sync::Arc;
 
 pub use crate::txn::TxMode;
 
@@ -49,7 +56,7 @@ const CHANGE_LOG_PRUNE_BATCH: usize = 1024;
 
 struct CommitPlan {
     new_txid: u64,
-    final_catalog: CatalogMap,
+    catalog_update: CatalogUpdate,
     final_schema_version: u64,
     final_change_feed_floor_txid: u64,
     final_change_feed_policy: ChangeFeedPolicy,
@@ -253,7 +260,7 @@ pub struct Engine<B: FileBackend> {
     // txid memory has not applied.
     wal_durable_txid: u64,
     schema_version: u64,
-    catalog: CatalogMap,
+    catalog: Arc<CatalogMap>,
     change_feed_floor_txid: u64,
     change_feed_policy: ChangeFeedPolicy,
     next_tx_id: u64,
@@ -330,7 +337,7 @@ impl<B: FileBackend> Engine<B> {
             superblock: loaded.superblock.clone(),
             wal_durable_txid: 0,
             schema_version: 0,
-            catalog: CatalogMap::new(),
+            catalog: Arc::new(CatalogMap::new()),
             change_feed_floor_txid: 0,
             change_feed_policy: ChangeFeedPolicy::default(),
             next_tx_id: 1,
@@ -365,7 +372,7 @@ impl<B: FileBackend> Engine<B> {
         self.wal_durable_txid = superblock.last_committed_txid;
         self.next_commit_txid = superblock.last_committed_txid.saturating_add(1);
         self.schema_version = catalog.schema_version;
-        self.catalog = catalog.stores;
+        self.catalog = Arc::new(catalog.stores);
         self.change_feed_floor_txid = change_feed_floor_txid;
         self.change_feed_policy = catalog.change_feed_policy;
         self.superblock = superblock;
@@ -546,7 +553,7 @@ impl<B: FileBackend> Engine<B> {
         if mode == TxMode::Readwrite && self.write_tx_open.is_some() {
             return Err(EngineError::WriteTransactionAlreadyOpen);
         }
-        let snapshot = Snapshot::new(
+        let snapshot = Snapshot::new_shared(
             self.schema_version,
             self.superblock.catalog_root_page_id,
             self.superblock.last_committed_txid,
@@ -594,11 +601,17 @@ impl<B: FileBackend> Engine<B> {
         let TxInner::Readwrite(write_tx) = tx.inner else {
             return Err(EngineError::ReadonlyTransaction);
         };
-        let result = self.commit_staged(
-            write_tx.stores,
-            write_tx.staged_schema_version,
-            write_tx.staged_change_feed_policy,
-        );
+        let ReadwriteTx {
+            snapshot,
+            stores,
+            staged_schema_version,
+            staged_change_feed_policy,
+        } = write_tx;
+        // The single writer no longer needs its base snapshot. Keeping this
+        // reference through publication would force a full catalog copy even
+        // when there are no readers of the current version.
+        drop(snapshot);
+        let result = self.commit_staged(stores, staged_schema_version, staged_change_feed_policy);
         if self.write_tx_open == Some(tx_id) {
             self.write_tx_open = None;
         }
@@ -1185,7 +1198,7 @@ impl<B: FileBackend> Engine<B> {
 
     pub fn export_snapshot(&mut self) -> Result<Vec<u8>> {
         self.ensure_healthy()?;
-        let snapshot = Snapshot::new(
+        let snapshot = Snapshot::new_shared(
             self.schema_version,
             self.superblock.catalog_root_page_id,
             self.superblock.last_committed_txid,
@@ -1500,7 +1513,7 @@ impl<B: FileBackend> Engine<B> {
     fn finish_commit(&mut self, plan: CommitPlan, next_page_id: u64) -> Result<u64> {
         let CommitPlan {
             new_txid,
-            final_catalog,
+            catalog_update,
             final_schema_version,
             final_change_feed_floor_txid,
             final_change_feed_policy,
@@ -1552,7 +1565,7 @@ impl<B: FileBackend> Engine<B> {
         self.superblock.last_committed_txid = new_txid;
         self.pager.set_page_limit(next_page_id);
         self.schema_version = final_schema_version;
-        self.catalog = final_catalog;
+        catalog_update.publish(&mut self.catalog);
         self.change_feed_floor_txid = final_change_feed_floor_txid;
         self.change_feed_policy = final_change_feed_policy;
         if let Err(err) = self.maybe_checkpoint() {
@@ -1649,7 +1662,7 @@ fn plan_commit<B: FileBackend>(
     now_ms: u64,
     alloc: &mut PageAllocator,
 ) -> Result<CommitPlan> {
-    let mut final_catalog = view.catalog.clone();
+    let mut catalog_delta = CatalogDelta::default();
     let final_schema_version = staged_schema_version.unwrap_or(view.schema_version);
     let final_policy = staged_policy.unwrap_or(view.change_feed_policy);
     let mut page_images = Vec::new();
@@ -1666,7 +1679,7 @@ fn plan_commit<B: FileBackend>(
             if let Some(meta) = stage.base_meta.as_ref() {
                 free_tree(pager, meta.store_root_page_id, alloc)?;
             }
-            final_catalog.remove(name);
+            catalog_delta.remove(view.catalog, name);
             continue;
         }
         let Some(built) = build_store_commit(pager, stage, now_ms, alloc)? else {
@@ -1677,13 +1690,14 @@ fn plan_commit<B: FileBackend>(
             (false, Some(meta)) => meta.created_txid,
             _ => new_txid,
         };
-        final_catalog.insert(
-            name.clone(),
-            StoreMetadata {
+        catalog_delta.set(
+            view.catalog,
+            name,
+            Some(StoreMetadata {
                 store_root_page_id: built.root_page_id,
                 created_txid,
                 flags: stage.flags,
-            },
+            }),
         );
     }
 
@@ -1693,7 +1707,9 @@ fn plan_commit<B: FileBackend>(
             // History restarts with this commit.
             floor = new_txid.saturating_sub(1);
         }
-        let log_meta = final_catalog.get(SYSTEM_CHANGELOG_STORE_NAME).cloned();
+        let log_meta = catalog_delta
+            .get(view.catalog, SYSTEM_CHANGELOG_STORE_NAME)
+            .cloned();
         let mut prune_keys = Vec::new();
         if let (Some(meta), Some(retain)) = (log_meta.as_ref(), final_policy.retain_txids) {
             let target = new_txid.saturating_sub(retain);
@@ -1748,32 +1764,29 @@ fn plan_commit<B: FileBackend>(
                 )?,
             };
             page_images.extend(built.page_images);
-            final_catalog.insert(
-                SYSTEM_CHANGELOG_STORE_NAME.to_string(),
-                StoreMetadata {
+            catalog_delta.set(
+                view.catalog,
+                SYSTEM_CHANGELOG_STORE_NAME,
+                Some(StoreMetadata {
                     store_root_page_id: built.root_page_id,
                     created_txid: log_meta.map(|meta| meta.created_txid).unwrap_or(new_txid),
                     flags: CHANGELOG_STORE_FLAGS,
-                },
+                }),
             );
         }
-    } else if let Some(meta) = final_catalog.remove(SYSTEM_CHANGELOG_STORE_NAME) {
+    } else if let Some(meta) = catalog_delta.remove(view.catalog, SYSTEM_CHANGELOG_STORE_NAME) {
         free_tree(pager, meta.store_root_page_id, alloc)?;
     }
 
-    let catalog_changed = final_catalog != *view.catalog
+    let catalog_changed = !catalog_delta.is_empty()
         || final_schema_version != view.schema_version
         || floor != view.change_feed_floor_txid
         || final_policy != view.change_feed_policy;
     let catalog_root_page_id = if catalog_changed {
-        free_tree(pager, view.catalog_root_page_id, alloc)?;
-        let built = build_catalog_tree(
-            &CatalogState {
-                schema_version: final_schema_version,
-                change_feed_floor_txid: floor,
-                change_feed_policy: final_policy,
-                stores: final_catalog.clone(),
-            },
+        let built = catalog_delta.build_tree(
+            pager,
+            view,
+            (final_schema_version, floor, final_policy),
             alloc,
         )?;
         page_images.extend(built.page_images);
@@ -1784,7 +1797,7 @@ fn plan_commit<B: FileBackend>(
 
     Ok(CommitPlan {
         new_txid,
-        final_catalog,
+        catalog_update: CatalogUpdate::Delta(catalog_delta),
         final_schema_version,
         final_change_feed_floor_txid: floor,
         final_change_feed_policy: final_policy,
@@ -1934,7 +1947,7 @@ fn plan_snapshot_apply(
 
     Ok(CommitPlan {
         new_txid,
-        final_catalog,
+        catalog_update: CatalogUpdate::Replace(final_catalog),
         final_schema_version: snapshot.schema_version,
         final_change_feed_floor_txid: floor,
         final_change_feed_policy: view.change_feed_policy,
