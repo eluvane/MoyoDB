@@ -4,6 +4,7 @@ use crate::layout::StoreMetadata;
 use crate::value::StoredValue;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TxMode {
@@ -34,7 +35,8 @@ pub struct Snapshot {
     pub schema_version: u64,
     pub catalog_root_page_id: u64,
     pub last_committed_txid: u64,
-    pub catalog: CatalogMap,
+    /// Shared immutable metadata. Serde retains the original map representation.
+    pub catalog: Arc<CatalogMap>,
 }
 
 impl Snapshot {
@@ -48,7 +50,21 @@ impl Snapshot {
             schema_version,
             catalog_root_page_id,
             last_committed_txid,
-            catalog: catalog.clone(),
+            catalog: Arc::new(catalog.clone()),
+        }
+    }
+
+    pub(crate) fn new_shared(
+        schema_version: u64,
+        catalog_root_page_id: u64,
+        last_committed_txid: u64,
+        catalog: &Arc<CatalogMap>,
+    ) -> Self {
+        Self {
+            schema_version,
+            catalog_root_page_id,
+            last_committed_txid,
+            catalog: Arc::clone(catalog),
         }
     }
 }
