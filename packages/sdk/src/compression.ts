@@ -92,10 +92,28 @@ function buildEnvelope(magic: Uint8Array, kindTag: number, rawLength: number, pa
     out.set(payload, ENVELOPE_HEADER_SIZE);
     return out;
 }
-function toOwnedArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+// Take one ownership snapshot before suspension. Compression and its fallback
+// share it; wrapping it in a Blob would copy the same input a second time.
+function copyBytes(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
     const copy = new Uint8Array(bytes.byteLength);
     copy.set(bytes);
-    return copy.buffer;
+    return copy;
+}
+function byteStream(bytes: Uint8Array<ArrayBuffer>): ReadableStream<Uint8Array<ArrayBuffer>> {
+    let offset = 0;
+    return new ReadableStream({
+        pull(controller) {
+            if (offset < bytes.byteLength) {
+                const end = Math.min(offset + 64 * 1024, bytes.byteLength);
+                // Views preserve backpressure without another ownership copy.
+                controller.enqueue(bytes.subarray(offset, end));
+                offset = end;
+            }
+            if (offset === bytes.byteLength) {
+                controller.close();
+            }
+        }
+    });
 }
 function readEnvelopeHeader(magic: Uint8Array, bytes: Uint8Array): EnvelopeHeader | null {
     if (bytes.byteLength < ENVELOPE_HEADER_SIZE) {
@@ -114,11 +132,11 @@ function readEnvelopeHeader(magic: Uint8Array, bytes: Uint8Array): EnvelopeHeade
         payloadChecksum: view.getUint32(14, true)
     };
 }
-async function compressBytes(data: Uint8Array, kind: CompressionKind): Promise<Uint8Array> {
+async function compressBytes(data: Uint8Array<ArrayBuffer>, kind: CompressionKind): Promise<Uint8Array> {
     ensureCompressionRuntime();
     let stream: ReadableStream<Uint8Array>;
     try {
-        stream = new Blob([toOwnedArrayBuffer(data)]).stream().pipeThrough(new CompressionStream(kind));
+        stream = byteStream(data).pipeThrough(new CompressionStream(kind));
     } catch {
         throw compressionRuntimeUnavailable();
     }
@@ -137,7 +155,7 @@ async function decompressBytes(
     ensureCompressionRuntime();
     let stream: ReadableStream<Uint8Array>;
     try {
-        stream = new Blob([toOwnedArrayBuffer(data)]).stream().pipeThrough(new DecompressionStream(kind));
+        stream = byteStream(copyBytes(data)).pipeThrough(new DecompressionStream(kind));
     } catch {
         throw compressionRuntimeUnavailable();
     }
@@ -169,6 +187,9 @@ async function readBoundedStream(
     } finally {
         reader.releaseLock();
     }
+    if (chunks.length === 1) {
+        return chunks[0];
+    }
     const out = new Uint8Array(totalBytes);
     let offset = 0;
     for (const chunk of chunks) {
@@ -197,11 +218,12 @@ export async function encodeStoreValueRecord(value: Uint8Array, compression: Com
     if (value.byteLength < STORE_VALUE_COMPRESSION_THRESHOLD) {
         return buildEnvelope(STORE_RECORD_MAGIC, COMPRESSION_TAG_NONE, value.byteLength, value);
     }
-    const compressed = await compressBytes(value, compression);
-    if (compressed.byteLength >= value.byteLength) {
-        return buildEnvelope(STORE_RECORD_MAGIC, COMPRESSION_TAG_NONE, value.byteLength, value);
+    const input = copyBytes(value);
+    const compressed = await compressBytes(input, compression);
+    if (compressed.byteLength >= input.byteLength) {
+        return buildEnvelope(STORE_RECORD_MAGIC, COMPRESSION_TAG_NONE, input.byteLength, input);
     }
-    return buildEnvelope(STORE_RECORD_MAGIC, compressionTag(compression), value.byteLength, compressed);
+    return buildEnvelope(STORE_RECORD_MAGIC, compressionTag(compression), input.byteLength, compressed);
 }
 export async function decodeStoreValueRecord(
     value: Uint8Array,
@@ -269,8 +291,9 @@ export async function wrapSnapshotWithCompression(
     if (compression === false) {
         return snapshot;
     }
-    const compressed = await compressBytes(snapshot, compression);
-    return buildEnvelope(SNAPSHOT_EXPORT_MAGIC, compressionTag(compression), snapshot.byteLength, compressed);
+    const input = copyBytes(snapshot);
+    const compressed = await compressBytes(input, compression);
+    return buildEnvelope(SNAPSHOT_EXPORT_MAGIC, compressionTag(compression), input.byteLength, compressed);
 }
 export async function unwrapSnapshotCompression(snapshot: Uint8Array): Promise<Uint8Array> {
     const header = readEnvelopeHeader(SNAPSHOT_EXPORT_MAGIC, snapshot);
