@@ -158,6 +158,7 @@ class ResponseQueue {
     private queued: Array<{ response: WorkerProtocolResponseMessage; transfer: Transferable[] }> = [];
     private queuedBytes = 0;
     private flushScheduled = false;
+    private flushChannel: MessageChannel | null = null;
     private closed = false;
 
     constructor(private readonly scope: DedicatedWorkerGlobalScope) {}
@@ -173,8 +174,15 @@ class ResponseQueue {
         if (!this.flushScheduled) {
             this.flushScheduled = true;
             queueMicrotask(() => {
-                this.flushScheduled = false;
-                this.flush();
+                if (this.closed || this.queued.length === 0) {
+                    this.flushScheduled = false;
+                    return;
+                }
+                // Same-lane requests settle in successive microtasks. Give
+                // them a task boundary to coalesce, but never wait for a slow
+                // sibling. Fully settled batches flush earlier in dispatch.
+                this.flushChannel ??= this.createFlushChannel();
+                this.flushChannel.port2.postMessage(null);
             });
         }
         if (this.queued.length >= MAX_WORKER_BATCH_MESSAGES || this.queuedBytes >= MAX_WORKER_BATCH_BYTES) {
@@ -186,9 +194,21 @@ class ResponseQueue {
         this.closed = true;
         this.queued = [];
         this.queuedBytes = 0;
+        this.flushChannel?.port1.close();
+        this.flushChannel?.port2.close();
+        this.flushChannel = null;
     }
 
-    private flush(): void {
+    private createFlushChannel(): MessageChannel {
+        const channel = new MessageChannel();
+        channel.port1.onmessage = () => {
+            this.flushScheduled = false;
+            this.flush();
+        };
+        return channel;
+    }
+
+    flush(): void {
         const queued = this.queued;
         this.queued = [];
         this.queuedBytes = 0;
@@ -220,8 +240,17 @@ export function exposeWorkerApi(
             return;
         }
         if (isWorkerProtocolRequestBatchMessage(event.data)) {
+            let remaining = event.data.requests.length;
+            const respond: SendResponse = (response, transfer) => {
+                responses.enqueue(response, transfer);
+                remaining -= 1;
+                // Do not add a task hop when every reply is already ready.
+                // The queue's task fallback still releases partial results
+                // when any request suspends or produces no protocol reply.
+                if (remaining === 0) responses.flush();
+            };
             for (const request of event.data.requests) {
-                void dispatchWorkerRequest(scope, api, scheduler, request, responses.enqueue);
+                void dispatchWorkerRequest(scope, api, scheduler, request, respond);
             }
             return;
         }

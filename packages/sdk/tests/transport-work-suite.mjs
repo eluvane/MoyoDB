@@ -768,6 +768,218 @@ export function createTransportSuite({ WorkerProtocolClient, exposeWorkerApi, pr
         'work'
     );
 
+    for (const count of [2, 8, 127, 128, 129, 1000, 10000]) {
+        test(
+            `${count} pipelined gets in one transaction batch replies, not operations`,
+            async () => {
+                const executed = [];
+                const h = await harness({
+                    get: async (txId, store, key) => {
+                        assert.equal(txId, 7);
+                        assert.equal(store, 'kv');
+                        const index = new DataView(key.buffer, key.byteOffset).getUint32(0, true);
+                        executed.push(index);
+                        const value = new Uint8Array(256).fill((index * 17 + 1) & 255);
+                        new DataView(value.buffer).setUint32(252, index, true);
+                        return value;
+                    }
+                });
+                const keys = Array.from({ length: count }, (_, index) => {
+                    const key = new Uint8Array(16);
+                    new DataView(key.buffer).setUint32(0, index, true);
+                    return key;
+                });
+                try {
+                    const values = await Promise.all(keys.map((key) => h.client.get(7, 'kv', key)));
+                    assert.deepEqual(executed, Array.from({ length: count }, (_, index) => index));
+                    for (let index = 0; index < count; index += 1) {
+                        const value = values[index];
+                        assert.equal(value.byteLength, 256);
+                        assert.ok(value.subarray(0, 252).every((byte) => byte === ((index * 17 + 1) & 255)));
+                        assert.equal(new DataView(value.buffer, value.byteOffset).getUint32(252, true), index);
+                        assert.equal(keys[index].byteLength, 16, 'caller keys remain reusable');
+                    }
+                    const replies = h.toClient.filter(({ data }) => data.type !== protocol.WORKER_PROTOCOL_READY);
+                    const observation = {
+                        count,
+                        requestMessages: h.toWorker.length,
+                        responseMessages: replies.length,
+                        executedGets: executed.length,
+                        transferredResponseBytes: replies.reduce((sum, item) => sum + item.transferredBytes, 0)
+                    };
+                    (observations.pipelinedReplies ??= []).push(observation);
+                    assert.equal(observation.requestMessages, Math.ceil(count / protocol.MAX_WORKER_BATCH_MESSAGES));
+                    assert.equal(observation.responseMessages, Math.ceil(count / protocol.MAX_WORKER_BATCH_MESSAGES));
+                    assert.equal(observation.transferredResponseBytes, count * 256);
+                    assert.ok(replies.every(({ data }) => (data.responses?.length ?? 1) <= 128));
+                } finally {
+                    h.dispose();
+                }
+            },
+            'work'
+        );
+    }
+
+    test('fully settled batches do not wait for the fallback task', async () => {
+        const h = await harness({ get: async () => null });
+        let fulfilled = false;
+        try {
+            const result = Promise.allSettled([0, 1].map((key) => h.client.get(7, 'kv', new Uint8Array([key])))).then(
+                (items) => { fulfilled = items.every((item) => item.status === 'fulfilled'); }
+            );
+            await drain();
+            assert.ok(fulfilled, 'ready replies should not require another event-loop task');
+            await result;
+        } finally {
+            h.dispose();
+        }
+    });
+
+    test('ready replies do not wait for a blocked sibling or transaction lane', async () => {
+        const gate = deferred();
+        const executed = [];
+        const h = await harness({
+            get: async (txId, _store, key) => {
+                executed.push([txId, key[0]]);
+                if (key[0] === 1) await gate.promise;
+                return key.slice();
+            }
+        });
+        let timer;
+        try {
+            const first = h.client.get(7, 'kv', new Uint8Array([0]));
+            const slow = h.client.get(7, 'kv', new Uint8Array([1]));
+            const later = h.client.get(7, 'kv', new Uint8Array([2]));
+            const other = h.client.get(8, 'kv', new Uint8Array([3]));
+            const all = Promise.allSettled([first, slow, later, other]);
+            // This is a deadlock deadline, not a latency/performance assertion.
+            const ready = await Promise.race([
+                Promise.all([first, other]),
+                new Promise((_, reject) => {
+                    timer = setTimeout(() => reject(new Error('ready replies blocked by pending work')), 5000);
+                })
+            ]);
+            assert.deepEqual(ready.map((value) => Array.from(value)), [[0], [3]]);
+            assert.ok(executed.some(([txId, key]) => txId === 7 && key === 1));
+            assert.ok(!executed.some(([, key]) => key === 2), 'same-lane order must remain intact');
+            gate.resolve();
+            assert.ok((await all).every((result) => result.status === 'fulfilled'));
+            assert.deepEqual(executed.filter(([txId]) => txId === 7), [[7, 0], [7, 1], [7, 2]]);
+        } finally {
+            clearTimeout(timer);
+            gate.resolve();
+            h.dispose();
+        }
+    });
+
+    test('response snapshots precede later same-lane mutations of borrowed views', async () => {
+        const backing = new Uint8Array([0, 7, 8, 0]);
+        const h = await harness({
+            get: async (_txId, _store, key) => {
+                if (key[0] === 1) backing.set([9, 10], 1);
+                return backing.subarray(1, 3);
+            }
+        });
+        try {
+            const values = await Promise.all([0, 1].map((key) => h.client.get(7, 'kv', new Uint8Array([key]))));
+            assert.deepEqual(values.map((value) => Array.from(value)), [[7, 8], [9, 10]]);
+            assert.equal(backing.byteLength, 4, 'a borrowed backing buffer must not be detached');
+        } finally {
+            h.dispose();
+        }
+    });
+
+    test('response byte bounds preserve every value, including a single oversized reply', async () => {
+        const sizes = [700 * 1024, 700 * 1024, 0, 256, 2 * 1024 * 1024, 64 * 1024];
+        const h = await harness({ get: async (_txId, _store, key) => new Uint8Array(sizes[key[0]]).fill(key[0]) });
+        try {
+            const values = await Promise.all(sizes.map((_, index) => h.client.get(7, 'kv', new Uint8Array([index]))));
+            for (let index = 0; index < sizes.length; index += 1) {
+                assert.equal(values[index].byteLength, sizes[index]);
+                assert.ok(values[index].every((byte) => byte === index));
+            }
+            const replies = h.toClient.filter(({ data }) => data.type !== protocol.WORKER_PROTOCOL_READY);
+            for (const { data } of replies) {
+                const items = data.responses ?? [data];
+                const bytes = items.reduce((sum, item) => sum + protocol.captureWorkerPayload(item, []).byteLength, 0);
+                assert.ok(items.length === 1 || bytes <= protocol.MAX_WORKER_BATCH_BYTES);
+            }
+            assert.equal(
+                replies.reduce((sum, item) => sum + item.transferredBytes, 0),
+                sizes.reduce((sum, size) => sum + size, 0)
+            );
+        } finally {
+            h.dispose();
+        }
+    });
+
+    test('batched transfer fallback preserves both successful replies and individual errors', async () => {
+        const h = await harness({
+            get: async (_txId, _store, key) => {
+                if (key[0] === 1) throw Object.assign(new Error('missing'), { name: 'InjectedError', code: 'test' });
+                return key.slice();
+            }
+        }, { failResponseTransfer: true });
+        try {
+            const results = await Promise.allSettled([0, 1, 2].map((key) => h.client.get(7, 'kv', new Uint8Array([key]))));
+            assert.deepEqual(Array.from(results[0].value), [0]);
+            assert.equal(results[1].status, 'rejected');
+            assert.equal(results[1].reason.name, 'InjectedError');
+            assert.equal(results[1].reason.code, 'test');
+            assert.deepEqual(Array.from(results[2].value), [2]);
+            assert.equal(h.failedTransferAttempts, 1);
+            assert.equal(responses(h.toClient).filter((message) => message.id !== undefined).length, 3);
+        } finally {
+            h.dispose();
+        }
+    });
+
+    test('flush channels are lazy, reused and closed; late tasks cannot publish after disposal', async () => {
+        const NativeChannel = globalThis.MessageChannel;
+        const channels = [];
+        let closedPorts = 0;
+        // Observe real channels; do not change scheduling or native prototypes.
+        globalThis.MessageChannel = class {
+            constructor() {
+                const channel = new NativeChannel();
+                channels.push(channel);
+                for (const port of [channel.port1, channel.port2]) {
+                    const close = port.close.bind(port);
+                    port.close = () => {
+                        closedPorts += 1;
+                        close();
+                    };
+                }
+                return channel;
+            }
+        };
+        const h = await harness({ get: async () => null, stats: async () => ({}) });
+        try {
+            await Promise.all([h.client.stats(), h.client.stats(), h.client.stats()]);
+            assert.equal(channels.length, 0, 'a fully ready metadata batch needs no task channel');
+            for (let index = 0; index < 3; index += 1) await h.client.get(7, 'kv', new Uint8Array([index]));
+            assert.equal(channels.length, 0, 'single requests must not allocate a flush channel');
+            for (let index = 0; index < 3; index += 1) {
+                await Promise.all([0, 1].map((key) => h.client.get(7, 'kv', new Uint8Array([key]))));
+            }
+            assert.ok(channels.length <= 1, 'one channel per server, not per batch');
+            const pending = Promise.allSettled([0, 1].map((key) => h.client.get(7, 'kv', new Uint8Array([key]))));
+            await drain();
+            const posted = h.toClient.length;
+            const lateTasks = channels.map((channel) => channel.port1.onmessage);
+            h.dispose();
+            h.dispose();
+            assert.equal(closedPorts, channels.length * 2);
+            for (const task of lateTasks) task?.({ data: null });
+            await drain();
+            assert.equal(h.toClient.length, posted);
+            assert.equal((await pending).length, 2);
+        } finally {
+            h.dispose();
+            globalThis.MessageChannel = NativeChannel;
+        }
+    });
+
     for (const [name, response] of [
         [
             'corrupt packed response',
