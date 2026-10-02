@@ -791,7 +791,10 @@ export function createTransportSuite({ WorkerProtocolClient, exposeWorkerApi, pr
                 });
                 try {
                     const values = await Promise.all(keys.map((key) => h.client.get(7, 'kv', key)));
-                    assert.deepEqual(executed, Array.from({ length: count }, (_, index) => index));
+                    assert.deepEqual(
+                        executed,
+                        Array.from({ length: count }, (_, index) => index)
+                    );
                     for (let index = 0; index < count; index += 1) {
                         const value = values[index];
                         assert.equal(value.byteLength, 256);
@@ -825,7 +828,10 @@ export function createTransportSuite({ WorkerProtocolClient, exposeWorkerApi, pr
         let fulfilled = false;
         try {
             const result = Promise.allSettled([0, 1].map((key) => h.client.get(7, 'kv', new Uint8Array([key])))).then(
-                (items) => { fulfilled = items.every((item) => item.status === 'fulfilled'); }
+                (items) => {
+                    fulfilled = items.every((item) => item.status === 'fulfilled');
+                    return items;
+                }
             );
             await drain();
             assert.ok(fulfilled, 'ready replies should not require another event-loop task');
@@ -855,16 +861,26 @@ export function createTransportSuite({ WorkerProtocolClient, exposeWorkerApi, pr
             // This is a deadlock deadline, not a latency/performance assertion.
             const ready = await Promise.race([
                 Promise.all([first, other]),
-                new Promise((_, reject) => {
+                new Promise((_resolve, reject) => {
                     timer = setTimeout(() => reject(new Error('ready replies blocked by pending work')), 5000);
                 })
             ]);
-            assert.deepEqual(ready.map((value) => Array.from(value)), [[0], [3]]);
+            assert.deepEqual(
+                ready.map((value) => Array.from(value)),
+                [[0], [3]]
+            );
             assert.ok(executed.some(([txId, key]) => txId === 7 && key === 1));
             assert.ok(!executed.some(([, key]) => key === 2), 'same-lane order must remain intact');
             gate.resolve();
             assert.ok((await all).every((result) => result.status === 'fulfilled'));
-            assert.deepEqual(executed.filter(([txId]) => txId === 7), [[7, 0], [7, 1], [7, 2]]);
+            assert.deepEqual(
+                executed.filter(([txId]) => txId === 7),
+                [
+                    [7, 0],
+                    [7, 1],
+                    [7, 2]
+                ]
+            );
         } finally {
             clearTimeout(timer);
             gate.resolve();
@@ -882,7 +898,13 @@ export function createTransportSuite({ WorkerProtocolClient, exposeWorkerApi, pr
         });
         try {
             const values = await Promise.all([0, 1].map((key) => h.client.get(7, 'kv', new Uint8Array([key]))));
-            assert.deepEqual(values.map((value) => Array.from(value)), [[7, 8], [9, 10]]);
+            assert.deepEqual(
+                values.map((value) => Array.from(value)),
+                [
+                    [7, 8],
+                    [9, 10]
+                ]
+            );
             assert.equal(backing.byteLength, 4, 'a borrowed backing buffer must not be detached');
         } finally {
             h.dispose();
@@ -914,14 +936,20 @@ export function createTransportSuite({ WorkerProtocolClient, exposeWorkerApi, pr
     });
 
     test('batched transfer fallback preserves both successful replies and individual errors', async () => {
-        const h = await harness({
-            get: async (_txId, _store, key) => {
-                if (key[0] === 1) throw Object.assign(new Error('missing'), { name: 'InjectedError', code: 'test' });
-                return key.slice();
-            }
-        }, { failResponseTransfer: true });
+        const h = await harness(
+            {
+                get: async (_txId, _store, key) => {
+                    if (key[0] === 1)
+                        throw Object.assign(new Error('missing'), { name: 'InjectedError', code: 'test' });
+                    return key.slice();
+                }
+            },
+            { failResponseTransfer: true }
+        );
         try {
-            const results = await Promise.allSettled([0, 1, 2].map((key) => h.client.get(7, 'kv', new Uint8Array([key]))));
+            const results = await Promise.allSettled(
+                [0, 1, 2].map((key) => h.client.get(7, 'kv', new Uint8Array([key])))
+            );
             assert.deepEqual(Array.from(results[0].value), [0]);
             assert.equal(results[1].status, 'rejected');
             assert.equal(results[1].reason.name, 'InjectedError');
@@ -937,21 +965,25 @@ export function createTransportSuite({ WorkerProtocolClient, exposeWorkerApi, pr
     test('flush channels are lazy, reused and closed; late tasks cannot publish after disposal', async () => {
         const NativeChannel = globalThis.MessageChannel;
         const channels = [];
+        const flushTasks = [];
         let closedPorts = 0;
         // Observe real channels; do not change scheduling or native prototypes.
-        globalThis.MessageChannel = class {
-            constructor() {
-                const channel = new NativeChannel();
-                channels.push(channel);
-                for (const port of [channel.port1, channel.port2]) {
-                    const close = port.close.bind(port);
-                    port.close = () => {
-                        closedPorts += 1;
-                        close();
-                    };
-                }
-                return channel;
+        globalThis.MessageChannel = function TrackedMessageChannel() {
+            const channel = new NativeChannel();
+            channels.push(channel);
+            const addListener = channel.port1.addEventListener.bind(channel.port1);
+            channel.port1.addEventListener = (type, listener, ...options) => {
+                if (type === 'message') flushTasks.push(listener);
+                return addListener(type, listener, ...options);
+            };
+            for (const port of [channel.port1, channel.port2]) {
+                const close = port.close.bind(port);
+                port.close = () => {
+                    closedPorts += 1;
+                    close();
+                };
             }
+            return channel;
         };
         const h = await harness({ get: async () => null, stats: async () => ({}) });
         try {
@@ -966,11 +998,10 @@ export function createTransportSuite({ WorkerProtocolClient, exposeWorkerApi, pr
             const pending = Promise.allSettled([0, 1].map((key) => h.client.get(7, 'kv', new Uint8Array([key]))));
             await drain();
             const posted = h.toClient.length;
-            const lateTasks = channels.map((channel) => channel.port1.onmessage);
             h.dispose();
             h.dispose();
             assert.equal(closedPorts, channels.length * 2);
-            for (const task of lateTasks) task?.({ data: null });
+            for (const task of flushTasks) task({ data: null });
             await drain();
             assert.equal(h.toClient.length, posted);
             assert.equal((await pending).length, 2);

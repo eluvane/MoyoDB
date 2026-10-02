@@ -933,3 +933,197 @@ describe('OPFS serial storage operations', () => {
         assert.deepEqual(Array.from(file.file.bytes), [9, 8, 7]);
     });
 });
+
+// These are shim work counts, not physical disk IOPS or browser timings.
+describe('prebatched OPFS write work', () => {
+    test('keeps each prebuilt buffer in one storage call without copying its payload', (t) => {
+        const sizes = [0, 4096, 65536, 262144, 262145, 1048576, 8388608, 67108864];
+        const backing = new Uint8Array(sizes.at(-1) + 32);
+        for (let index = 0; index < backing.length; index += 1) {
+            backing[index] = (index * 37) ^ (index >>> 8);
+        }
+        const results = [];
+        for (const length of sizes) {
+            const source = backing.subarray(11, 11 + length);
+            const handle = handleOver(new Uint8Array(length + 34).fill(0xa5));
+            let calls = 0;
+            handle.file.writeHook = (src, at, file) => {
+                assert.equal(src.buffer, source.buffer, 'the shim must borrow, not copy, the source');
+                assert.equal(src.byteOffset, source.byteOffset + at - 17);
+                assert.ok(at >= 17 && at + src.length <= 17 + length);
+                calls += 1;
+                return storeBytes(file, src, at);
+            };
+            const work = measureReadBuffers(() => {
+                assert.equal(writeAll(handle, source, 17), length);
+            });
+            assert.deepEqual(work, { backingAllocations: 0, allocatedBytes: 0, slicedBytes: 0 });
+            assert.deepEqual(handle.file.bytes.subarray(17, 17 + length), source);
+            assert.ok(handle.file.bytes.subarray(0, 17).every((byte) => byte === 0xa5));
+            assert.ok(handle.file.bytes.subarray(17 + length).every((byte) => byte === 0xa5));
+            results.push({ bytes: length, writeCalls: calls });
+        }
+        t.diagnostic(JSON.stringify(results));
+        assert.deepEqual(
+            results.map(({ writeCalls }) => writeCalls),
+            sizes.map((length) => (length === 0 ? 0 : 1))
+        );
+    });
+
+    test('splits only at the browser byte-count limit, including after short writes', () => {
+        const maxWrite = 0x7fffffff;
+        for (const length of [maxWrite - 1, maxWrite, maxWrite + 1, maxWrite * 2 + 17]) {
+            for (const shortFirst of [false, true]) {
+                // Virtual spans test >2 GiB arithmetic without a multi-GiB allocation.
+                // The real-buffer tests separately verify bytes and borrowed views.
+                const source = {
+                    length,
+                    start: 0,
+                    subarray(start, end) {
+                        assert.ok(start >= 0 && end >= start && end <= length);
+                        return { start, length: end - start };
+                    }
+                };
+                const offered = [];
+                let stored = 0;
+                const handle = {
+                    write(span, { at }) {
+                        assert.equal(span.start, stored);
+                        assert.equal(at, 19 + stored);
+                        assert.equal(span.length, Math.min(maxWrite, length - stored));
+                        offered.push(span.length);
+                        const count = shortFirst && offered.length === 1 ? 7 : span.length;
+                        stored += count;
+                        return count;
+                    }
+                };
+                assert.equal(writeAll(handle, source, 19), length);
+                assert.equal(stored, length);
+                assert.equal(
+                    offered.length,
+                    shortFirst ? 1 + Math.ceil((length - 7) / maxWrite) : Math.ceil(length / maxWrite)
+                );
+            }
+        }
+    });
+
+    test('retries only the remaining suffix after native short writes', () => {
+        const backing = new Uint8Array(1048576 + 43);
+        for (let index = 0; index < backing.length; index += 1) backing[index] = index * 13;
+        const source = backing.subarray(7, backing.length - 9);
+        const handle = handleOver(new Uint8Array(source.length + 26).fill(0xa5));
+        const accepted = [262145, 3, 65537];
+        const offered = [];
+        let stored = 0;
+        handle.file.writeHook = (src, at, file) => {
+            offered.push(src.length);
+            assert.equal(at, 13 + stored);
+            assert.equal(src.buffer, source.buffer);
+            assert.equal(src.byteOffset, source.byteOffset + stored);
+            const count = Math.min(src.length, accepted[offered.length - 1] ?? src.length);
+            stored += count;
+            return storeBytes(file, src.subarray(0, count), at);
+        };
+        assert.equal(writeAll(handle, source, 13), source.length);
+        assert.deepEqual(offered, [
+            source.length,
+            source.length - 262145,
+            source.length - 262148,
+            source.length - 327685
+        ]);
+        assert.deepEqual(handle.file.bytes.subarray(13, 13 + source.length), source);
+        assert.ok(handle.file.bytes.subarray(0, 13).every((byte) => byte === 0xa5));
+        assert.ok(handle.file.bytes.subarray(13 + source.length).every((byte) => byte === 0xa5));
+    });
+
+    test('validates every returned count against the offered suffix and stops on failure', () => {
+        for (const prefix of [0, 5]) {
+            for (const invalid of [0, -1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, 9 - prefix]) {
+                let calls = 0;
+                const handle = {
+                    write() {
+                        calls += 1;
+                        return prefix > 0 && calls === 1 ? prefix : invalid;
+                    }
+                };
+                assert.throws(() => writeAll(handle, new Uint8Array(8), 91), {
+                    name: 'StorageError',
+                    code: 'StorageError'
+                });
+                assert.equal(calls, prefix > 0 ? 2 : 1);
+            }
+        }
+    });
+
+    test('propagates native storage errors unchanged after partial progress', () => {
+        for (const failure of [new DOMException('quota exhausted', 'QuotaExceededError'), new Error('write failed')]) {
+            const handle = handleOver(new Uint8Array(12).fill(0xa5));
+            let calls = 0;
+            handle.file.writeHook = (src, at, file) => {
+                calls += 1;
+                if (calls === 2) throw failure;
+                return storeBytes(file, src.subarray(0, 3), at);
+            };
+            assert.throws(
+                () => writeAll(handle, new Uint8Array([7, 8, 9, 10, 11]), 2),
+                (error) => error === failure
+            );
+            assert.equal(calls, 2);
+            assert.deepEqual(
+                Array.from(handle.file.bytes),
+                [0xa5, 0xa5, 7, 8, 9, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5]
+            );
+        }
+    });
+
+    test('uses the current WASM memory view after growth without retaining the old one', () => {
+        const memory = new WebAssembly.Memory({ initial: 5, maximum: 16 });
+        for (const pages of [0, 5]) {
+            memory.grow(pages);
+            const source = new Uint8Array(memory.buffer, 37, memory.buffer.byteLength - 74);
+            source.fill(0x6d);
+            const handle = handleOver(new Uint8Array(source.length));
+            handle.file.writeHook = (src, at, file) => {
+                assert.equal(src.buffer, memory.buffer);
+                return storeBytes(file, src, at);
+            };
+            assert.equal(writeAll(handle, source, 0), source.length);
+            assert.deepEqual(handle.file.bytes, source);
+        }
+    });
+
+    test('does not merge logical writes or add, remove, or defer caller flushes', async (t) => {
+        const { name, dbRoot } = await seedDb();
+        const { sessionId } = await opfs.opfsOpenActiveDb(name, false);
+        const wal = (await dbRoot.getFileHandle('wal.bin')).file;
+        const events = [];
+        t.mock.method(MemoryAccessHandle.prototype, 'flush', function () {
+            assert.equal(this.file, wal);
+            events.push({ kind: 'flush' });
+        });
+        wal.writeHook = (src, at, file) => {
+            events.push({ kind: 'write', at, length: src.length });
+            return storeBytes(file, src, at);
+        };
+        const bytes = new Uint8Array(1048576).fill(0x39);
+        try {
+            assert.equal(opfs.opfsWriteAt(sessionId, 2, 0n, bytes), bytes.length);
+            opfs.opfsFlush(sessionId, 2);
+            assert.equal(opfs.opfsWriteAt(sessionId, 2, BigInt(bytes.length), bytes), bytes.length);
+            opfs.opfsFlush(sessionId, 2);
+            assert.deepEqual(events, [
+                { kind: 'write', at: 0, length: bytes.length },
+                { kind: 'flush' },
+                { kind: 'write', at: bytes.length, length: bytes.length },
+                { kind: 'flush' }
+            ]);
+            assert.equal(opfs.opfsLen(sessionId, 2), BigInt(bytes.length * 2));
+            assert.deepEqual(wal.bytes.subarray(0, bytes.length), bytes);
+            assert.deepEqual(wal.bytes.subarray(bytes.length), bytes);
+            assert.throws(() => opfs.opfsWriteAt(sessionId, 99, 0n, new Uint8Array()), /no OPFS access handle/);
+        } finally {
+            opfsCloseSession(sessionId);
+        }
+        assert.throws(() => opfs.opfsWriteAt(sessionId, 2, 0n, new Uint8Array()), /no OPFS session/);
+    });
+});

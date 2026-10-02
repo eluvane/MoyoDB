@@ -6,7 +6,9 @@ const CONTROL_VERSION = 1;
 const CONTROL_CHECKSUM_OFFSET = 24;
 const CONTROL_NAME_OFFSET = 32;
 const CONTROL_MAGIC = new Uint8Array([66, 68, 66, 82, 79, 79, 84, 49]);
-const OPFS_WRITE_CHUNK_SIZE = 256 * 1024;
+// Chromium rejects a SyncAccessHandle.write larger than a signed 32-bit count.
+// This is an API limit, not a batching target; the engine already owns the input.
+const OPFS_MAX_WRITE_SIZE = 0x7fffffff;
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 let rootDir = null;
@@ -87,7 +89,10 @@ function isGenerationNameValid(name) {
 export function writeAll(handle, bytes, at) {
     let writtenTotal = 0;
     while (writtenTotal < bytes.length) {
-        const chunk = bytes.subarray(writtenTotal, writtenTotal + OPFS_WRITE_CHUNK_SIZE);
+        // Preserve the engine's batch instead of fragmenting a WAL append.
+        // Only the browser's size limit or a short write needs a suffix view.
+        const end = Math.min(bytes.length, writtenTotal + OPFS_MAX_WRITE_SIZE);
+        const chunk = writtenTotal === 0 && end === bytes.length ? bytes : bytes.subarray(writtenTotal, end);
         const rawWritten = handle.write(chunk, { at: at + writtenTotal });
         const written = Number(rawWritten);
         if (!Number.isSafeInteger(written) || written < 0 || written > chunk.length) {

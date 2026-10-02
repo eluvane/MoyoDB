@@ -27,10 +27,10 @@ structuredClone at the test message boundary. Values are checked byte for byte.
 These are transport counts, not storage or browser measurements.
 
 | Gets, one transaction | Request messages, both | Response messages before | After | Returned bytes, both |
-| ---: | ---: | ---: | ---: | ---: |
-| 128 | 1 | 128 | 1 | 32,768 |
-| 1,000 | 8 | 1,000 | 8 | 256,000 |
-| 10,000 | 79 | 10,000 | 79 | 2,560,000 |
+| --------------------: | ---------------------: | -----------------------: | ----: | -------------------: |
+|                   128 |                      1 |                      128 |     1 |               32,768 |
+|                 1,000 |                      8 |                    1,000 |     8 |              256,000 |
+|                10,000 |                     79 |                   10,000 |    79 |            2,560,000 |
 
 All gets still execute individually and in order. No getMany substitution,
 reduced payload, skipped validation or merged transaction is used.
@@ -48,14 +48,14 @@ Both variants time begin + all gets + rollback. Compilation, Worker startup,
 fixture preload, key preparation and full result verification are outside
 both timed regions. Fixture get output allocation/copying remains inside.
 
-| Workload | Before ms | After ms | Before / after |
-| --- | ---: | ---: | ---: |
-| 2 pipelined x 256 B | 0.259 | 0.295 | 0.88x |
-| 128 pipelined x 256 B | 3.557 | 2.585 | 1.38x |
-| 1,000 pipelined x 256 B | 11.490 | 9.988 | 1.15x |
-| 10,000 pipelined x 256 B | 136.914 | 94.816 | 1.44x |
-| 128 pipelined x 64 KiB | 5.720 | 4.013 | 1.43x |
-| 1,000 sequential x 256 B (control) | 33.207 | 31.670 | 1.05x |
+| Workload                           | Before ms | After ms | Before / after |
+| ---------------------------------- | --------: | -------: | -------------: |
+| 2 pipelined x 256 B                |     0.259 |    0.295 |          0.88x |
+| 128 pipelined x 256 B              |     3.557 |    2.585 |          1.38x |
+| 1,000 pipelined x 256 B            |    11.490 |    9.988 |          1.15x |
+| 10,000 pipelined x 256 B           |   136.914 |   94.816 |          1.44x |
+| 128 pipelined x 64 KiB             |     5.720 |    4.013 |          1.43x |
+| 1,000 sequential x 256 B (control) |    33.207 |   31.670 |          1.05x |
 
 The sequential path is unchanged; its timing difference is not an optimization
 claim. Tiny batches show no demonstrated benefit. An additional same-source

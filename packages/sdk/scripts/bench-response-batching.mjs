@@ -28,7 +28,10 @@ async function compile(source, destination) {
             compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
         });
         assert.ok(!(result.diagnostics ?? []).some((item) => item.category === ts.DiagnosticCategory.Error));
-        await writeFile(join(destination, `${name}.mjs`), result.outputText.replace(/from '(\.\/[^']+)'/g, "from '$1.mjs'"));
+        await writeFile(
+            join(destination, `${name}.mjs`),
+            result.outputText.replace(/from '(\.\/[^']+)'/g, "from '$1.mjs'")
+        );
     }
     return { hashes, typescript: ts.version };
 }
@@ -50,39 +53,42 @@ async function serve() {
         parentPort.postMessage(message, transfer);
     };
     parentPort.on('message', (data) => scope.dispatchEvent(new MessageEvent('message', { data })));
-    const server = exposeWorkerApi({
-        open: async ({ count, valueBytes }) => {
-            active = false;
-            counts = { gets: 0, begins: 0, rollbacks: 0, responseMessages: 0, responseBytes: 0 };
-            values = Array.from({ length: count }, (_, index) => {
-                const value = new Uint8Array(valueBytes).fill((index * 17 + 1) & 255);
-                new DataView(value.buffer).setUint32(valueBytes - 4, index, true);
-                return value;
-            });
+    const server = exposeWorkerApi(
+        {
+            open: async ({ count, valueBytes }) => {
+                active = false;
+                counts = { gets: 0, begins: 0, rollbacks: 0, responseMessages: 0, responseBytes: 0 };
+                values = Array.from({ length: count }, (_, index) => {
+                    const value = new Uint8Array(valueBytes).fill((index * 17 + 1) & 255);
+                    new DataView(value.buffer).setUint32(valueBytes - 4, index, true);
+                    return value;
+                });
+            },
+            begin: async (mode) => {
+                assert.equal(mode, 'readonly');
+                assert.equal(active, false);
+                active = true;
+                counts.begins += 1;
+                return 1;
+            },
+            get: async (txId, store, key) => {
+                assert.ok(active);
+                assert.equal(txId, 1);
+                assert.equal(store, 'kv');
+                counts.gets += 1;
+                const index = new DataView(key.buffer, key.byteOffset).getUint32(0, true);
+                return values[index].slice();
+            },
+            rollback: async (txId) => {
+                assert.equal(txId, 1);
+                assert.ok(active);
+                counts.rollbacks += 1;
+                active = false;
+            },
+            stats: async () => ({ ...counts })
         },
-        begin: async (mode) => {
-            assert.equal(mode, 'readonly');
-            assert.equal(active, false);
-            active = true;
-            counts.begins += 1;
-            return 1;
-        },
-        get: async (txId, store, key) => {
-            assert.ok(active);
-            assert.equal(txId, 1);
-            assert.equal(store, 'kv');
-            counts.gets += 1;
-            const index = new DataView(key.buffer, key.byteOffset).getUint32(0, true);
-            return values[index].slice();
-        },
-        rollback: async (txId) => {
-            assert.equal(txId, 1);
-            assert.ok(active);
-            counts.rollbacks += 1;
-            active = false;
-        },
-        stats: async () => ({ ...counts })
-    }, scope);
+        scope
+    );
     parentPort.once('close', () => server.close());
 }
 
@@ -107,7 +113,9 @@ async function connect(destination) {
         await deadline(client.whenReady());
         return {
             client,
-            get requestMessages() { return requests; },
+            get requestMessages() {
+                return requests;
+            },
             async close() {
                 client.dispose();
                 await worker.terminate();
@@ -125,7 +133,7 @@ async function deadline(promise) {
     try {
         return await Promise.race([
             promise,
-            new Promise((_, reject) => {
+            new Promise((_resolve, reject) => {
                 timer = setTimeout(() => reject(new Error('transport benchmark stalled')), 30000);
             })
         ]);
@@ -238,15 +246,21 @@ async function main() {
             const after = summarize(measured.after);
             results.push({ ...spec, before, after, speedup: before.medianMs / after.medianMs });
         }
-        console.log(JSON.stringify({
-            level: 'Node Worker transport component; no database, WASM, OPFS or IndexedDB',
-            node: process.version,
-            platform: `${process.platform}/${process.arch}`,
-            samples,
-            warmup,
-            metadata,
-            results
-        }, null, 2));
+        console.log(
+            JSON.stringify(
+                {
+                    level: 'Node Worker transport component; no database, WASM, OPFS or IndexedDB',
+                    node: process.version,
+                    platform: `${process.platform}/${process.arch}`,
+                    samples,
+                    warmup,
+                    metadata,
+                    results
+                },
+                null,
+                2
+            )
+        );
     } finally {
         await Promise.all(Object.values(connections).map((connection) => connection.close()));
         await rm(temporary, { recursive: true, force: true });

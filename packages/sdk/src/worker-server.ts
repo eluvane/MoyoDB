@@ -201,10 +201,11 @@ class ResponseQueue {
 
     private createFlushChannel(): MessageChannel {
         const channel = new MessageChannel();
-        channel.port1.onmessage = () => {
+        channel.port1.addEventListener('message', () => {
             this.flushScheduled = false;
             this.flush();
-        };
+        });
+        channel.port1.start();
         return channel;
     }
 
@@ -412,7 +413,7 @@ function successResponse(id: number, result: unknown): WorkerProtocolSuccessMess
         id,
         ok: true,
         result
-    } as WorkerProtocolSuccessMessage;
+    };
 }
 
 function errorResponse(id: number, error: unknown): WorkerProtocolErrorMessage {
