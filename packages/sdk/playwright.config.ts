@@ -26,12 +26,20 @@ const disableVideo =
 const chromiumUse = chromiumExecutablePath
     ? { ...devices['Desktop Chrome'], launchOptions: { executablePath: chromiumExecutablePath } }
     : { ...devices['Desktop Chrome'] };
+const outputProfile =
+    (
+        globalThis as {
+            process?: {
+                env?: Record<string, string | undefined>;
+            };
+        }
+    ).process?.env?.MOYODB_PLAYWRIGHT_PROFILE ?? 'sdk';
 export default defineConfig({
     testDir: './tests',
     timeout: 60000,
     workers: isCi ? 1 : undefined,
-    outputDir: './test-results',
-    reporter: [['list'], ['html', { open: 'never', outputFolder: 'playwright-report' }]],
+    outputDir: `./test-results/${outputProfile}`,
+    reporter: [['list'], ['html', { open: 'never', outputFolder: `playwright-report/${outputProfile}` }]],
     expect: {
         timeout: 10000
     },

@@ -106,7 +106,11 @@ persistent-user-data-*/
 *.7z
 
 # Local documentation folder
-docs/
+docs/*
+!docs/PERFORMANCE_PASS_III_CATALOG.md
+!docs/PERFORMANCE_FOLLOWUPS.md
+!docs/LEAN_BTREE_CHECKER.md
+!docs/LEAN_LINTING.md
 
 # Keep important project files tracked even if broad patterns change later
 !Cargo.toml

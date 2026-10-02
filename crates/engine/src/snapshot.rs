@@ -56,7 +56,7 @@ pub fn collect_snapshot_contents<B: FileBackend>(
         validate_user_store_name(name)?;
         let mut entries = Vec::new();
         for pair in load_all_entries(pager, meta.store_root_page_id)? {
-            let stored = StoredValue::decode_for_store(meta.flags, &pair.value)?;
+            let stored = StoredValue::decode_owned_for_store(meta.flags, pair.value)?;
             if stored.is_expired_at(now_ms) {
                 continue;
             }
@@ -80,33 +80,28 @@ pub fn collect_snapshot_contents<B: FileBackend>(
 }
 
 pub fn encode_snapshot(contents: &SnapshotContents) -> Result<Vec<u8>> {
-    let mut body = Vec::new();
-    body.extend_from_slice(&contents.source_last_committed_txid.to_le_bytes());
-    body.extend_from_slice(&contents.schema_version.to_le_bytes());
-    body.extend_from_slice(
+    let mut snapshot = vec![0u8; SNAPSHOT_HEADER_SIZE];
+    snapshot.extend_from_slice(&contents.source_last_committed_txid.to_le_bytes());
+    snapshot.extend_from_slice(&contents.schema_version.to_le_bytes());
+    snapshot.extend_from_slice(
         &u32::try_from(contents.stores.len())
             .map_err(|_| EngineError::Serialization("snapshot store count overflow".into()))?
             .to_le_bytes(),
     );
-    body.extend_from_slice(&0u32.to_le_bytes());
+    snapshot.extend_from_slice(&0u32.to_le_bytes());
 
     for store in &contents.stores {
-        encode_store(&mut body, store)?;
+        encode_store(&mut snapshot, store)?;
     }
 
-    let mut snapshot = vec![0u8; SNAPSHOT_HEADER_SIZE];
     snapshot[..8].copy_from_slice(&SNAPSHOT_MAGIC);
     write_u32_le(&mut snapshot, 8, SNAPSHOT_VERSION)?;
     write_u32_le(&mut snapshot, 12, 0)?;
-    write_u64_le(
-        &mut snapshot,
-        16,
-        u64::try_from(body.len())
-            .map_err(|_| EngineError::Serialization("snapshot body too large".into()))?,
-    )?;
+    let body_len = u64::try_from(snapshot.len() - SNAPSHOT_HEADER_SIZE)
+        .map_err(|_| EngineError::Serialization("snapshot body too large".into()))?;
+    write_u64_le(&mut snapshot, 16, body_len)?;
     write_u32_le(&mut snapshot, SNAPSHOT_CHECKSUM_OFFSET, 0)?;
     write_u32_le(&mut snapshot, 28, 0)?;
-    snapshot.extend_from_slice(&body);
 
     let checksum = checksum_with_zeroed_region(&snapshot, SNAPSHOT_CHECKSUM_OFFSET, 4);
     write_u32_le(&mut snapshot, SNAPSHOT_CHECKSUM_OFFSET, checksum)?;
@@ -164,10 +159,10 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotContents> {
         offset += 8;
 
         let name_bytes = take_slice(bytes, &mut offset, name_len, "snapshot store name")?;
-        let name = String::from_utf8(name_bytes.to_vec())
+        let name = std::str::from_utf8(name_bytes)
             .map_err(|err| corruption(format!("snapshot store name utf8: {err}")))?;
-        validate_user_store_name(&name).map_err(corruption_from_engine_error)?;
-        if !seen_store_names.insert(name.clone()) {
+        validate_user_store_name(name).map_err(corruption_from_engine_error)?;
+        if !seen_store_names.insert(name) {
             return Err(corruption(format!("duplicate snapshot store {name}")));
         }
 
@@ -204,26 +199,26 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotContents> {
                 None
             };
 
-            let key = take_slice(bytes, &mut offset, key_len, "snapshot key")?.to_vec();
-            validate_key(&key).map_err(corruption_from_engine_error)?;
+            let key = take_slice(bytes, &mut offset, key_len, "snapshot key")?;
+            validate_key(key).map_err(corruption_from_engine_error)?;
 
             let value = take_slice(bytes, &mut offset, value_len, "snapshot value")?.to_vec();
             validate_value(&value).map_err(corruption_from_engine_error)?;
 
-            if !seen_keys.insert(key.clone()) {
+            if !seen_keys.insert(key) {
                 return Err(corruption(format!(
                     "duplicate snapshot key in store {name}"
                 )));
             }
             entries.push(SnapshotEntry {
-                key,
+                key: key.to_vec(),
                 value,
                 expires_at_ms,
             });
         }
 
         stores.push(SnapshotStore {
-            name,
+            name: name.to_owned(),
             flags,
             entries,
         });
@@ -267,7 +262,7 @@ fn encode_store(dst: &mut Vec<u8>, store: &SnapshotStore) -> Result<()> {
     for entry in &store.entries {
         validate_key(&entry.key)?;
         validate_value(&entry.value)?;
-        if !seen_keys.insert(entry.key.clone()) {
+        if !seen_keys.insert(entry.key.as_slice()) {
             return Err(EngineError::Serialization(format!(
                 "duplicate key while encoding snapshot store {}",
                 store.name

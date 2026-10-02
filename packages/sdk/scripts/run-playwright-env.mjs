@@ -39,7 +39,7 @@ function gitRevision() {
     }
 }
 
-const env = { ...process.env, ...profile.env };
+const env = { ...process.env, ...profile.env, MOYODB_PLAYWRIGHT_PROFILE: profileName.replaceAll(':', '-') };
 if (profile.env.MOYODB_RUN_BENCH === '1' && !env.MOYODB_BENCH_GIT_SHA) {
     env.MOYODB_BENCH_GIT_SHA = env.GITHUB_SHA ?? gitRevision();
 }

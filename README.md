@@ -42,7 +42,8 @@ await db.close();
 
 ## Verification
 
-- `proofs/moyodb_proofs` is a Lean 4 executable specification, not a proof of the storage engine. It models the store as a sorted association list, the WAL as a list of page-image and commit records, and transactions as write batches over that list. Its theorems (lookup after insert, idempotent delete, scan bounds, an incomplete WAL tail is ignored, snapshot stability) hold for that model only; they say nothing about the Rust B-tree, page and checksum layout, OPFS I/O, flush ordering, or power loss.
+- Lean checks run with all built-in/extra linters, Heron, JunkLinter and the full Batteries set; every finding fails CI. See [strict Lean linting](docs/LEAN_LINTING.md) and run `npm run lint:lean` locally.
+- `proofs/moyodb_proofs` models abstract KV/WAL/transaction semantics and independently checks real inline B-tree pages. The [B-tree checker](docs/LEAN_BTREE_CHECKER.md) has kernel-checked certificates for structure, contents and routing for every byte-string key; CI compares real Rust mutations, lookup/scan and retained COW roots with Lean-computed states and rejects two production mutation witnesses. This proves properties of the Lean checker and checks concrete Rust executions; the Rust engine, checksums, overflow, OPFS I/O, flush ordering and power loss remain outside those proofs.
 - The traces exported to `proofs/artifacts` are replayed against the Rust engine by `crates/engine/tests/proof_artifacts.rs` as conformance scenarios.
 - Crash behavior is covered by tests: `crates/engine/tests/crash_matrix.rs`, `crates/engine/tests/fault_injection.rs` (failed and short writes plus torn flushes at every WAL, main-file, and superblock operation during commit, checkpoint, and recovery), and `crates/engine/js/opfs_shim.test.mjs` for control-file publication.
 

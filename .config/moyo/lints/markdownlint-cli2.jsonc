@@ -31,6 +31,7 @@
     "!node_modules/**",
     "!**/node_modules/**",
     "!target/**",
+    "!.tmp/**",
     "!**/target/**",
     "!**/.lake/**",
     "!packages/sdk/dist/**",

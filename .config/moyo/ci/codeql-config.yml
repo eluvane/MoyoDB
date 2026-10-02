@@ -10,5 +10,7 @@ paths-ignore:
   - node_modules
   - packages/sdk/dist
   - packages/sdk/public/engine
+  - packages/sdk/playwright-report
+  - packages/sdk/test-results
   - target
   - proofs/moyodb_proofs/.lake

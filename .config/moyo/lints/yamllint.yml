@@ -2,6 +2,7 @@
 extends: default
 
 ignore: |
+  .tmp/**
   node_modules/**
   target/**
   **/target/**

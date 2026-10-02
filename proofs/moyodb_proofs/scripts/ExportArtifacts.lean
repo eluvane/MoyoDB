@@ -1,3 +1,8 @@
 import ExportArtifacts
 
-def main : IO Unit := ExportArtifacts.main
+namespace ProofArtifactScript
+
+/-- Legacy script entry point forwarding to the project's artifact writer. -/
+def main : IO Unit := writeArtifacts
+
+end ProofArtifactScript

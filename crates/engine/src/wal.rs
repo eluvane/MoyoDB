@@ -8,7 +8,7 @@ use crate::layout::{
     WAL_PAGE_IMAGE_BODY_HEADER_SIZE, WAL_RECORD_CHECKSUM_OFFSET, WAL_RECORD_HEADER_SIZE,
 };
 use crate::page::verify_page_image;
-use crate::pager::Pager;
+use crate::pager::{Pager, PAGE_WRITE_BATCH_PAGES};
 use crate::storage::backend::FileBackend;
 use read_buffer::WalReadBuffer;
 use serde::{Deserialize, Serialize};
@@ -140,14 +140,41 @@ const PAGE_IMAGE_PAYLOAD_LEN: usize = WAL_PAGE_IMAGE_BODY_HEADER_SIZE + PAGE_SIZ
 /// Page images are judged only once their commit record is seen; an
 /// uncommitted tail is never applied, so its contents do not matter.
 pub fn scan_wal_index<B: FileBackend>(wal: &B) -> Result<Vec<WalTransaction>> {
+    let mut committed = Vec::new();
+    #[cfg(test)]
+    let mut retained_page_offsets = 0usize;
+    visit_wal_transactions(wal, |commit, pages, end_offset| {
+        #[cfg(test)]
+        {
+            retained_page_offsets += pages.len();
+        }
+        committed.push(WalTransaction {
+            txid: commit.txid,
+            commit,
+            pages: std::mem::take(pages),
+            end_offset,
+        });
+        #[cfg(test)]
+        scan_work::retain_committed(committed.len(), retained_page_offsets);
+        Ok(())
+    })?;
+    Ok(committed)
+}
+
+/// Visits fully validated commits; an unfinished tail is never passed on.
+/// The visitor may take the page buffer for collection or leave it for reuse.
+pub(crate) fn visit_wal_transactions<B: FileBackend>(
+    wal: &B,
+    mut on_commit: impl FnMut(CommitRecord, &mut Vec<(u64, u64)>, u64) -> Result<()>,
+) -> Result<()> {
     let len = wal.len()?;
     let mut reader = WalReadBuffer::new(wal, len);
     let mut offset = 0u64;
-    let mut committed: Vec<WalTransaction> = Vec::new();
     let mut pending_txid: Option<u64> = None;
     let mut pending_pages: Vec<(u64, u64)> = Vec::new();
     let mut pending_invalid: Option<EngineError> = None;
     let mut last_txid = 0u64;
+    let mut last_next_page_id: Option<u64> = None;
 
     while len.saturating_sub(offset) >= WAL_RECORD_HEADER_SIZE as u64 {
         let header: WalRecordHeader = {
@@ -197,6 +224,10 @@ pub fn scan_wal_index<B: FileBackend>(wal: &B) -> Result<Vec<WalTransaction>> {
                             .map(|err| wal_corruption(offset, &err.to_string()))
                     };
                 }
+                #[cfg(test)]
+                if pending_pages.len() == pending_pages.capacity() {
+                    scan_work::pending_page_growth();
+                }
                 pending_pages.push((
                     page_id,
                     offset + (WAL_RECORD_HEADER_SIZE + WAL_PAGE_IMAGE_BODY_HEADER_SIZE) as u64,
@@ -240,24 +271,19 @@ pub fn scan_wal_index<B: FileBackend>(wal: &B) -> Result<Vec<WalTransaction>> {
                         ),
                     ));
                 }
-                if let Some(previous) = committed.last() {
-                    if commit.new_next_page_id < previous.commit.new_next_page_id {
-                        return Err(wal_corruption(offset, "next page id went backwards"));
-                    }
+                if last_next_page_id.is_some_and(|previous| commit.new_next_page_id < previous) {
+                    return Err(wal_corruption(offset, "next page id went backwards"));
                 }
                 last_txid = commit.txid;
+                last_next_page_id = Some(commit.new_next_page_id);
                 pending_txid = None;
-                committed.push(WalTransaction {
-                    txid: commit.txid,
-                    commit,
-                    pages: std::mem::take(&mut pending_pages),
-                    end_offset: offset + total_len,
-                });
+                on_commit(commit, &mut pending_pages, offset + total_len)?;
+                pending_pages.clear();
             }
         }
         offset += total_len;
     }
-    Ok(committed)
+    Ok(())
 }
 
 fn wal_corruption(offset: u64, message: &str) -> EngineError {
@@ -278,13 +304,80 @@ pub fn replay_wal_index<B: FileBackend>(
             latest.insert(*page_id, *offset);
         }
     }
+    replay_latest_pages(pager, wal, latest)
+}
+
+pub(crate) fn replay_latest_pages<B: FileBackend>(
+    pager: &mut Pager<B>,
+    wal: &B,
+    latest: BTreeMap<u64, u64>,
+) -> Result<()> {
+    let mut locations: Vec<(u64, u64)> =
+        Vec::with_capacity(latest.len().min(PAGE_WRITE_BATCH_PAGES));
+    let mut images: Vec<(u64, Vec<u8>)> =
+        Vec::with_capacity(latest.len().min(PAGE_WRITE_BATCH_PAGES));
+    let mut buffer = Vec::new();
     for (page_id, offset) in latest {
-        let bytes = wal.read_at(offset, PAGE_SIZE)?;
-        verify_page_image(&bytes, page_id)?;
-        pager.write_page_image(page_id, &bytes)?;
+        if locations.len() == PAGE_WRITE_BATCH_PAGES
+            || locations
+                .last()
+                .is_some_and(|(previous, _)| previous.checked_add(1) != Some(page_id))
+        {
+            replay_page_batch(pager, wal, &locations, &mut images, &mut buffer)?;
+            locations.clear();
+        }
+        locations.push((page_id, offset));
     }
+    replay_page_batch(pager, wal, &locations, &mut images, &mut buffer)?;
     pager.flush()?;
     Ok(())
+}
+
+fn replay_page_batch<B: FileBackend>(
+    pager: &mut Pager<B>,
+    wal: &B,
+    locations: &[(u64, u64)],
+    images: &mut Vec<(u64, Vec<u8>)>,
+    buffer: &mut Vec<u8>,
+) -> Result<()> {
+    let record_len = wal_record_total_len(PAGE_IMAGE_PAYLOAD_LEN);
+    let mut start = 0;
+    while start < locations.len() {
+        let mut end = start + 1;
+        while end < locations.len()
+            && locations[end - 1].1.checked_add(record_len as u64) == Some(locations[end].1)
+        {
+            end += 1;
+        }
+        // Consecutive images in WAL have record headers between them. Reading
+        // the bounded span amortizes backend crossings without reading gaps.
+        let source_len = (end - start - 1) * record_len + PAGE_SIZE;
+        let source_offset = locations[start].1;
+        source_offset
+            .checked_add(source_len as u64)
+            .ok_or_else(|| EngineError::Storage("wal replay read range overflow".into()))?;
+        let source = wal.read_at(source_offset, source_len)?;
+        if end == start + 1 {
+            verify_page_image(&source, locations[start].0)?;
+            images.push((locations[start].0, source));
+        } else {
+            for (index, (page_id, _)) in locations[start..end].iter().enumerate() {
+                let local = index * record_len;
+                let remaining = source.get(local..).unwrap_or_default();
+                // Let the original page validator classify short or oversized
+                // buffers, after any earlier invalid image in this source run.
+                let bytes = if index + 1 == end - start {
+                    remaining
+                } else {
+                    &remaining[..remaining.len().min(PAGE_SIZE)]
+                };
+                verify_page_image(bytes, *page_id)?;
+                images.push((*page_id, bytes.to_vec()));
+            }
+        }
+        start = end;
+    }
+    pager.write_page_images(images, buffer)
 }
 
 /// Materializing variant of [`scan_wal_index`], kept for tools and tests.
@@ -389,4 +482,50 @@ fn finish_record_checksum(out: &mut [u8], record_start: usize) {
     let checksum = checksum_with_zeroed_region(&out[record_start..], WAL_RECORD_CHECKSUM_OFFSET, 4);
     let checksum_start = record_start + WAL_RECORD_CHECKSUM_OFFSET;
     out[checksum_start..checksum_start + 4].copy_from_slice(&checksum.to_le_bytes());
+}
+
+#[cfg(test)]
+pub(crate) mod scan_work {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default)]
+    pub(crate) struct Work {
+        pub pending_page_growths: usize,
+        pub retained_transactions_peak: usize,
+        pub retained_committed_offsets_peak: usize,
+    }
+
+    thread_local! {
+        static WORK: Cell<Work> = const { Cell::new(Work {
+            pending_page_growths: 0,
+            retained_transactions_peak: 0,
+            retained_committed_offsets_peak: 0,
+        }) };
+    }
+
+    pub(crate) fn reset() {
+        WORK.with(|work| work.set(Work::default()));
+    }
+
+    pub(crate) fn snapshot() -> Work {
+        WORK.with(Cell::get)
+    }
+
+    pub(super) fn pending_page_growth() {
+        WORK.with(|work| {
+            let mut value = work.get();
+            value.pending_page_growths += 1;
+            work.set(value);
+        });
+    }
+
+    pub(crate) fn retain_committed(transactions: usize, offsets: usize) {
+        WORK.with(|work| {
+            let mut value = work.get();
+            value.retained_transactions_peak = value.retained_transactions_peak.max(transactions);
+            value.retained_committed_offsets_peak =
+                value.retained_committed_offsets_peak.max(offsets);
+            work.set(value);
+        });
+    }
 }

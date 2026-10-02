@@ -121,6 +121,11 @@ pub struct StagedStore {
     pub cleared: bool,
     pub flags: u64,
     pub force_full_rewrite: bool,
+    /// None means unknown, including after deserializing an older stage.
+    /// Only engine-owned empty stages can start with a known absence of TTLs.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub has_expiring_mutations: Option<bool>,
 }
 
 impl StagedStore {
@@ -128,6 +133,7 @@ impl StagedStore {
         Self {
             created: true,
             flags,
+            has_expiring_mutations: Some(false),
             ..Self::default()
         }
     }
@@ -137,6 +143,7 @@ impl StagedStore {
         Self {
             base_meta: Some(base_meta),
             flags,
+            has_expiring_mutations: Some(false),
             ..Self::default()
         }
     }

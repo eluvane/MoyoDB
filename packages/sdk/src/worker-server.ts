@@ -1,8 +1,12 @@
 import type { AutocommitCommand, WorkerApi } from './worker-api';
 import {
+    MAX_WORKER_BATCH_BYTES,
+    MAX_WORKER_BATCH_MESSAGES,
     WORKER_PROTOCOL_READY,
     WORKER_PROTOCOL_RESPONSE,
+    WORKER_PROTOCOL_RESPONSE_BATCH,
     WORKER_PROTOCOL_VERSION,
+    captureWorkerPayload,
     decodeWorkerCommandPayload,
     isAutocommitCommand,
     packedBatchOpsBytes,
@@ -10,11 +14,13 @@ import {
     prepareWorkerResponsePayload,
     isWorkerCommand,
     isWorkerProtocolEnvelope,
+    isWorkerProtocolRequestBatchMessage,
     isWorkerProtocolRequestMessage,
     serializeWorkerError,
     workerProtocolError,
     type WorkerProtocolErrorMessage,
     type WorkerProtocolResponseMessage,
+    type WorkerProtocolResponseBatchMessage,
     type WorkerProtocolSuccessMessage,
     type WorkerCommand
 } from './worker-protocol';
@@ -109,17 +115,15 @@ class RequestScheduler {
         })();
         const settled = result.then(noop, noop);
         this.#inFlight.add(settled);
-        void settled.then(() => {
-            this.#inFlight.delete(settled);
-        });
         if (lane !== null) {
             this.#lanes.set(lane, settled);
-            void settled.then(() => {
-                if (this.#lanes.get(lane) === settled) {
-                    this.#lanes.delete(lane);
-                }
-            });
         }
+        void settled.then(() => {
+            this.#inFlight.delete(settled);
+            if (lane !== null && this.#lanes.get(lane) === settled) {
+                this.#lanes.delete(lane);
+            }
+        });
         return result;
     }
 
@@ -148,22 +152,91 @@ function laneFor(command: WorkerCommand, args: unknown[]): number | string | nul
     return null;
 }
 
+type SendResponse = (response: WorkerProtocolResponseMessage, transfer?: Transferable[]) => void;
+
+class ResponseQueue {
+    private queued: Array<{ response: WorkerProtocolResponseMessage; transfer: Transferable[] }> = [];
+    private queuedBytes = 0;
+    private flushScheduled = false;
+    private closed = false;
+
+    constructor(private readonly scope: DedicatedWorkerGlobalScope) {}
+
+    enqueue: SendResponse = (response, transfer = []) => {
+        if (this.closed) return;
+        const captured = captureWorkerPayload(response, transfer);
+        if (this.queued.length > 0 && this.queuedBytes + captured.byteLength > MAX_WORKER_BATCH_BYTES) {
+            this.flush();
+        }
+        this.queued.push({ response: captured.value, transfer: captured.transfer });
+        this.queuedBytes += captured.byteLength;
+        if (!this.flushScheduled) {
+            this.flushScheduled = true;
+            queueMicrotask(() => {
+                this.flushScheduled = false;
+                this.flush();
+            });
+        }
+        if (this.queued.length >= MAX_WORKER_BATCH_MESSAGES || this.queuedBytes >= MAX_WORKER_BATCH_BYTES) {
+            this.flush();
+        }
+    };
+
+    close(): void {
+        this.closed = true;
+        this.queued = [];
+        this.queuedBytes = 0;
+    }
+
+    private flush(): void {
+        const queued = this.queued;
+        this.queued = [];
+        this.queuedBytes = 0;
+        if (this.closed || queued.length === 0) return;
+        const response: WorkerProtocolResponseMessage | WorkerProtocolResponseBatchMessage =
+            queued.length === 1
+                ? queued[0].response
+                : {
+                      type: WORKER_PROTOCOL_RESPONSE_BATCH,
+                      version: WORKER_PROTOCOL_VERSION,
+                      responses: queued.map((entry) => entry.response)
+                  };
+        const transfer: Transferable[] = [];
+        for (const entry of queued) {
+            for (const buffer of entry.transfer) transfer.push(buffer);
+        }
+        postWorkerResponse(this.scope, response, transfer);
+    }
+}
+
 export function exposeWorkerApi(
     api: WorkerApi,
     scope: DedicatedWorkerGlobalScope = self as DedicatedWorkerGlobalScope
 ): WorkerServerHandle {
     const scheduler = new RequestScheduler();
+    const responses = new ResponseQueue(scope);
     const handleMessage = (event: MessageEvent<unknown>) => {
+        if (event.origin !== '' && event.origin !== scope.location.origin) {
+            return;
+        }
+        if (isWorkerProtocolRequestBatchMessage(event.data)) {
+            for (const request of event.data.requests) {
+                void dispatchWorkerRequest(scope, api, scheduler, request, responses.enqueue);
+            }
+            return;
+        }
         void dispatchWorkerRequest(scope, api, scheduler, event.data);
     };
     scope.addEventListener('message', handleMessage);
     scope.postMessage({
         type: WORKER_PROTOCOL_READY,
-        version: WORKER_PROTOCOL_VERSION
+        version: WORKER_PROTOCOL_VERSION,
+        batching: 1
     });
     return {
         close() {
             scope.removeEventListener('message', handleMessage);
+            responses.close();
         }
     };
 }
@@ -172,22 +245,19 @@ async function dispatchWorkerRequest(
     scope: DedicatedWorkerGlobalScope,
     api: WorkerApi,
     scheduler: RequestScheduler,
-    data: unknown
+    data: unknown,
+    respond: SendResponse = (response, transfer) => postWorkerResponse(scope, response, transfer)
 ): Promise<void> {
     if (!isWorkerProtocolEnvelope(data)) {
         return;
     }
     const id = typeof data.id === 'number' && Number.isSafeInteger(data.id) ? data.id : 0;
     if (!isWorkerProtocolRequestMessage(data)) {
-        postWorkerResponse(
-            scope,
-            errorResponse(id, workerProtocolError('WorkerProtocolError', 'invalid worker protocol request'))
-        );
+        respond(errorResponse(id, workerProtocolError('WorkerProtocolError', 'invalid worker protocol request')));
         return;
     }
     if (!isWorkerCommand(data.command)) {
-        postWorkerResponse(
-            scope,
+        respond(
             errorResponse(
                 data.id,
                 workerProtocolError('WorkerProtocolError', `unsupported worker command: ${String(data.command)}`)
@@ -218,9 +288,9 @@ async function dispatchWorkerRequest(
         }
         const result = await scheduler.schedule(command, args, invoke);
         const responsePayload = prepareWorkerResponsePayload(responseCommand, result as never);
-        postWorkerResponse(scope, successResponse(data.id, responsePayload.result), responsePayload.transfer);
+        respond(successResponse(data.id, responsePayload.result), responsePayload.transfer);
     } catch (error) {
-        postWorkerResponse(scope, errorResponse(data.id, error));
+        respond(errorResponse(data.id, error));
     }
 }
 
@@ -235,8 +305,10 @@ function invokeCommand(api: WorkerApi, command: WorkerCommand, args: unknown[]):
     if (packedResult !== null) {
         return packedResult;
     }
-    const method = api[command] as unknown as (...methodArgs: unknown[]) => Promise<unknown>;
-    return method.apply(api, decodeWorkerCommandPayload(command, args as never) as unknown[]);
+    return (api[command] as unknown as (...methodArgs: unknown[]) => Promise<unknown>).apply(
+        api,
+        decodeWorkerCommandPayload(command, args as never) as unknown[]
+    );
 }
 
 async function runAutocommit(
@@ -326,10 +398,10 @@ function errorResponse(id: number, error: unknown): WorkerProtocolErrorMessage {
 
 function postWorkerResponse(
     scope: DedicatedWorkerGlobalScope,
-    response: WorkerProtocolResponseMessage,
+    response: WorkerProtocolResponseMessage | WorkerProtocolResponseBatchMessage,
     transfer: Transferable[] = []
 ): void {
-    if (response.ok && transfer.length > 0) {
+    if (transfer.length > 0) {
         try {
             scope.postMessage(response, transfer);
             return;

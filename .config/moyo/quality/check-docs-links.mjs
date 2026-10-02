@@ -45,7 +45,7 @@ for (const script of Object.keys(sdkPackage.scripts ?? {})) {
 
 function collectMarkdown(dir, files = []) {
     for (const entry of readdirSync(dir)) {
-        if (['.git', 'node_modules', 'target', '.lake', 'dist', 'public'].includes(entry)) continue;
+        if (['.git', '.tmp', 'node_modules', 'target', '.lake', 'dist', 'public'].includes(entry)) continue;
         const path = join(dir, entry);
         const stat = statSync(path);
         if (stat.isDirectory()) collectMarkdown(path, files);

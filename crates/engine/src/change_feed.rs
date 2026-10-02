@@ -70,6 +70,25 @@ pub struct ChangeRecord {
     pub value: Option<Vec<u8>>,
 }
 
+pub(crate) struct ChangeRecordRef<'a> {
+    pub(crate) store: &'a str,
+    key: &'a [u8],
+    kind: ChangeKind,
+    value: Option<&'a [u8]>,
+}
+
+impl ChangeRecordRef<'_> {
+    pub(crate) fn into_owned(self, txid: TxId) -> ChangeRecord {
+        ChangeRecord {
+            tx_id: txid,
+            store: self.store.to_owned(),
+            key: self.key.to_vec(),
+            kind: self.kind,
+            value: self.value.map(|value| value.to_vec()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ChangeFeed {
@@ -191,6 +210,11 @@ pub fn encode_change_record_payload(
 }
 
 pub fn decode_change_record_payload(txid: TxId, payload: &[u8]) -> Result<ChangeRecord> {
+    Ok(decode_change_record_payload_ref(payload)?.into_owned(txid))
+}
+
+/// Validates the complete payload before callers inspect the borrowed fields.
+pub(crate) fn decode_change_record_payload_ref(payload: &[u8]) -> Result<ChangeRecordRef<'_>> {
     if payload.len() < CHANGE_RECORD_HEADER_SIZE {
         return Err(EngineError::Corruption(format!(
             "change log payload too short: expected at least {CHANGE_RECORD_HEADER_SIZE} bytes, got {}",
@@ -227,15 +251,15 @@ pub fn decode_change_record_payload(txid: TxId, payload: &[u8]) -> Result<Change
         )));
     }
 
-    let store = String::from_utf8(payload[header_end..store_end].to_vec())
+    let store = std::str::from_utf8(&payload[header_end..store_end])
         .map_err(|err| EngineError::Corruption(format!("change log store name utf8: {err}")))?;
-    validate_user_store_name(&store)?;
+    validate_user_store_name(store)?;
 
-    let key = payload[store_end..key_end].to_vec();
-    validate_key(&key)?;
+    let key = &payload[store_end..key_end];
+    validate_key(key)?;
 
     let value = match kind {
-        ChangeKind::Put => Some(payload[key_end..value_end].to_vec()),
+        ChangeKind::Put => Some(&payload[key_end..value_end]),
         ChangeKind::Delete | ChangeKind::Clear | ChangeKind::Drop => {
             if value_len != 0 {
                 return Err(EngineError::Corruption(
@@ -251,8 +275,7 @@ pub fn decode_change_record_payload(txid: TxId, payload: &[u8]) -> Result<Change
         }
     };
 
-    Ok(ChangeRecord {
-        tx_id: txid,
+    Ok(ChangeRecordRef {
         store,
         key,
         kind,

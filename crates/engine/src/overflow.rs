@@ -7,6 +7,10 @@ use crate::page::{
 };
 use crate::pager::Pager;
 use crate::storage::backend::FileBackend;
+use crate::value::{
+    decode_envelope_expiry, store_uses_system_raw_values, store_uses_value_envelope, StoredValue,
+    VALUE_ENVELOPE_HEADER_SIZE,
+};
 
 #[derive(Debug, Clone)]
 pub struct OverflowChain {
@@ -112,6 +116,65 @@ pub fn read_overflow_value<B: FileBackend>(
         Ok(true)
     })?;
     Ok(out)
+}
+
+/// Copies only the payload into its final buffer, while validating the complete
+/// chain before decoding the envelope (including for already expired values).
+pub(crate) fn read_overflow_stored_value<B: FileBackend>(
+    pager: &mut Pager<B>,
+    head_page_id: u64,
+    total_len: usize,
+    store_flags: u64,
+) -> Result<StoredValue> {
+    if !store_uses_value_envelope(store_flags) || store_uses_system_raw_values(store_flags) {
+        return StoredValue::decode_owned_for_store(
+            store_flags,
+            read_overflow_value(pager, head_page_id, total_len)?,
+        );
+    }
+    if head_page_id == 0 {
+        return Err(EngineError::Corruption(
+            "overflow value is missing its head page".into(),
+        ));
+    }
+    validate_declared_len(total_len)?;
+    let mut prefix = [0; VALUE_ENVELOPE_HEADER_SIZE];
+    let mut prefix_len = 0;
+    let mut value = Vec::with_capacity(total_len.saturating_sub(VALUE_ENVELOPE_HEADER_SIZE));
+    walk_chain(pager, head_page_id, total_len, |_, chunk| {
+        let take = (VALUE_ENVELOPE_HEADER_SIZE - prefix_len).min(chunk.len());
+        prefix[prefix_len..prefix_len + take].copy_from_slice(&chunk[..take]);
+        prefix_len += take;
+        value.extend_from_slice(&chunk[take..]);
+        Ok(true)
+    })?;
+    StoredValue::decode_envelope_parts(&prefix[..prefix_len], value)
+}
+
+/// Reads the TTL header into a fixed buffer, retaining prefix-read bounds and
+/// allowing a header to span short chunks in a checksummed input chain.
+pub(crate) fn read_overflow_expiry<B: FileBackend>(
+    pager: &mut Pager<B>,
+    head_page_id: u64,
+    total_len: usize,
+) -> Result<Option<u64>> {
+    if head_page_id == 0 {
+        return Err(EngineError::Corruption(
+            "overflow value is missing its head page".into(),
+        ));
+    }
+    let wanted = VALUE_ENVELOPE_HEADER_SIZE.min(total_len);
+    let mut prefix = [0; VALUE_ENVELOPE_HEADER_SIZE];
+    let mut prefix_len = 0;
+    if wanted > 0 {
+        walk_chain(pager, head_page_id, total_len, |_, chunk| {
+            let take = (wanted - prefix_len).min(chunk.len());
+            prefix[prefix_len..prefix_len + take].copy_from_slice(&chunk[..take]);
+            prefix_len += take;
+            Ok(prefix_len < wanted)
+        })?;
+    }
+    decode_envelope_expiry(&prefix[..prefix_len])
 }
 
 /// Reads at most `prefix_len` bytes from the start of the chain, touching only

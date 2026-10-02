@@ -58,6 +58,7 @@ ignore:
   - '**/node_modules'
   - .gitignore
   - target
+  - .tmp
   - '**/target'
   - '**/.lake'
   - packages/sdk/dist

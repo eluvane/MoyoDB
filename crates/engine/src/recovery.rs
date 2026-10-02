@@ -7,7 +7,8 @@ use crate::layout::{
 };
 use crate::pager::Pager;
 use crate::storage::backend::FileBackend;
-use crate::wal::{replay_wal_index, scan_wal_index};
+use crate::wal::{replay_latest_pages, visit_wal_transactions};
+use std::collections::BTreeMap;
 
 /// Publication protocol shared with the JS control file (`root-manifest.bin`):
 /// two fixed-size slots, magic then checksum then version. A slot that fails
@@ -87,27 +88,33 @@ pub fn recover_if_needed<B: FileBackend>(
             base.catalog_root_page_id, base.next_page_id
         )));
     }
-    let txs = scan_wal_index(wal)?;
     let mut recovered = base.clone();
-    let mut to_replay = Vec::new();
-    for tx in txs {
-        if tx.txid <= base.last_committed_txid {
-            continue;
+    let mut latest = BTreeMap::new();
+    visit_wal_transactions(wal, |commit, pages, end_offset| {
+        if commit.txid <= base.last_committed_txid {
+            return Ok(());
         }
-        if tx.commit.new_next_page_id < recovered.next_page_id {
+        if commit.new_next_page_id < recovered.next_page_id {
             return Err(EngineError::Corruption(format!(
                 "wal transaction {} shrinks next page id from {} to {}",
-                tx.txid, recovered.next_page_id, tx.commit.new_next_page_id
+                commit.txid, recovered.next_page_id, commit.new_next_page_id
             )));
         }
-        recovered.last_committed_txid = tx.commit.txid;
-        recovered.catalog_root_page_id = tx.commit.new_catalog_root_page_id;
-        recovered.next_page_id = tx.commit.new_next_page_id;
-        recovered.last_replayed_wal_offset = tx.end_offset;
-        to_replay.push(tx);
-    }
-    if !to_replay.is_empty() {
-        replay_wal_index(pager, wal, &to_replay)?;
+        recovered.last_committed_txid = commit.txid;
+        recovered.catalog_root_page_id = commit.new_catalog_root_page_id;
+        recovered.next_page_id = commit.new_next_page_id;
+        recovered.last_replayed_wal_offset = end_offset;
+        for (page_id, offset) in pages.iter() {
+            latest.insert(*page_id, *offset);
+        }
+        #[cfg(test)]
+        crate::wal::scan_work::retain_committed(0, latest.len());
+        Ok(())
+    })?;
+    if recovered.last_committed_txid > base.last_committed_txid {
+        // No main-file write happens until every committed record, including
+        // overwritten and already-published images, has passed validation.
+        replay_latest_pages(pager, wal, latest)?;
         recovered.generation = recovered
             .generation
             .checked_add(1)
@@ -180,5 +187,102 @@ pub fn ensure_openable_or_initialize<B: FileBackend>(
                 ))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::{page_offset, ValueKind};
+    use crate::page::{encode_leaf_page, LeafCell};
+    use crate::storage::memory::MemoryBackend;
+    use crate::wal::{append_transaction, scan_wal_index, scan_work, CommitRecord};
+
+    #[test]
+    fn repeated_commits_recovery_retains_only_latest_offsets() -> Result<()> {
+        let mut manifest = MemoryBackend::new();
+        let main = MemoryBackend::new();
+        let mut pager = Pager::new(main.clone(), 4);
+        let mut wal = MemoryBackend::new();
+        let base = initialize_empty_db(&mut manifest, &mut pager, &mut wal, 7)?;
+        let mut oracle_main = MemoryBackend::from_durable(
+            main.durable_snapshot()
+                .ok_or_else(|| EngineError::Internal("initial main bytes missing".into()))?,
+        );
+        let mut oracle_manifest = manifest
+            .durable_snapshot()
+            .ok_or_else(|| EngineError::Internal("initial manifest bytes missing".into()))?;
+        let mut offset = 0;
+        let mut final_image = Vec::new();
+        for txid in 1..=32 {
+            final_image = encode_leaf_page(
+                1,
+                0,
+                0,
+                &[LeafCell {
+                    key: b"key".to_vec(),
+                    value: vec![txid as u8],
+                    value_kind: ValueKind::Inline,
+                    total_value_len: 1,
+                    overflow_head_page_id: 0,
+                }],
+            )?;
+            append_transaction(
+                &mut wal,
+                &mut offset,
+                txid,
+                &[(1, final_image.clone())],
+                &CommitRecord {
+                    txid,
+                    new_catalog_root_page_id: 1,
+                    new_next_page_id: 2,
+                    changed_page_count: 1,
+                },
+            )?;
+            oracle_main.write_at(page_offset(1), &final_image)?;
+        }
+        wal.flush()?;
+        oracle_main.flush()?;
+        let mut expected = base.clone();
+        expected.generation += 1;
+        expected.active_slot = 1;
+        expected.last_committed_txid = 32;
+        expected.last_replayed_wal_offset = offset;
+        oracle_manifest[SUPERBLOCK_SLOT_SIZE..].copy_from_slice(&encode_superblock_slot(&expected));
+
+        // Previous recovery retained this collecting API's history until
+        // replay. Measure that representation before the streaming path.
+        scan_work::reset();
+        let collecting = {
+            let transactions = scan_wal_index(&wal)?;
+            assert_eq!(transactions.len(), 32);
+            scan_work::snapshot()
+        };
+        assert_eq!(collecting.retained_transactions_peak, 32);
+        assert_eq!(collecting.retained_committed_offsets_peak, 32);
+        assert_eq!(collecting.pending_page_growths, 32);
+
+        scan_work::reset();
+        let recovered = recover_if_needed(&mut manifest, &mut pager, &mut wal, &base)?;
+        let work = scan_work::snapshot();
+        assert_eq!(recovered, expected);
+        assert_eq!(main.read_at(page_offset(1), PAGE_SIZE)?, final_image);
+        assert_eq!(main.durable_snapshot(), oracle_main.durable_snapshot());
+        assert_eq!(manifest.durable_snapshot(), Some(oracle_manifest));
+        assert_eq!(wal.durable_snapshot(), Some(Vec::new()));
+        assert_eq!(
+            work.retained_transactions_peak, 0,
+            "recovery must not retain historical transaction objects: {work:?}"
+        );
+        assert_eq!(
+            work.retained_committed_offsets_peak, 1,
+            "all commits update one distinct page: {work:?}"
+        );
+        assert_eq!(
+            work.pending_page_growths, 1,
+            "reuse the pending page buffer between commits: {work:?}"
+        );
+        println!("recovery scan work: collecting={collecting:?}, streaming={work:?}");
+        Ok(())
     }
 }

@@ -1,6 +1,7 @@
 # This ignore file is nested under .config/moyo/formatters, so repository-root
 # paths are written with ../../../ prefixes for Prettier's ignore-path resolver.
 ../../../node_modules/
+../../../.tmp/
 ../../../target/
 ../../../**/target/
 ../../../.lake/
@@ -23,6 +24,7 @@
 
 # Keep unprefixed copies for tools that read the file as repo-root globs.
 node_modules/
+.tmp/
 target/
 **/target/
 .lake/

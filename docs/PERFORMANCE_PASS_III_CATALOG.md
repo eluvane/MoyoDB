@@ -31,15 +31,15 @@ results. `N` is the number of catalog store entries and `K` the changed entries.
 Counts exclude value trees and change-feed payloads, which this pass does not
 optimize.
 
-| Work | Before | After |
-| --- | --- | --- |
-| Catalog entries cloned at engine transaction begin | `N` | `0`; one shared reference |
-| Full-map entry clones for begin + changed one-store commit, no readers | Approximately `3N` | `0` |
-| Catalog-wide map comparison during planning | Up to `N` entries | None; delta emptiness plus scalar comparisons |
-| Store metadata serialized for catalog mutation | All `N` records | Changed records only (`K`) |
-| Catalog pages retired and emitted | Entire catalog tree | Affected COW paths and necessary rebalancing |
-| Scalar-only commit with a live reader | Catalog clones and full rebuild | No store-map clone; affected metadata path only |
-| First store-map mutation with a reader of the current version | Unconditional full clones | One `N`-entry COW copy; subsequent writes need not repeat it |
+| Work                                                                   | Before                          | After                                                        |
+| ---------------------------------------------------------------------- | ------------------------------- | ------------------------------------------------------------ |
+| Catalog entries cloned at engine transaction begin                     | `N`                             | `0`; one shared reference                                    |
+| Full-map entry clones for begin + changed one-store commit, no readers | Approximately `3N`              | `0`                                                          |
+| Catalog-wide map comparison during planning                            | Up to `N` entries               | None; delta emptiness plus scalar comparisons                |
+| Store metadata serialized for catalog mutation                         | All `N` records                 | Changed records only (`K`)                                   |
+| Catalog pages retired and emitted                                      | Entire catalog tree             | Affected COW paths and necessary rebalancing                 |
+| Scalar-only commit with a live reader                                  | Catalog clones and full rebuild | No store-map clone; affected metadata path only              |
+| First store-map mutation with a reader of the current version          | Unconditional full clones       | One `N`-entry COW copy; subsequent writes need not repeat it |
 
 For example, updating one existing store in a running 8,192-store database with
 the feed disabled, unchanged schema/policy and an effective floor of zero removes

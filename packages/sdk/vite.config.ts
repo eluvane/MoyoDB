@@ -3,6 +3,11 @@ import { defineConfig } from 'vite';
 const entry = decodeURIComponent(new URL('./src/index.ts', import.meta.url).pathname).replace(/^\/([A-Z]:)/i, '$1');
 
 export default defineConfig({
+    server: {
+        watch: {
+            ignored: ['**/playwright-report/**', '**/test-results/**', '**/bench/results/**']
+        }
+    },
     build: {
         lib: {
             entry,

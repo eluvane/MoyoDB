@@ -426,6 +426,14 @@ export async function opfsReadActiveGeneration(encodedDbName) {
     const dbRoot = await getDbRoot(encodedDbName, false);
     return await resolveActiveGeneration(dbRoot);
 }
+// Rust supplies its owned WASM buffer as a view valid only during this call.
+// Keep the requested length contract even for a reused destination past EOF.
+export function opfsReadAtInto(sessionId, fileKind, offset, buffer) {
+    const handle = getAccessHandle(sessionId, fileKind);
+    const read = readAll(handle, buffer, Number(offset));
+    buffer.fill(0, read);
+    return read;
+}
 export function opfsReadAt(sessionId, fileKind, offset, len) {
     const handle = getAccessHandle(sessionId, fileKind);
     const buffer = new Uint8Array(len);

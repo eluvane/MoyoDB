@@ -8,7 +8,8 @@ use crate::catalog::{
 use crate::error::{EngineError, Result};
 use crate::layout::{PageKind, ValueKind, PAGE_HEADER_SIZE, PAGE_SIZE};
 use crate::overflow::{
-    free_overflow_chain, read_overflow_prefix, read_overflow_value, write_overflow_chain,
+    free_overflow_chain, read_overflow_expiry, read_overflow_prefix, read_overflow_stored_value,
+    read_overflow_value, write_overflow_chain,
 };
 use crate::page::{
     decode_internal_cell_ref, decode_leaf_cell_ref, decode_page_header_verified,
@@ -17,6 +18,9 @@ use crate::page::{
 };
 use crate::pager::Pager;
 use crate::storage::backend::FileBackend;
+use crate::value::{
+    decode_envelope_expiry, store_uses_system_raw_values, store_uses_value_envelope, StoredValue,
+};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -165,7 +169,7 @@ pub fn lookup<B: FileBackend>(
     root_page_id: u64,
     key: &[u8],
 ) -> Result<Option<Vec<u8>>> {
-    match lookup_pending(pager, root_page_id, key)? {
+    match lookup_pending(pager, root_page_id, key, usize::MAX)? {
         Some(value) => materialize_pending_value(pager, value).map(Some),
         None => Ok(None),
     }
@@ -179,11 +183,8 @@ pub fn lookup_prefix<B: FileBackend>(
     key: &[u8],
     prefix_len: usize,
 ) -> Result<Option<Vec<u8>>> {
-    match lookup_pending(pager, root_page_id, key)? {
-        Some(PendingValue::Inline(mut value)) => {
-            value.truncate(prefix_len);
-            Ok(Some(value))
-        }
+    match lookup_pending(pager, root_page_id, key, prefix_len)? {
+        Some(PendingValue::Inline(value)) => Ok(Some(value)),
         Some(PendingValue::Overflow {
             head_page_id,
             total_len,
@@ -196,31 +197,180 @@ fn lookup_pending<B: FileBackend>(
     pager: &mut Pager<B>,
     root_page_id: u64,
     key: &[u8],
+    inline_prefix_len: usize,
 ) -> Result<Option<PendingValue>> {
+    lookup_cell(
+        pager,
+        root_page_id,
+        key,
+        |cell| Ok(pending_value_from_leaf_ref(cell, inline_prefix_len)),
+        None,
+    )
+}
+
+/// Keeps only the current internal path for one sorted batch. Overflow reads
+/// may evict these pages from the pager; retaining them avoids restarting I/O
+/// without prefetching leaves or materializing values ahead of their key.
+#[derive(Default)]
+pub(crate) struct PointReadBatch {
+    ancestors: Vec<PointReadAncestor>,
+}
+
+struct PointReadAncestor {
+    page_id: u64,
+    header: PageHeaderInfo,
+    bytes: Vec<u8>,
+}
+
+impl PointReadBatch {
+    fn with_node<B: FileBackend, R>(
+        &mut self,
+        pager: &mut Pager<B>,
+        depth: usize,
+        page_id: u64,
+        expected_level: Option<u8>,
+        inspect: impl FnOnce(&[u8], &PageHeaderInfo) -> Result<R>,
+    ) -> Result<R> {
+        if let Some(node) = self
+            .ancestors
+            .get(depth)
+            .filter(|node| node.page_id == page_id)
+        {
+            if let Some(expected) = expected_level {
+                if node.header.level != expected {
+                    return Err(EngineError::Corruption(format!(
+                        "page {page_id} has level {}, parent expects {expected}",
+                        node.header.level
+                    )));
+                }
+            }
+            return inspect(&node.bytes, &node.header);
+        }
+        self.ancestors.truncate(depth);
+        pager.with_page(page_id, |bytes| {
+            let header = node_header(bytes, page_id, expected_level)?;
+            let result = inspect(bytes, &header)?;
+            if header.page_kind == PageKind::Internal {
+                self.ancestors.push(PointReadAncestor {
+                    page_id,
+                    header,
+                    bytes: bytes.to_vec(),
+                });
+            }
+            Ok(result)
+        })
+    }
+}
+
+fn lookup_cell<B: FileBackend, T>(
+    pager: &mut Pager<B>,
+    root_page_id: u64,
+    key: &[u8],
+    mut read_value: impl FnMut(&crate::page::LeafCellRef<'_>) -> Result<T>,
+    mut batch: Option<&mut PointReadBatch>,
+) -> Result<Option<T>> {
     if root_page_id == 0 {
         return Ok(None);
     }
     let mut current = root_page_id;
     let mut expected_level = None;
+    let mut depth = 0;
     loop {
-        let step = pager.with_page(current, |bytes| {
-            let header = node_header(bytes, current, expected_level)?;
-            match header.page_kind {
-                PageKind::Leaf => lookup_leaf_in_page(bytes, &header, key),
-                _ => {
-                    let (_, child_page_id) = choose_internal_child_in_page(bytes, &header, key)?;
-                    Ok(LookupStep::Descend(child_page_id, header.level - 1))
-                }
+        let mut inspect = |bytes: &[u8], header: &PageHeaderInfo| match header.page_kind {
+            PageKind::Leaf => lookup_leaf_in_page(bytes, header, key, &mut read_value),
+            _ => {
+                let (_, child_page_id) = choose_internal_child_in_page(bytes, header, key)?;
+                Ok(LookupStep::Descend(child_page_id, header.level - 1))
             }
-        })?;
+        };
+        let step = match batch.as_deref_mut() {
+            Some(batch) => batch.with_node(pager, depth, current, expected_level, inspect),
+            None => pager.with_page(current, |bytes| {
+                let header = node_header(bytes, current, expected_level)?;
+                inspect(bytes, &header)
+            }),
+        }?;
         match step {
             LookupStep::Descend(child_page_id, level) => {
                 current = child_page_id;
                 expected_level = Some(level);
+                depth += 1;
             }
             LookupStep::Found(value) => return Ok(Some(value)),
             LookupStep::NotFound => return Ok(None),
         }
+    }
+}
+
+pub(crate) fn lookup_stored_value<B: FileBackend>(
+    pager: &mut Pager<B>,
+    root_page_id: u64,
+    key: &[u8],
+    store_flags: u64,
+    batch: Option<&mut PointReadBatch>,
+) -> Result<Option<StoredValue>> {
+    let value = lookup_cell(
+        pager,
+        root_page_id,
+        key,
+        |cell| {
+            if cell.value_kind == ValueKind::Inline {
+                StoredValue::decode_for_store(store_flags, cell.inline_value)
+                    .map(PointValue::Inline)
+            } else {
+                Ok(PointValue::Overflow {
+                    head_page_id: cell.overflow_head_page_id,
+                    total_len: cell.total_value_len as usize,
+                })
+            }
+        },
+        batch,
+    )?;
+    match value {
+        None => Ok(None),
+        Some(PointValue::Inline(value)) => Ok(Some(value)),
+        Some(PointValue::Overflow {
+            head_page_id,
+            total_len,
+        }) => read_overflow_stored_value(pager, head_page_id, total_len, store_flags).map(Some),
+    }
+}
+
+/// `None` means missing; `Some(None)` means present without an expiry.
+pub(crate) fn lookup_value_expiry<B: FileBackend>(
+    pager: &mut Pager<B>,
+    root_page_id: u64,
+    key: &[u8],
+    store_flags: u64,
+    batch: Option<&mut PointReadBatch>,
+) -> Result<Option<Option<u64>>> {
+    let enveloped =
+        store_uses_value_envelope(store_flags) && !store_uses_system_raw_values(store_flags);
+    let value = lookup_cell(
+        pager,
+        root_page_id,
+        key,
+        |cell| {
+            if !enveloped {
+                Ok(PointValue::Inline(None))
+            } else if cell.value_kind == ValueKind::Inline {
+                decode_envelope_expiry(cell.inline_value).map(PointValue::Inline)
+            } else {
+                Ok(PointValue::Overflow {
+                    head_page_id: cell.overflow_head_page_id,
+                    total_len: cell.total_value_len as usize,
+                })
+            }
+        },
+        batch,
+    )?;
+    match value {
+        None => Ok(None),
+        Some(PointValue::Inline(expiry)) => Ok(Some(expiry)),
+        Some(PointValue::Overflow {
+            head_page_id,
+            total_len,
+        }) => read_overflow_expiry(pager, head_page_id, total_len).map(Some),
     }
 }
 
@@ -507,6 +657,11 @@ pub fn apply_mutations<B: FileBackend>(
     })
 }
 
+enum TreeLinks {
+    Leaf(Vec<(u64, usize)>),
+    Internal { level: u8, children: Vec<u64> },
+}
+
 /// Retires every page of a committed tree, including overflow chains.
 pub fn free_tree<B: FileBackend>(
     pager: &mut Pager<B>,
@@ -524,24 +679,64 @@ pub fn free_tree<B: FileBackend>(
                 "page {page_id} is reachable twice in one tree"
             )));
         }
-        let node = read_node(pager, page_id, expected_level)?;
-        alloc.free(page_id);
-        match node {
-            Node::Leaf(cells) => {
-                for cell in cells {
-                    if cell.value_kind == ValueKind::Overflow {
-                        free_overflow_chain(
-                            pager,
-                            cell.overflow_head_page_id,
-                            cell.total_value_len as usize,
-                            alloc,
-                        )?;
+        // Validate the entire node before retiring it, without copying keys
+        // or inline values that this traversal will never return or rewrite.
+        let links = pager.with_page(page_id, |bytes| {
+            let header = node_header(bytes, page_id, expected_level)?;
+            let count = header.cell_count as usize;
+            let mut previous: Option<&[u8]> = None;
+            match header.page_kind {
+                PageKind::Leaf => {
+                    let mut overflow = Vec::new();
+                    for index in 0..count {
+                        let slot = read_cell_slot(bytes, &header, index)?;
+                        let cell = decode_leaf_cell_ref(bytes, slot)?;
+                        if previous.is_some_and(|key| compare_keys(key, cell.key) != Ordering::Less)
+                        {
+                            return Err(EngineError::Corruption(format!(
+                                "leaf page {page_id} keys are not strictly increasing"
+                            )));
+                        }
+                        previous = Some(cell.key);
+                        if cell.value_kind == ValueKind::Overflow {
+                            overflow
+                                .push((cell.overflow_head_page_id, cell.total_value_len as usize));
+                        }
                     }
+                    Ok(TreeLinks::Leaf(overflow))
+                }
+                _ => {
+                    let mut children = Vec::with_capacity(count);
+                    for index in 0..count {
+                        let slot = read_cell_slot(bytes, &header, index)?;
+                        let cell = decode_internal_cell_ref(bytes, slot)?;
+                        if previous
+                            .is_some_and(|key| compare_keys(key, cell.separator) != Ordering::Less)
+                        {
+                            return Err(EngineError::Corruption(format!(
+                                "internal page {page_id} separators are not strictly increasing"
+                            )));
+                        }
+                        previous = Some(cell.separator);
+                        children.push(cell.child_page_id);
+                    }
+                    Ok(TreeLinks::Internal {
+                        level: header.level,
+                        children,
+                    })
                 }
             }
-            Node::Internal { level, cells } => {
-                for cell in cells {
-                    stack.push((cell.child_page_id, Some(level - 1)));
+        })?;
+        alloc.free(page_id);
+        match links {
+            TreeLinks::Leaf(overflow) => {
+                for (head_page_id, total_len) in overflow {
+                    free_overflow_chain(pager, head_page_id, total_len, alloc)?;
+                }
+            }
+            TreeLinks::Internal { level, children } => {
+                for child_page_id in children {
+                    stack.push((child_page_id, Some(level - 1)));
                 }
             }
         }
@@ -558,15 +753,16 @@ pub fn collect_keys_below<B: FileBackend>(
 ) -> Result<Vec<Vec<u8>>> {
     let range = RangeSpec {
         lt: Some(upper.to_vec()),
+        limit: Some(limit),
         ..RangeSpec::default()
     };
-    let mut iter = TreeIter::new(pager, root_page_id, &range)?;
+    let mut iter = TreeIter::new_keys_only(pager, root_page_id, &range)?;
     let mut out = Vec::new();
     while out.len() < limit {
-        let Some(pair) = iter.next(pager)? else {
+        let Some(key) = iter.next_key(pager)? else {
             break;
         };
-        out.push(pair.key);
+        out.push(key);
     }
     Ok(out)
 }
@@ -684,7 +880,7 @@ impl<'a, B: FileBackend> TreeWriter<'a, B> {
         expected_level: Option<u8>,
         mutations: &[Mutation<'_>],
     ) -> Result<Run> {
-        let node = read_node(self.pager()?, page_id, expected_level)?;
+        let node = read_node(self.pager()?, page_id, expected_level, mutations)?;
         self.alloc.free(page_id);
         match node {
             Node::Leaf(cells) => self.merge_leaf(cells, mutations),
@@ -827,7 +1023,7 @@ impl<'a, B: FileBackend> TreeWriter<'a, B> {
         match child {
             Child::Changed(run) => Ok(run),
             Child::Keep(cell) => {
-                let node = read_node(self.pager()?, cell.child_page_id, Some(child_level))?;
+                let node = read_node(self.pager()?, cell.child_page_id, Some(child_level), &[])?;
                 self.alloc.free(cell.child_page_id);
                 Ok(match node {
                     Node::Leaf(cells) => Run::Leaf(cells),
@@ -996,6 +1192,7 @@ fn read_node<B: FileBackend>(
     pager: &mut Pager<B>,
     page_id: u64,
     expected_level: Option<u8>,
+    mutations: &[Mutation<'_>],
 ) -> Result<Node> {
     pager.with_page(page_id, |bytes| {
         let header = node_header(bytes, page_id, expected_level)?;
@@ -1003,6 +1200,7 @@ fn read_node<B: FileBackend>(
         match header.page_kind {
             PageKind::Leaf => {
                 let mut cells: Vec<LeafCell> = Vec::with_capacity(count);
+                let mut mutation_index = 0;
                 for index in 0..count {
                     let slot = read_cell_slot(bytes, &header, index)?;
                     let cell = decode_leaf_cell_ref(bytes, slot)?;
@@ -1013,9 +1211,24 @@ fn read_node<B: FileBackend>(
                             )));
                         }
                     }
+                    while mutations
+                        .get(mutation_index)
+                        .is_some_and(|(key, _)| compare_keys(key, cell.key) == Ordering::Less)
+                    {
+                        mutation_index += 1;
+                    }
+                    let replaced = mutations
+                        .get(mutation_index)
+                        .is_some_and(|(key, _)| *key == cell.key);
                     cells.push(LeafCell {
                         key: cell.key.to_vec(),
-                        value: cell.inline_value.to_vec(),
+                        // merge_leaf removes these old cells before packing.
+                        // Keep their validated metadata to retire overflow chains.
+                        value: if replaced {
+                            Vec::new()
+                        } else {
+                            cell.inline_value.to_vec()
+                        },
                         value_kind: cell.value_kind,
                         total_value_len: cell.total_value_len,
                         overflow_head_page_id: cell.overflow_head_page_id,
@@ -1075,10 +1288,15 @@ fn node_header(bytes: &[u8], page_id: u64, expected_level: Option<u8>) -> Result
     Ok(header)
 }
 
-enum LookupStep {
+enum LookupStep<T> {
     Descend(u64, u8),
-    Found(PendingValue),
+    Found(T),
     NotFound,
+}
+
+enum PointValue<T> {
+    Inline(T),
+    Overflow { head_page_id: u64, total_len: usize },
 }
 
 pub(crate) enum PendingValue {
@@ -1226,13 +1444,24 @@ fn descend<B: FileBackend>(
     }
 }
 
-/// Streams entries of one tree in key order (or reverse), one leaf at a time.
-/// Values stay unread until the caller materializes them.
+struct ValidatedLeafWindow {
+    header: PageHeaderInfo,
+    start: usize,
+    end: usize,
+    hit_bound: bool,
+}
+
+/// Streams entries of one tree in key order (or reverse).
+/// Finite scans copy entries on demand after validating the entire leaf window.
+/// Unlimited scans buffer a leaf so overflow reads do not force leaf rereads.
 pub(crate) struct TreeIter {
     cursor: Option<LeafCursor>,
     buffer: VecDeque<PendingKvPair>,
+    window: Option<ValidatedLeafWindow>,
     lower: Option<(Vec<u8>, bool)>,
     upper: Option<(Vec<u8>, bool)>,
+    max_buffered_entries: usize,
+    inline_prefix_len: usize,
     reverse: bool,
     loaded_first: bool,
     exhausted: bool,
@@ -1267,11 +1496,32 @@ impl TreeIter {
             exhausted: cursor.is_none(),
             cursor,
             buffer: VecDeque::new(),
+            window: None,
             lower,
             upper,
+            // This is a copying hint, not an entry limit: callers may need
+            // further entries after TTL, staged deletes, or filtering.
+            max_buffered_entries: if range.limit.is_some() { 1 } else { usize::MAX },
+            inline_prefix_len: usize::MAX,
             reverse: range.reverse,
             loaded_first: false,
         })
+    }
+
+    fn new_keys_only<B: FileBackend>(
+        pager: &mut Pager<B>,
+        root_page_id: u64,
+        range: &RangeSpec,
+    ) -> Result<Self> {
+        let mut iter = Self::new(pager, root_page_id, range)?;
+        // Keys-only callers discard PendingValue. A zero inline prefix keeps
+        // the same cell validation without allocating unused value bytes.
+        iter.inline_prefix_len = 0;
+        Ok(iter)
+    }
+
+    fn next_key<B: FileBackend>(&mut self, pager: &mut Pager<B>) -> Result<Option<Vec<u8>>> {
+        self.next(pager).map(|pair| pair.map(|pair| pair.key))
     }
 
     pub(crate) fn next<B: FileBackend>(
@@ -1282,6 +1532,38 @@ impl TreeIter {
             if let Some(pair) = self.buffer.pop_front() {
                 return Ok(Some(pair));
             }
+            if let Some(window) = self.window.as_mut() {
+                if window.start < window.end {
+                    let page_id = self
+                        .cursor
+                        .as_ref()
+                        .ok_or_else(|| {
+                            EngineError::Internal("leaf window without a cursor".into())
+                        })?
+                        .current;
+                    let index = if self.reverse {
+                        window.end - 1
+                    } else {
+                        window.start
+                    };
+                    let inline_prefix_len = self.inline_prefix_len;
+                    let pair = pager.with_page(page_id, |bytes| {
+                        let slot = read_cell_slot(bytes, &window.header, index)?;
+                        let cell = decode_leaf_cell_ref(bytes, slot)?;
+                        Ok(PendingKvPair {
+                            key: cell.key.to_vec(),
+                            value: pending_value_from_leaf_ref(&cell, inline_prefix_len),
+                        })
+                    })?;
+                    if self.reverse {
+                        window.end -= 1;
+                    } else {
+                        window.start += 1;
+                    }
+                    return Ok(Some(pair));
+                }
+            }
+            self.window = None;
             if self.exhausted {
                 return Ok(None);
             }
@@ -1311,26 +1593,39 @@ impl TreeIter {
                 .as_ref()
                 .map(|(key, inclusive)| (key.as_slice(), *inclusive));
             let reverse = self.reverse;
-            let (pairs, hit_bound) = pager.with_page(page_id, |bytes| {
-                collect_leaf_window(bytes, page_id, lower, upper, reverse)
+            let max_buffered_entries = self.max_buffered_entries;
+            let inline_prefix_len = self.inline_prefix_len;
+            let (window, pairs) = pager.with_page(page_id, |bytes| {
+                collect_leaf_window(
+                    bytes,
+                    page_id,
+                    lower,
+                    upper,
+                    reverse,
+                    max_buffered_entries,
+                    inline_prefix_len,
+                )
             })?;
             self.buffer.extend(pairs);
-            if hit_bound {
+            if window.hit_bound {
                 self.exhausted = true;
             }
+            self.window = Some(window);
         }
     }
 }
 
-/// Entries of one leaf inside the bounds, in iteration order, and whether the
-/// bound in the direction of travel cut this leaf (so later leaves are out of range).
+/// Validates all cells in range in their original ascending order, then returns
+/// the requested first batch and indices for the remaining validated cells.
 fn collect_leaf_window(
     bytes: &[u8],
     page_id: u64,
     lower: Option<(&[u8], bool)>,
     upper: Option<(&[u8], bool)>,
     reverse: bool,
-) -> Result<(Vec<PendingKvPair>, bool)> {
+    max_buffered_entries: usize,
+    inline_prefix_len: usize,
+) -> Result<(ValidatedLeafWindow, Vec<PendingKvPair>)> {
     let header = node_header(bytes, page_id, Some(0))?;
     let count = header.cell_count as usize;
     let start = match lower {
@@ -1347,14 +1642,22 @@ fn collect_leaf_window(
         })?,
         None => count,
     };
-    let mut pairs = Vec::with_capacity(end.saturating_sub(start));
+    let buffered_count = end.saturating_sub(start).min(max_buffered_entries);
+    let (copy_start, copy_end) = if reverse {
+        (end.max(start) - buffered_count, end.max(start))
+    } else {
+        (start, start + buffered_count)
+    };
+    let mut pairs = Vec::with_capacity(buffered_count);
     for index in start..end.max(start) {
         let slot = read_cell_slot(bytes, &header, index)?;
         let cell = decode_leaf_cell_ref(bytes, slot)?;
-        pairs.push(PendingKvPair {
-            key: cell.key.to_vec(),
-            value: pending_value_from_leaf_ref(&cell),
-        });
+        if index >= copy_start && index < copy_end {
+            pairs.push(PendingKvPair {
+                key: cell.key.to_vec(),
+                value: pending_value_from_leaf_ref(&cell, inline_prefix_len),
+            });
+        }
     }
     let hit_bound = if reverse {
         pairs.reverse();
@@ -1362,7 +1665,15 @@ fn collect_leaf_window(
     } else {
         end < count
     };
-    Ok((pairs, hit_bound))
+    Ok((
+        ValidatedLeafWindow {
+            header,
+            start: if reverse { start } else { copy_end },
+            end: if reverse { copy_start } else { end.max(start) },
+            hit_bound,
+        },
+        pairs,
+    ))
 }
 
 /// First index whose key does not satisfy `before`.
@@ -1386,7 +1697,12 @@ fn leaf_partition(
     Ok(lo)
 }
 
-fn lookup_leaf_in_page(bytes: &[u8], header: &PageHeaderInfo, key: &[u8]) -> Result<LookupStep> {
+fn lookup_leaf_in_page<T>(
+    bytes: &[u8],
+    header: &PageHeaderInfo,
+    key: &[u8],
+    mut read_value: impl FnMut(&crate::page::LeafCellRef<'_>) -> Result<T>,
+) -> Result<LookupStep<T>> {
     let mut lo = 0usize;
     let mut hi = header.cell_count as usize;
     while lo < hi {
@@ -1396,7 +1712,9 @@ fn lookup_leaf_in_page(bytes: &[u8], header: &PageHeaderInfo, key: &[u8]) -> Res
         match compare_keys(cell.key, key) {
             Ordering::Less => lo = mid + 1,
             Ordering::Greater => hi = mid,
-            Ordering::Equal => return Ok(LookupStep::Found(pending_value_from_leaf_ref(&cell))),
+            Ordering::Equal => {
+                return read_value(&cell).map(LookupStep::Found);
+            }
         }
     }
     Ok(LookupStep::NotFound)
@@ -1434,9 +1752,14 @@ fn child_page_id_at(bytes: &[u8], header: &PageHeaderInfo, index: usize) -> Resu
     Ok(decode_internal_cell_ref(bytes, slot)?.child_page_id)
 }
 
-fn pending_value_from_leaf_ref(cell: &crate::page::LeafCellRef<'_>) -> PendingValue {
+fn pending_value_from_leaf_ref(
+    cell: &crate::page::LeafCellRef<'_>,
+    inline_prefix_len: usize,
+) -> PendingValue {
     if cell.value_kind == ValueKind::Inline {
-        PendingValue::Inline(cell.inline_value.to_vec())
+        PendingValue::Inline(
+            cell.inline_value[..inline_prefix_len.min(cell.inline_value.len())].to_vec(),
+        )
     } else {
         PendingValue::Overflow {
             head_page_id: cell.overflow_head_page_id,

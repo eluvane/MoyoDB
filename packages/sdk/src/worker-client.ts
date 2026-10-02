@@ -16,11 +16,18 @@ import type {
     TxMode
 } from './types';
 import {
+    MAX_WORKER_BATCH_BYTES,
+    MAX_WORKER_BATCH_MESSAGES,
     WORKER_PROTOCOL_REQUEST,
+    WORKER_PROTOCOL_REQUEST_BATCH,
+    WORKER_PROTOCOL_RESPONSE,
+    WORKER_PROTOCOL_RESPONSE_BATCH,
     WORKER_PROTOCOL_VERSION,
+    captureWorkerPayload,
     deserializeWorkerError,
     decodeWorkerResponsePayload,
     isWorkerProtocolReadyMessage,
+    isWorkerProtocolResponseBatchMessage,
     isWorkerProtocolResponseMessage,
     prepareWorkerCommandPayload,
     workerProtocolError,
@@ -28,8 +35,10 @@ import {
     type WorkerCommand,
     type WorkerCommandArgs,
     type WorkerCommandResult,
+    type WorkerProtocolRequestBatchMessage,
     type WorkerProtocolRequestMessage
 } from './worker-protocol';
+import { isRecord } from './internal';
 
 interface PendingRequest {
     /** Command whose response format the result is decoded with. */
@@ -37,6 +46,12 @@ interface PendingRequest {
     resolve: (value: unknown) => void;
     reject: (error: Error) => void;
     timeout: ReturnType<typeof setTimeout> | null;
+}
+
+interface QueuedRequest {
+    message: WorkerProtocolRequestMessage;
+    transfer: Transferable[];
+    byteLength: number;
 }
 
 function clearPendingTimeout(pending: PendingRequest): void {
@@ -60,6 +75,11 @@ export class WorkerProtocolClient implements WorkerApi {
     private requestTimeoutMs: number;
     private fatalHandler: ((error: Error) => void) | null = null;
     private closeReason: Error | null = null;
+    private batching = false;
+    private queuedRequests: QueuedRequest[] = [];
+    private queuedBytes = 0;
+    private flushScheduled = false;
+    private awaitingReady = 0;
 
     constructor(
         private readonly worker: Worker,
@@ -265,8 +285,16 @@ export class WorkerProtocolClient implements WorkerApi {
         responseCommand: WorkerCommand
     ): Promise<unknown> {
         this.ensureOpen();
-        await this.ready;
+        this.awaitingReady += 1;
+        try {
+            await this.ready;
+        } finally {
+            this.awaitingReady -= 1;
+        }
         this.ensureOpen();
+        // Concurrent calls are already waiting in the same READY microtask
+        // queue. A lone call keeps its original immediate postMessage path.
+        const shouldQueue = this.batching && (this.awaitingReady > 0 || this.queuedRequests.length > 0);
         const id = this.nextRequestId;
         this.nextRequestId += 1;
         const prepared = prepareWorkerCommandPayload(command, args);
@@ -297,7 +325,9 @@ export class WorkerProtocolClient implements WorkerApi {
                 timeout
             });
             try {
-                if (prepared.transfer.length > 0) {
+                if (shouldQueue) {
+                    this.queueRequest(message, prepared.transfer);
+                } else if (prepared.transfer.length > 0) {
                     this.worker.postMessage(message, prepared.transfer);
                 } else {
                     this.worker.postMessage(message);
@@ -306,6 +336,61 @@ export class WorkerProtocolClient implements WorkerApi {
                 this.rejectPending(id, error instanceof Error ? error : new Error(String(error)));
             }
         });
+    }
+
+    private queueRequest(message: WorkerProtocolRequestMessage, transfer: Transferable[]): void {
+        const captured = captureWorkerPayload(message, transfer);
+        if (!this.pending.has(message.id)) return;
+        if (this.queuedRequests.length > 0 && this.queuedBytes + captured.byteLength > MAX_WORKER_BATCH_BYTES) {
+            this.flushRequests();
+        }
+        this.queuedRequests.push({
+            message: captured.value,
+            transfer: captured.transfer,
+            byteLength: captured.byteLength
+        });
+        this.queuedBytes += captured.byteLength;
+        if (!this.flushScheduled) {
+            this.flushScheduled = true;
+            queueMicrotask(() => {
+                this.flushScheduled = false;
+                this.flushRequests();
+            });
+        }
+        if (this.queuedRequests.length >= MAX_WORKER_BATCH_MESSAGES || this.queuedBytes >= MAX_WORKER_BATCH_BYTES) {
+            this.flushRequests();
+        }
+    }
+
+    private flushRequests(): void {
+        const queued = this.queuedRequests;
+        this.queuedRequests = [];
+        this.queuedBytes = 0;
+        if (this.closed) return;
+        const active = queued.filter((entry) => this.pending.has(entry.message.id));
+        if (active.length === 0) return;
+        const message: WorkerProtocolRequestMessage | WorkerProtocolRequestBatchMessage =
+            active.length === 1
+                ? active[0].message
+                : {
+                      type: WORKER_PROTOCOL_REQUEST_BATCH,
+                      version: WORKER_PROTOCOL_VERSION,
+                      requests: active.map((entry) => entry.message)
+                  };
+        const transfer: Transferable[] = [];
+        for (const entry of active) {
+            for (const buffer of entry.transfer) transfer.push(buffer);
+        }
+        try {
+            if (transfer.length > 0) {
+                this.worker.postMessage(message, transfer);
+            } else {
+                this.worker.postMessage(message);
+            }
+        } catch (error) {
+            const reason = error instanceof Error ? error : new Error(String(error));
+            for (const entry of active) this.rejectPending(entry.message.id, reason);
+        }
     }
 
     private ensureOpen(): void {
@@ -317,13 +402,40 @@ export class WorkerProtocolClient implements WorkerApi {
     private handleMessage = (event: MessageEvent<unknown>): void => {
         const data = event.data;
         if (isWorkerProtocolReadyMessage(data)) {
+            if (this.readyResolved) return;
+            this.batching = data.batching === 1;
             this.readyResolved = true;
             this.readyResolve?.();
             this.readyResolve = null;
             this.readyReject = null;
             return;
         }
+        if (isWorkerProtocolResponseBatchMessage(data)) {
+            for (const response of data.responses) this.handleResponse(response);
+            return;
+        }
+        if (
+            isRecord(data) &&
+            data.type === WORKER_PROTOCOL_RESPONSE_BATCH &&
+            data.version === WORKER_PROTOCOL_VERSION
+        ) {
+            this.disposeInternal(workerProtocolError('WorkerProtocolError', 'invalid worker response batch'), true);
+            return;
+        }
+        this.handleResponse(data);
+    };
+
+    private handleResponse(data: unknown): void {
         if (!isWorkerProtocolResponseMessage(data)) {
+            if (
+                isRecord(data) &&
+                data.type === WORKER_PROTOCOL_RESPONSE &&
+                data.version === WORKER_PROTOCOL_VERSION &&
+                typeof data.id === 'number' &&
+                Number.isSafeInteger(data.id)
+            ) {
+                this.rejectPending(data.id, workerProtocolError('WorkerProtocolError', 'invalid worker response'));
+            }
             return;
         }
         const pending = this.pending.get(data.id);
@@ -332,12 +444,20 @@ export class WorkerProtocolClient implements WorkerApi {
         }
         this.pending.delete(data.id);
         clearPendingTimeout(pending);
-        if (data.ok) {
-            pending.resolve(decodeWorkerResponsePayload(pending.command, data.result));
-            return;
+        try {
+            if (data.ok) {
+                pending.resolve(decodeWorkerResponsePayload(pending.command, data.result));
+            } else {
+                pending.reject(deserializeWorkerError(data.error));
+            }
+        } catch (error) {
+            pending.reject(
+                error instanceof Error && error.name === 'WorkerProtocolError'
+                    ? error
+                    : workerProtocolError('WorkerProtocolError', 'worker response could not be decoded')
+            );
         }
-        pending.reject(deserializeWorkerError(data.error));
-    };
+    }
 
     private handleMessageError = (): void => {
         this.disposeInternal(
@@ -378,6 +498,8 @@ export class WorkerProtocolClient implements WorkerApi {
         }
         this.readyResolve = null;
         this.readyReject = null;
+        this.queuedRequests = [];
+        this.queuedBytes = 0;
         for (const pending of this.pending.values()) {
             clearPendingTimeout(pending);
             pending.reject(reason);

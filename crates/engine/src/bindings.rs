@@ -1,5 +1,289 @@
+// Binding-only byte representation; native serializer tests inspect this same
+// adapter without changing ChangeFeed's general JSON or storage representation.
+#[cfg(any(target_arch = "wasm32", test))]
+struct WasmChangeFeed<'a>(&'a crate::change_feed::ChangeFeed);
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl serde::Serialize for WasmChangeFeed<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut fields = serializer.serialize_struct("ChangeFeed", 2)?;
+        fields.serialize_field("changes", &WasmChangeRecords(&self.0.changes))?;
+        fields.serialize_field("latestTxId", &self.0.latest_tx_id)?;
+        fields.end()
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+struct WasmChangeRecords<'a>(&'a [crate::change_feed::ChangeRecord]);
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WasmChangeRecord<'a> {
+    tx_id: u64,
+    store: &'a str,
+    #[serde(with = "serde_bytes")]
+    key: &'a [u8],
+    kind: crate::change_feed::ChangeKind,
+    #[serde(with = "serde_bytes")]
+    value: Option<&'a [u8]>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl serde::Serialize for WasmChangeRecords<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq;
+        let mut records = serializer.serialize_seq(Some(self.0.len()))?;
+        for record in self.0 {
+            records.serialize_element(&WasmChangeRecord {
+                tx_id: record.tx_id,
+                store: &record.store,
+                key: &record.key,
+                kind: record.kind,
+                value: record.value.as_deref(),
+            })?;
+        }
+        records.end()
+    }
+}
+
+#[cfg(test)]
+mod typed_feed_binding_tests {
+    use super::WasmChangeFeed;
+    use crate::change_feed::{ChangeFeed, ChangeKind, ChangeRecord};
+    use serde::ser::{Impossible, SerializeSeq, SerializeStruct};
+    use serde::{Serialize, Serializer};
+
+    #[derive(Default)]
+    struct Trace {
+        bytes: Vec<Vec<u8>>,
+        scalar_bytes: usize,
+        sequences: usize,
+        none: usize,
+        variants: Vec<&'static str>,
+    }
+    struct TraceSerializer<'a>(&'a mut Trace);
+    type TraceResult<T = ()> = Result<T, serde_json::Error>;
+
+    macro_rules! scalar {
+        ($($method:ident($kind:ty)),* $(,)?) => {
+            $(fn $method(self, _value: $kind) -> TraceResult { Ok(()) })*
+        };
+    }
+
+    impl<'a> Serializer for TraceSerializer<'a> {
+        type Ok = ();
+        type Error = serde_json::Error;
+        type SerializeSeq = Self;
+        type SerializeTuple = Impossible<(), Self::Error>;
+        type SerializeTupleStruct = Impossible<(), Self::Error>;
+        type SerializeTupleVariant = Impossible<(), Self::Error>;
+        type SerializeMap = Impossible<(), Self::Error>;
+        type SerializeStruct = Self;
+        type SerializeStructVariant = Impossible<(), Self::Error>;
+
+        scalar!(
+            serialize_bool(bool),
+            serialize_i8(i8),
+            serialize_i16(i16),
+            serialize_i32(i32),
+            serialize_i64(i64),
+            serialize_u16(u16),
+            serialize_u32(u32),
+            serialize_u64(u64),
+            serialize_f32(f32),
+            serialize_f64(f64),
+            serialize_char(char),
+            serialize_str(&str)
+        );
+
+        fn serialize_u8(self, _value: u8) -> TraceResult {
+            self.0.scalar_bytes += 1;
+            Ok(())
+        }
+        fn serialize_bytes(self, value: &[u8]) -> TraceResult {
+            self.0.bytes.push(value.to_vec());
+            Ok(())
+        }
+        fn serialize_none(self) -> TraceResult {
+            self.0.none += 1;
+            Ok(())
+        }
+        fn serialize_some<T: ?Sized + Serialize>(self, value: &T) -> TraceResult {
+            value.serialize(self)
+        }
+        fn serialize_unit(self) -> TraceResult {
+            Ok(())
+        }
+        fn serialize_unit_struct(self, _name: &'static str) -> TraceResult {
+            Ok(())
+        }
+        fn serialize_unit_variant(
+            self,
+            _name: &'static str,
+            _index: u32,
+            variant: &'static str,
+        ) -> TraceResult {
+            self.0.variants.push(variant);
+            Ok(())
+        }
+        fn serialize_newtype_struct<T: ?Sized + Serialize>(
+            self,
+            _name: &'static str,
+            value: &T,
+        ) -> TraceResult {
+            value.serialize(self)
+        }
+        fn serialize_newtype_variant<T: ?Sized + Serialize>(
+            self,
+            _name: &'static str,
+            _index: u32,
+            _variant: &'static str,
+            _value: &T,
+        ) -> TraceResult {
+            Err(serde::ser::Error::custom("unexpected newtype variant"))
+        }
+        fn serialize_seq(self, _length: Option<usize>) -> TraceResult<Self::SerializeSeq> {
+            self.0.sequences += 1;
+            Ok(self)
+        }
+        fn serialize_tuple(self, _length: usize) -> TraceResult<Self::SerializeTuple> {
+            Err(serde::ser::Error::custom("unexpected tuple"))
+        }
+        fn serialize_tuple_struct(
+            self,
+            _name: &'static str,
+            _length: usize,
+        ) -> TraceResult<Self::SerializeTupleStruct> {
+            Err(serde::ser::Error::custom("unexpected tuple struct"))
+        }
+        fn serialize_tuple_variant(
+            self,
+            _name: &'static str,
+            _index: u32,
+            _variant: &'static str,
+            _length: usize,
+        ) -> TraceResult<Self::SerializeTupleVariant> {
+            Err(serde::ser::Error::custom("unexpected tuple variant"))
+        }
+        fn serialize_map(self, _length: Option<usize>) -> TraceResult<Self::SerializeMap> {
+            Err(serde::ser::Error::custom("unexpected map"))
+        }
+        fn serialize_struct(
+            self,
+            _name: &'static str,
+            _length: usize,
+        ) -> TraceResult<Self::SerializeStruct> {
+            Ok(self)
+        }
+        fn serialize_struct_variant(
+            self,
+            _name: &'static str,
+            _index: u32,
+            _variant: &'static str,
+            _length: usize,
+        ) -> TraceResult<Self::SerializeStructVariant> {
+            Err(serde::ser::Error::custom("unexpected struct variant"))
+        }
+    }
+    impl SerializeSeq for TraceSerializer<'_> {
+        type Ok = ();
+        type Error = serde_json::Error;
+        fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> TraceResult {
+            value.serialize(TraceSerializer(self.0))
+        }
+        fn end(self) -> TraceResult {
+            Ok(())
+        }
+    }
+    impl SerializeStruct for TraceSerializer<'_> {
+        type Ok = ();
+        type Error = serde_json::Error;
+        fn serialize_field<T: ?Sized + Serialize>(
+            &mut self,
+            _name: &'static str,
+            value: &T,
+        ) -> TraceResult {
+            value.serialize(TraceSerializer(self.0))
+        }
+        fn end(self) -> TraceResult {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn typed_feed_binding_uses_byte_slices_instead_of_scalar_elements() -> TraceResult {
+        let feed = ChangeFeed {
+            latest_tx_id: 7,
+            changes: vec![ChangeRecord {
+                tx_id: 6,
+                store: "docs".into(),
+                key: (0..16).collect(),
+                kind: ChangeKind::Put,
+                value: Some((16..32).collect()),
+            }],
+        };
+        let mut trace = Trace::default();
+        WasmChangeFeed(&feed).serialize(TraceSerializer(&mut trace))?;
+        assert_eq!(trace.bytes.len(), 2);
+        assert_eq!(trace.bytes.first(), Some(&feed.changes[0].key));
+        assert_eq!(trace.bytes.get(1), feed.changes[0].value.as_ref());
+        assert_eq!(trace.scalar_bytes, 0);
+        assert_eq!(
+            trace.sequences, 1,
+            "only the changes list should be a sequence"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn typed_feed_binding_preserves_json_shape_kinds_and_absent_values() -> TraceResult {
+        let changes = [
+            ChangeKind::Put,
+            ChangeKind::Delete,
+            ChangeKind::Clear,
+            ChangeKind::Drop,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, kind)| ChangeRecord {
+            tx_id: index as u64 + 1,
+            store: "docs".into(),
+            key: if kind.is_store_level() {
+                vec![]
+            } else {
+                vec![index as u8]
+            },
+            kind,
+            value: (kind == ChangeKind::Put).then(|| vec![0, 255]),
+        })
+        .collect();
+        let feed = ChangeFeed {
+            latest_tx_id: 99,
+            changes,
+        };
+        assert_eq!(
+            serde_json::to_value(WasmChangeFeed(&feed))?,
+            serde_json::to_value(&feed)?
+        );
+        let mut trace = Trace::default();
+        WasmChangeFeed(&feed).serialize(TraceSerializer(&mut trace))?;
+        assert_eq!(trace.none, 3);
+        assert_eq!(trace.variants, ["put", "delete", "clear", "drop"]);
+        Ok(())
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 mod wasm {
+    use super::WasmChangeFeed;
     use crate::btree::{KvPair, RangeSpec};
     use crate::catalog::ChangeFeedPolicy;
     use crate::change_feed::ChangeFeedOptions;
@@ -157,6 +441,7 @@ mod wasm {
     }
 
     #[wasm_bindgen]
+    #[derive(Default)]
     pub struct WasmEngine {
         inner: Option<Engine<OpfsBackend>>,
     }
@@ -257,7 +542,7 @@ mod wasm {
     impl WasmEngine {
         #[wasm_bindgen(constructor)]
         pub fn new() -> Self {
-            Self { inner: None }
+            Self::default()
         }
 
         #[wasm_bindgen]
@@ -346,6 +631,22 @@ mod wasm {
             self.inner_mut()?.compact_into(target).map_err(js_error)
         }
 
+        /// Rebuild-only omission of explicitly named internal stores. The
+        /// default compaction path retains every store as before.
+        #[wasm_bindgen]
+        pub fn compact_into_skipping_stores(
+            &mut self,
+            target: &mut WasmEngine,
+            skip_stores: JsValue,
+        ) -> std::result::Result<u64, JsValue> {
+            let skip_stores: Vec<String> =
+                serde_wasm_bindgen::from_value(skip_stores).map_err(js_error_from_display)?;
+            let target = target.inner_mut()?;
+            self.inner_mut()?
+                .compact_into_skipping_stores(target, &skip_stores)
+                .map_err(js_error)
+        }
+
         #[wasm_bindgen]
         pub fn begin_tx(&mut self, mode: String) -> std::result::Result<u64, JsValue> {
             let engine = self.inner_mut()?;
@@ -418,6 +719,22 @@ mod wasm {
             key: &[u8],
         ) -> std::result::Result<bool, JsValue> {
             self.inner_mut()?.has(tx_id, &store, key).map_err(js_error)
+        }
+
+        /// One existence batch with one TTL clock and no value materialization.
+        #[wasm_bindgen]
+        pub fn has_many(
+            &mut self,
+            tx_id: u64,
+            store: String,
+            keys: JsValue,
+        ) -> std::result::Result<JsValue, JsValue> {
+            let keys = parse_uint8_array_list(keys)?;
+            let values = self
+                .inner_mut()?
+                .has_many(tx_id, &store, &keys)
+                .map_err(js_error)?;
+            js_value_from_serializable(&values)
         }
 
         #[wasm_bindgen]
@@ -641,7 +958,7 @@ mod wasm {
                 .inner_mut()?
                 .changes_since(tx_id, options)
                 .map_err(js_error)?;
-            js_value_from_serializable(&feed)
+            js_value_from_serializable(&WasmChangeFeed(&feed))
         }
 
         #[wasm_bindgen]
@@ -789,9 +1106,11 @@ mod wasm {
         Ok(items)
     }
 
+    type PackedBinaryPair<'a> = (&'a [u8], &'a [u8]);
+
     fn parse_packed_binary_pairs(
         bytes: &[u8],
-    ) -> std::result::Result<Vec<(&[u8], &[u8])>, JsValue> {
+    ) -> std::result::Result<Vec<PackedBinaryPair<'_>>, JsValue> {
         let what = "packed putMany";
         if bytes.len() < 4 {
             return Err(js_error_from_display("invalid packed putMany payload"));

@@ -1,0 +1,202 @@
+Mother of Licenses 1.0
+
+Version: 1.0
+Short name: MoL-1.0
+SPDX license reference: LicenseRef-MoL-1.0
+
+Copyright © 2026 Eluvane
+Licensor: Eluvane
+Licensing contact: keiko1337@proton.me
+Official repository: https://github.com/eluvane/MoyoDB
+
+MoyoDB is offered under this License starting with release 1.0.0. Earlier published releases remain governed by their original licenses.
+
+1. Scope and Acceptance
+
+This License applies only to material expressly released under the Mother of Licenses 1.0 by a party authorized to do so. Public availability does not grant additional permissions.
+
+By exercising permissions under this License that require the Licensor's authorization, You accept its conditions. Activities independently permitted under Section 14 do not require acceptance. Merely viewing the Work does not make You a Contributor.
+
+The grants are non-exclusive, worldwide, and royalty-free for the duration of the applicable intellectual property rights, subject to this License and its termination provisions. No subscription, registration, revenue threshold, or organization-size limit applies. Rights not expressly granted are reserved.
+
+2. Definitions
+
+Work means the software, source and executable code, documentation, and accompanying copyrightable material expressly covered by this License, including covered portions of that material. It excludes third-party material except to the extent the Licensor has authority to offer that material under this License.
+
+Licensor means the copyright holder or authorized licensing party offering the Work under this License and identified in the applicable licensing notice. Where multiple copyright holders are named, the notice must identify the party receiving Contributions and administering exceptions. A Contributor does not become that party merely by contributing.
+
+You means the individual or legal entity exercising rights under this License. Personnel and contractors may act on Your behalf within Your authorized activities; this does not give them broader independent rights.
+
+Official Distribution means a version, source snapshot, or package expressly published under this License by, or with authorization from, the Licensor through its designated repository or release channel. An identical copy retains its provenance but its distributor does not thereby become an official publisher. Later withdrawal does not retrospectively change a distribution's authorized status.
+
+Authorized Build means the mechanical preparation of unmodified Official Distribution source through compilation, transpilation, linking, bundling, optimization, minification, or removal of unused code, using ordinary build tools and the Work's supported configuration mechanisms. This includes necessary runtime portions incorporated into generated applications. It does not include source patches, replacement implementations, or changes to the Work's authored functionality. An Authorized Build must not be represented as an official binary unless authorized.
+
+Derivative Work means an adaptation or modification incorporating copyright-protected expression from the Work that requires the relevant rights holder's permission under applicable law. Independently written software does not become a Derivative Work merely by interoperating with the Work. Authorized Builds and permitted component combinations are governed by their express permissions below, regardless of their legal classification.
+
+Component Product means an application, product, or service that uses the Work as a supporting dependency or development tool and supplies substantial, independently developed, application-specific functionality beyond providing the Work's principal capabilities themselves. Its customer-facing purpose must not primarily be obtaining, operating, or replacing the Work. Merely adding packaging, branding, billing, authentication, deployment, monitoring, or an interface around those capabilities is insufficient. The Work's technical necessity, code volume, or contribution to performance does not alone disqualify a Component Product.
+
+Commercial Use means use in business, professional, or revenue-generating activities, including internal operations and developing, distributing, or operating Component Products. Commercial Use is permitted only within the specific grants below; the term does not itself authorize Commercialization.
+
+Hosted Service means providing others with remote access to software functionality. Access solely by Your personnel or contractors acting for Your internal operations is not a Hosted Service for this purpose.
+
+Project-as-a-Service means a Hosted Service whose primary offering is the Work's principal capabilities themselves, supplied through the Work or a Derivative Work. A separately offered feature is evaluated separately even when bundled into a broader service. A service remains Project-as-a-Service despite added interfaces or management features described in the Component Product definition.
+
+Commercialization means offering the Work or a Derivative Work itself for payment or other commercial consideration, including selling copies, charging for its license or access, reselling a substantially unchanged package, or supplying it as the primary inducement to purchase another offering. Charging for a qualifying Component Product or services expressly permitted below is not Commercialization.
+
+Competing Product means software or a service that incorporates or adapts a substantial amount of the Work's protected implementation or other copyrightable expression and whose primary purpose is to offer the Work's core capabilities as a substitute, alternative distribution, or independent successor. Substantiality concerns quantity or qualitative importance to that implementation. Similar functionality, unprotected ideas, interfaces, algorithms, or general architectural concepts alone do not establish a Competing Product.
+
+Contribution means copyrightable material intentionally submitted to the Licensor for inclusion in the official Work, through an official contribution channel, by its rights holder or authorized representative with notice and acceptance of Section 9. A Contributor is that submitting party. Material merely quoted for discussion, or clearly designated as not offered for incorporation, is not a Contribution.
+
+Written Permission means express authorization from the Licensor or its authorized licensing representative identifying the otherwise restricted activity. Verifiable electronic communications qualify. Silence, an unanswered request, or technical access does not qualify.
+
+3. Permitted Use and Component Products
+
+You may obtain, copy, inspect, study, audit, and run Official Distributions and Authorized Builds for personal, educational, research, governmental, or commercial purposes. You may make backups and internal copies reasonably necessary for those activities.
+
+You may use the Work to create commercial software and may incorporate unmodified Official Distribution code or Authorized Builds as dependencies in Component Products. This includes static or dynamic linking, embedded libraries, browser bundles, applications, containers, and ordinary infrastructure dependencies.
+
+You may sell, license, distribute, and operate Component Products, including proprietary and closed-source products, and charge for their independently developed functionality. You may provide software-as-a-service that uses the Work internally as a component rather than providing Project-as-a-Service.
+
+You may charge for independently supplied consulting, training, integration, audits, or support, provided the charge does not purchase restricted distribution rights, access to the Work itself, or Project-as-a-Service. General-purpose computing, storage, networking, and CI services are permitted where customers choose and operate their own instances and the provider does not supply a Work-specific managed service.
+
+Employees, contractors, and infrastructure providers may make necessary operational copies solely on Your behalf and within these permissions. You must not authorize them to exceed those permissions.
+
+No source-disclosure obligation attaches to Your independently developed application, integrations, data, or output merely because You use the Work. Output containing portions of the Work remains subject to this License for those portions; other output is not covered merely because the Work produced it.
+
+You may create, maintain, build, test, and run private modifications of the Work solely for Your own internal use, including use of Your own patches in production. Under this permission, neither the modifications nor the modified Work may be distributed, published, or otherwise provided or made available to third parties. The permissions for persons acting on Your behalf do not override this restriction.
+
+Private modifications must not be used to create a standalone or Competing Product or to provide Project-as-a-Service. This permission does not authorize distributing a Component Product containing modified portions of the Work.
+
+Except for the limited upstream contribution workflow expressly permitted by Section 6, distributing, publishing, or otherwise making modified versions or patches available to third parties requires Written Permission. Other modifications require another express permission under this License or Written Permission.
+
+4. Permitted Redistribution and Infrastructure Copies
+
+You may distribute the Work as an included component of a Component Product under Section 3, in source form taken unchanged from an Official Distribution or as an Authorized Build. You may charge for the Component Product, but not separately for rights to the Work itself.
+
+You may also reproduce and redistribute exact, unmodified Official Distributions where reasonably necessary for package managers, dependency registries, operating-system repositories, CI caches, archival preservation, security scanning, or research indexing.
+
+For this infrastructure exception, compression, transport containers, signatures, and external package metadata may be added without changing the enclosed distribution files. A separately rebuilt binary, patched package, or substituted implementation is not an exact Official Distribution and requires another applicable permission. Mere verification, caching, and retention of historical versions do not create an independent development line.
+
+Infrastructure redistribution must preserve this License and applicable notices, identify the original project and version, distinguish the infrastructure operator from the official publisher, and not charge primarily for access to the Work. Ordinary fees for shared infrastructure, storage, bandwidth, repository operation, or indexing are permitted. Calling a Work-specific paywall an infrastructure fee does not qualify.
+
+These exceptions do not permit publishing an independently branded edition, issuing unofficial project releases, or operating a mirror as an independent successor project. A neutral mirror or archive faithfully presenting official versions remains permitted.
+
+Each recipient obtains rights to the included Work directly under this License. Your product terms may govern Your own material but must exclude the Work from conflicting restrictions and must not purport to relicense it. No obligation requires disclosure of Your surrounding source code.
+
+5. Reserved Activities
+
+Except as expressly permitted elsewhere in this License, by Written Permission, or under Section 14, You may not create, maintain, publish, or distribute an independent fork or development line based on the Work; distribute modified versions or patches as an alternative implementation; or make the Work or a Derivative Work available as a standalone unofficial distribution.
+
+You may not engage in Commercialization, including resale, paid repackaging, license-fee collection, or payment-gated access to the Work itself. You may not rebrand the Work or a Derivative Work as software independently created by You.
+
+You may not develop or offer a Competing Product based on the Work, or provide Project-as-a-Service without Written Permission. The fork, Competing Product, and Project-as-a-Service restrictions apply whether the offering is paid, free, donation-supported, or promotional. Private modifications under Section 3 and genuine upstream development under Section 6 remain permitted within their respective conditions.
+
+Changing names, adding superficial features, dividing an offering across related entities, or providing source code does not create an exception. Offering to disclose modified source does not authorize distribution.
+
+This Section does not restrict independently written competing software merely because it addresses the same problem, nor does it restrict the ordinary component uses expressly permitted by Section 3.
+
+6. Upstream Contribution Workflow
+
+You may clone the official repository, create local branches, modify the Work, and build and test those modifications solely to prepare, submit, revise, or review a bona fide upstream Contribution. Reviewers and automated CI systems may make the copies necessary for that process.
+
+Where the official contribution workflow reasonably requires it, You may create a technical fork on a hosting platform and expose the relevant branches, patches, and temporary test artifacts for upstream review. Clearly identify its contribution-only purpose and the official upstream project. Do not publish general-use releases, solicit users for an alternative project, or use that fork as a production distribution.
+
+Once the contribution process concludes or is abandoned, stop distribution of the modified copy except for inactive review records. Further development and use must be limited to the private modifications permitted by Section 3, further bona fide upstream work under this Section, or Written Permission. You may retain private archival copies and need not delete records the platform retains independently. Retention does not authorize an independent development line.
+
+Acceptance of a patch authorizes its incorporation into an Official Distribution, not independent distribution of Your modified version. Until officially published, modified builds may be used only under the private-modification permission in Section 3, this contribution workflow, or Written Permission.
+
+7. Indexing, Analysis, and Artificial Intelligence
+
+You may perform ordinary search-engine and repository indexing, code search, academic indexing, security scanning, automated review, and archival preservation. You may publish findings and reasonably necessary attributed excerpts for analysis, teaching, criticism, or security reporting, but not a substitute implementation or modified software distribution. Distribution of complete copies remains governed by Sections 4 and 6.
+
+You may use commercial or noncommercial AI development tools to process the Work for otherwise authorized development, debugging, review, documentation, research, or contribution preparation.
+
+This permission includes task-related transmission, temporary storage, tokenization, embeddings, retrieval, and inference. Providers acting for an authorized user may perform those operations for the requested task. Retrieval indexes and ordinary prompt processing are not model training merely because a commercial tool performs them.
+
+Without Written Permission, You may not use a substantial portion of the Work to train, pretrain, fine-tune, or distill a model intended for commercial deployment, commercial code generation, or sale; prepare training examples for those purposes; or sell or commercially license a dataset substantially reproducing or adapting the Work.
+
+For this restriction, training means fitting or updating learned model parameters. Commercial purposes include proprietary business deployment and research specifically undertaken to develop a commercial model. Substantiality is assessed against the Work, including a qualitatively important protected implementation, not diluted by the size of a larger corpus. Related collections are assessed together; incidental, isolated snippets are not automatically substantial.
+
+Ordinary task processing does not authorize a provider's separate restricted training. You must not direct or knowingly authorize that training without sufficient rights, but You need not investigate undisclosed provider conduct merely to use an assistant. Genuinely noncommercial research remains permitted within the other applicable conditions.
+
+The Licensor expressly reserves rights for the restricted reproductions and extractions described here wherever applicable law recognizes such reservations. This reservation does not narrow the permitted indexing, inference, or contribution workflows, and remains subject to Section 14.
+
+8. Notices, Authorship, and Trademarks
+
+Preserve the full License text and applicable copyright, authorship, patent, and attribution notices when distributing the Work. For executable or bundled distributions, include a readable copy in accompanying license files, documentation, or an accessible third-party-notices location. Mechanical removal of source comments from a build is permitted only where the relevant notices remain in those accompanying materials. For limited excerpts under Section 7, identifying the source, the copyright holder where known, and this License is sufficient.
+
+Do not falsely remove or reassign authorship. You may accurately identify Your separate contributions and Your Component Product. No advertising, splash screen, or prominent user-interface attribution is required.
+
+No trademark, service-mark, trade-name, logo, or endorsement rights are granted. Do not impersonate the official project, suggest unauthorized affiliation, or describe an unofficial build as an official release. Truthful, legally permitted nominative descriptions are not prohibited by this License.
+
+9. Contributions and Relicensing Authority
+
+By knowingly submitting a Contribution with notice of this Section, You accept this Section and make the following grants. The Licensor may require a recorded electronic acknowledgment or separate contributor agreement before incorporation. Mere public availability of someone else's material does not constitute its submission or consent.
+
+You grant the Licensor a perpetual, worldwide, non-exclusive, irrevocable, royalty-free, fully paid-up, transferable, and sublicensable copyright license to Your Contribution. It includes authority to use, reproduce, modify, adapt, translate, combine, incorporate, distribute, publicly display, publicly perform, commercialize, and otherwise exploit the Contribution in any medium.
+
+The Licensor may sublicense through multiple levels, sell licenses, include the Contribution in proprietary products, and offer it under different, additional, or replacement licensing terms, including commercial terms. The Licensor may transfer these granted rights without further consent from You. The grant takes effect upon submission and does not depend on acceptance, merger, attribution in advertising, or continued distribution of the Contribution.
+
+You retain ownership and authorship of Your original Contribution unless separately assigned. No partnership, employment, equity interest, or ownership interest in the remainder of the Work arises. You may separately license material You own, but not portions of the Work belonging to others without authorization.
+
+To the extent legally waivable, You have no entitlement to royalties, revenue share, license fees, payment, ownership percentages, or other compensation merely because the Licensor or its licensees use, relicense, or commercially exploit Your Contribution. This does not cancel compensation expressly agreed in writing or rights that applicable law makes non-waivable.
+
+You represent that You have authority to submit the Contribution and grant these rights; that it is Your original work or You have sufficient permissions; and that any necessary employer or other rights-holder authorization has been obtained. You must identify known third-party material and its applicable terms. You must not knowingly submit material subject to obligations incompatible with these grants.
+
+No patent search, absolute guarantee of originality, or investigation beyond reasonable knowledge is required. If You discover a material rights problem, notify the Licensor promptly. Material You cannot license on these terms must be identified before submission and may be incorporated only under a separate arrangement preserving the relevant third-party rights.
+
+To the extent lawful, You consent to modifications and exploitation authorized here and agree not to assert moral rights solely to prevent those authorized acts. This does not authorize false attribution or waive rights that cannot lawfully be waived.
+
+The Licensor need not accept, maintain, support, or publicly release a Contribution. These grants survive withdrawal of a submission and termination of Your permissions, subject to mandatory law and the patent-specific provisions below. A separate contribution agreement expressly accepted by the Licensor controls any stated differences.
+
+10. Patents
+
+Each Contributor grants the Licensor and recipients of the Work a worldwide, non-exclusive, royalty-free patent license under claims the Contributor owns or is authorized to license that are necessarily infringed by its Contribution alone or by that Contribution combined with the Work to which it was submitted. The Licensor makes the equivalent grant for its own contributed material.
+
+The license permits making, having made, using, offering, selling, importing, and transferring the covered implementation, but only within activities authorized by this License or a separate license from the Licensor. It does not authorize otherwise prohibited Commercialization or distribution.
+
+For Contributions, the Licensor may transfer and sublicense this patent license through multiple levels to support the exploitation and relicensing authorized by Section 9. Coverage does not extend to claims infringed only because of later additions or combinations beyond the contributed implementation and its combination with the Work as submitted. These grants continue for the relevant patents' duration and are irrevocable except for termination expressly provided by this License or required by law.
+
+If a beneficiary of a patent grant under this Section initiates or directs patent litigation, including an infringement counterclaim or cross-claim, alleging that the Work or an incorporated Contribution infringes a patent it owns or controls, all patent permissions granted to that claimant under this License for that Work terminate when the claim is filed. Defending a claim without asserting such infringement does not trigger termination.
+
+Patent retaliation does not terminate unrelated parties' rights. Restoration requires written consent from the relevant patent grantor and is not guaranteed by Section 13. No additional patent rights are implied, and copyright permissions do not supply missing patent rights.
+
+11. Separate Licenses and Exceptions
+
+The Licensor may offer separate or additional licenses on different terms, for payment or otherwise, including commercial, OEM, redistribution, fork, hosted-service, and proprietary-derivative rights, to the extent it controls the necessary rights.
+
+A separate agreement may require source disclosure, royalties, attribution, or other conditions for authorized modifications or distributions. Those conditions neither arise automatically under this License nor create rights for anyone outside that agreement.
+
+Written Permission controls only its stated scope. No exception is inferred from cooperation, contribution acceptance, delayed enforcement, or permission granted to another person.
+
+12. Disclaimer of Warranty and Limitation of Liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE WORK IS PROVIDED “AS IS” AND AS AVAILABLE, WITHOUT EXPRESS, IMPLIED, OR STATUTORY WARRANTIES OR CONDITIONS, INCLUDING MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, NON-INFRINGEMENT, CORRECTNESS, SECURITY, AVAILABILITY, OR RELIABILITY.
+
+NO WARRANTY IS MADE OF PRODUCTION SUITABILITY, UNINTERRUPTED OPERATION, DURABILITY, CRASH CONSISTENCY, SUCCESSFUL RECOVERY, OR THE PRESERVATION, ACCURACY, OR INTEGRITY OF STORED OR PROCESSED DATA. YOU ARE RESPONSIBLE FOR EVALUATION, TESTING, BACKUPS, AND OPERATIONAL SAFEGUARDS.
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE LICENSOR AND CONTRIBUTORS SHALL NOT BE LIABLE FOR DAMAGES ARISING FROM THIS LICENSE OR THE WORK, UNDER CONTRACT, TORT, NEGLIGENCE, STRICT LIABILITY, OR OTHER THEORY, INCLUDING DIRECT, INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR PUNITIVE DAMAGES; LOST OR CORRUPTED DATA; LOST REVENUE, PROFITS, BUSINESS, OR GOODWILL; DOWNTIME; SECURITY INCIDENTS; OR SYSTEM FAILURES, EVEN IF ADVISED OF THE POSSIBILITY.
+
+These provisions do not exclude liability or rights that cannot lawfully be excluded, including any applicable mandatory protections concerning fraud, intentional misconduct, gross negligence, or death or personal injury. They do not cancel the express contributor representations in Section 9 or obligations expressly assumed in a separate written agreement.
+
+13. Termination and Cure
+
+Your permissions terminate automatically upon a material breach of this License, subject to mandatory law.
+
+For a first, unintentional, curable material breach, permissions are automatically reinstated when You stop the breach and complete reasonably practicable corrective measures for consequences within Your control, provided this occurs before notice or within 30 days after receiving written notice describing the breach with reasonable specificity.
+
+Intentional unauthorized Commercialization, deliberate operation of an unauthorized fork or Project-as-a-Service, and repeated material breaches after prior notice do not receive automatic reinstatement. The Licensor may nevertheless reinstate permissions by Written Permission. Obtaining another copy does not itself reinstate terminated permissions. Patent retaliation is governed separately by Section 10.
+
+Upon termination, stop exercising the terminated permissions and cease unauthorized distribution and services. You may retain non-operational copies required for legal compliance or evidence, and inaccessible routine backups until ordinarily overwritten, but may not use that retention to continue prohibited activity.
+
+Reinstatement does not automatically waive claims arising before cure. Termination does not terminate compliant recipients' direct licenses or grants You have made under Sections 9 and 10, except as expressly stated there. Ownership provisions, accrued claims, disclaimers, liability limitations, and provisions necessary to interpret surviving rights remain effective.
+
+14. Existing Rights, Versioning, and General Terms
+
+Historical releases and third-party material. This License does not revoke, replace, or restrict rights validly granted under another license. Those rights and obligations remain governed by their own terms. Publishing this file does not relicense third-party code or earlier Contributions. The Licensor's grants extend only to rights it controls; applicable third-party licenses and notices remain effective.
+
+Independent legal and platform rights. Nothing here restricts fair use, fair dealing, mandatory interoperability or research exceptions, non-waivable rights, or acts not requiring permission under applicable law. Nothing here revokes rights separately granted by the Licensor through repository-hosting terms, including applicable on-platform viewing, copying, forking, or processing permissions. Such rights remain limited to their own valid scope; this License does not enlarge them or independently grant unrestricted off-platform exploitation.
+
+Fixed version. This document is Mother of Licenses 1.0. Future license versions may be published but do not automatically apply to material released under this version. A valid existing MoL-1.0 grant is not withdrawn merely by publication of different terms. You may elect another license only where the relevant rights holder validly offers it.
+
+Interpretation. No governing law, forum, or arbitration agreement is selected here; applicable conflict-of-laws and jurisdiction rules determine those matters. If a provision is unenforceable, it is limited or severed only as required by applicable law, without expanding the remaining grants. Failure to enforce a provision is not a continuing waiver. Notices may be delivered through a designated licensing contact or another written channel providing reasonable evidence of receipt.

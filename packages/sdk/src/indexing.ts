@@ -12,9 +12,9 @@ import type { IndexDef, Range } from './types';
 const encoder = new TextEncoder();
 const fatalDecoder = new TextDecoder('utf-8', { fatal: true });
 const MISSING = Symbol('moyodb.indexing.missing');
-const FNV64_OFFSET = 0xcbf29ce484222325n;
-const FNV64_PRIME = 0x100000001b3n;
-const FNV64_MASK = 0xffffffffffffffffn;
+const FNV64_OFFSET = BigInt('0xcbf29ce484222325');
+const FNV64_PRIME = BigInt('0x100000001b3');
+const FNV64_MASK = BigInt('0xffffffffffffffff');
 // Legacy SDK internal namespace preserved for storage-format compatibility; do not rename without a migration.
 const INTERNAL_STORE_PREFIX = '__browserdb:';
 const INTERNAL_INDEX_STORE_PREFIX = '__browserdb:index:';
@@ -203,7 +203,7 @@ export function createIndexKeyExtractor(valueBytes: Uint8Array): (def: Normalize
         return extractLogicalIndexKeyFromDocument(def, documentValue);
     };
 }
-function extractLogicalIndexKeyFromDocument(def: NormalizedIndexDef, documentValue: unknown): Uint8Array | null {
+export function extractLogicalIndexKeyFromDocument(def: NormalizedIndexDef, documentValue: unknown): Uint8Array | null {
     if (def.compound) {
         const parts: Uint8Array[] = [];
         for (const keyPath of def.keyPath) {
@@ -301,7 +301,7 @@ function fnv1a64Hex(bytes: Uint8Array): string {
     }
     return hash.toString(16).padStart(16, '0');
 }
-function decodeIndexedDocument(bytes: Uint8Array): unknown {
+export function decodeIndexedDocument(bytes: Uint8Array): unknown {
     try {
         return JSON.parse(fatalDecoder.decode(bytes));
     } catch (error) {
@@ -336,9 +336,6 @@ function encodeDocumentIndexValue(value: unknown): Uint8Array {
 function describeValue(value: unknown): string {
     if (Array.isArray(value)) {
         return 'array';
-    }
-    if (value === null) {
-        return 'null';
     }
     return typeof value;
 }

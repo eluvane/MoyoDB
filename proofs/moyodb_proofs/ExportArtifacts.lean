@@ -1,5 +1,6 @@
 import MoyoDbProofs.Main
 
+/-- Committed wire-format constants exported for cross-language checks. -/
 def derivedConstantsJson : String := r#"{
   "format_version": 1,
   "superblock_magic": "STKDB001",
@@ -39,6 +40,7 @@ def derivedConstantsJson : String := r#"{
 }
 "#
 
+/-- Committed reference B-tree operation traces for implementation comparison. -/
 def btreeTracesJson : String := r#"{
   "scenarios": [
     {
@@ -1034,6 +1036,7 @@ def btreeTracesJson : String := r#"{
 }
 "#
 
+/-- Committed abstract WAL recovery cases. -/
 def walRecoveryJson : String := r#"{
   "scenarios": [
     {
@@ -1076,6 +1079,7 @@ def walRecoveryJson : String := r#"{
 }
 "#
 
+/-- Committed transaction serialization and readonly snapshot cases. -/
 def txnJson : String := r#"{
   "scenarios": [
     {
@@ -1130,6 +1134,7 @@ def txnJson : String := r#"{
 }
 "#
 
+/-- Write the four deterministic reference artifacts to the sibling artifact directory. -/
 def writeArtifacts : IO Unit := do
   IO.FS.createDirAll "../artifacts"
   IO.FS.writeFile "../artifacts/derived_constants.json" derivedConstantsJson
@@ -1137,4 +1142,5 @@ def writeArtifacts : IO Unit := do
   IO.FS.writeFile "../artifacts/wal_recovery_traces.json" walRecoveryJson
   IO.FS.writeFile "../artifacts/txn_serialization_traces.json" txnJson
 
+/-- Run this module's command-line entry point. -/
 def main : IO Unit := writeArtifacts

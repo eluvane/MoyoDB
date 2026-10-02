@@ -28,17 +28,19 @@ import {
     createIndexKeyExtractor,
     decodeIndexEntryKey,
     decodeIndexMetadataValue,
+    decodeIndexedDocument,
     encodeIndexEntryKey,
     encodeIndexMetadataKey,
     encodeIndexMetadataValue,
     extractLogicalIndexKey,
+    extractLogicalIndexKeyFromDocument,
     findIndexDefinition,
     indexKeyExactRange,
     indexRangeToPhysicalRange,
-    indexesForStore,
     isInternalStoreName,
     normalizeIndexDefinitions,
     toPublicIndexDefinitions,
+    type DecodedIndexEntryKey,
     type NormalizedIndexDef
 } from './indexing';
 import type { AutocommitCommand, IndexScanPage, WorkerApi, WorkerOpenRequest } from './worker-api';
@@ -124,6 +126,7 @@ type WasmEngine = {
     recover(): WasmRecoveryReport;
     checkpoint(): void;
     compact_into(target: WasmEngine): WasmU64;
+    compact_into_skipping_stores(target: WasmEngine, skipStores: string[]): WasmU64;
     change_feed_policy(): WasmChangeFeedPolicy;
     set_change_feed_policy(txId: WasmU64, policy: { enabled: boolean; retainTxids: number | null }): void;
     begin_tx(mode: TxMode): WasmU64;
@@ -138,6 +141,8 @@ type WasmEngine = {
     get_many_packed(txId: WasmU64, store: string, keys: Uint8Array): Uint8Array;
     /** Key metadata only; the value is never materialized. */
     has(txId: WasmU64, store: string, key: Uint8Array): boolean;
+    /** Optional for SDK compatibility with older bindings. */
+    has_many?(txId: WasmU64, store: string, keys: Array<Uint8Array>): boolean[];
     /** Returns whether a live value existed before the write. */
     put(txId: WasmU64, store: string, key: Uint8Array, value: Uint8Array, options?: unknown): boolean;
     put_many(txId: WasmU64, store: string, entries: Array<[Uint8Array, Uint8Array]>, options?: unknown): boolean[];
@@ -240,7 +245,10 @@ const EMPTY_VALUE = new Uint8Array(0);
 const MAX_ENGINE_KEY_BYTES = 1024;
 const INDEX_SCAN_PAGE_ROWS = 256;
 const INDEX_SCAN_RAW_CHUNK_ROWS = 512;
+const RECONCILE_DOCUMENT_CACHE_BYTES = 4 * 1024 * 1024;
+const RECONCILE_DOCUMENT_CACHE_ROWS = 4096;
 const HEX_BYTE_STRINGS = Array.from({ length: 256 }, (_value, byte) => byte.toString(16).padStart(2, '0'));
+const COMPRESSED_READ_CONCURRENCY = 8;
 function getOrInsert<K, V>(map: Map<K, V>, key: K, create: () => V): V {
     const existing = map.get(key);
     if (existing !== undefined) {
@@ -334,6 +342,9 @@ class MainThreadPersistenceBridge {
         });
     }
     private handleInitMessage = (event: MessageEvent<unknown>) => {
+        if (event.origin !== '' && event.origin !== self.location.origin) {
+            return;
+        }
         const data = event.data as {
             type?: string;
         } | null;
@@ -568,6 +579,8 @@ class DbWorker implements WorkerApi {
      * `begin`, replaced by `reconcileIndexes`. Never mutated in place.
      */
     private txIndexSchemas = new Map<number, NormalizedIndexDef[]>();
+    private indexesBySchema = new WeakMap<NormalizedIndexDef[], Map<string, NormalizedIndexDef[]>>();
+    private txEnsuredRawStores = new Map<number, Set<string>>();
     private txIndexSchemaChanged = new Set<number>();
     private txStoreCompression = new Map<number, StoreCompressionSnapshot>();
     private committedIndexes: NormalizedIndexDef[] | null = null;
@@ -787,6 +800,7 @@ class DbWorker implements WorkerApi {
     }
     createStore(txId: number, name: string, options: CreateStoreOptions = {}): Promise<void> {
         const compression = options.compression ?? false;
+        this.txEnsuredRawStores.get(txId)?.delete(name);
         this.withEngine((engine) => engine.create_store(toWasmU64(txId), name, { compression }));
         this.recordStoreCompressionCreate(txId, name, compression);
         this.ensureInternalStoresForStore(txId, name);
@@ -795,6 +809,7 @@ class DbWorker implements WorkerApi {
     }
     dropStore(txId: number, name: string): Promise<void> {
         const defs = this.indexesForStoreInTx(txId, name);
+        this.txEnsuredRawStores.get(txId)?.delete(name);
         this.withEngine((engine) => engine.drop_store(toWasmU64(txId), name));
         this.recordStoreCompressionDrop(txId, name);
         for (const def of defs) {
@@ -805,6 +820,7 @@ class DbWorker implements WorkerApi {
     }
     clearStore(txId: number, name: string): Promise<void> {
         const defs = this.indexesForStoreInTx(txId, name);
+        this.txEnsuredRawStores.get(txId)?.delete(name);
         this.withEngine((engine) => engine.clear_store(toWasmU64(txId), name));
         for (const def of defs) {
             this.clearRawStoreIfExists(txId, def.internalStore);
@@ -817,14 +833,16 @@ class DbWorker implements WorkerApi {
     }
     async getMany(txId: number, store: string, keys: Array<Uint8Array>): Promise<Array<Uint8Array | null>> {
         const values = this.withEngine((engine) => engine.get_many(toWasmU64(txId), store, keys));
-        if (isInternalStoreName(store) || this.storeCompressionForTx(txId, store) === false) {
-            return values.map((value) => (value === null ? null : normalizeWasmBytes(value)));
+        const compressed = !isInternalStoreName(store) && this.storeCompressionForTx(txId, store) !== false;
+        // The binding owns this result array. Normalize every borrowed view
+        // before any decoder suspends, including values queued behind the pool.
+        for (let index = 0; index < values.length; index += 1) {
+            const value = values[index];
+            if (value !== null) {
+                values[index] = normalizeWasmBytes(value);
+            }
         }
-        return Promise.all(
-            values.map(async (value) =>
-                value === null ? null : this.decodeStoreValue(txId, store, normalizeWasmBytes(value))
-            )
-        );
+        return compressed ? this.decodeStoreValues(txId, store, values) : values;
     }
     async getManyPacked(
         txId: number,
@@ -838,11 +856,9 @@ class DbWorker implements WorkerApi {
             // Raw values go back to the caller in the engine's own layout.
             return packedOptionalValues(packed);
         }
-        return Promise.all(
-            unpackPackedOptionalValues(packed).map(async (value) =>
-                value === null ? null : this.decodeStoreValue(txId, store, value)
-            )
-        );
+        // These views belong to the private normalized packet; queued decoders
+        // retain it until all active work completes.
+        return this.decodeStoreValues(txId, store, unpackPackedOptionalValues(packed));
     }
     has(txId: number, store: string, key: Uint8Array): Promise<boolean> {
         return Promise.resolve(this.withEngine((engine) => engine.has(toWasmU64(txId), store, key)));
@@ -1189,13 +1205,82 @@ class DbWorker implements WorkerApi {
             }
         }
         this.clearRawStoreIfExists(txId, INDEX_METADATA_STORE);
+        let documentStore: string | null = null;
+        let cachedBytes = 0;
+        let sourceRows: ScanItem[] | null = null;
+        const canRefreshVisibility = typeof this.engine?.has_many === 'function';
+        const documents = new Map<string, { bytes: Uint8Array; inputBytes: number; document: unknown }>();
         for (const def of target) {
+            if (documentStore !== def.store) {
+                documents.clear();
+                cachedBytes = 0;
+                sourceRows = null;
+                documentStore = def.store;
+            }
             this.ensureRawStore(txId, def.internalStore);
             this.clearRawStoreIfExists(txId, def.internalStore);
             if (this.rawStoreExistsInTx(txId, def.store)) {
-                const rows = await this.readStoreScan(txId, def.store, EMPTY_RANGE);
+                let rows: ScanItem[];
+                if (sourceRows !== null) {
+                    // The scheduler serializes this transaction's commands.
+                    // Source keys/bytes are immutable here; only TTL changes.
+                    // One native call observes a fresh timestamp and stages
+                    // expiry before this index's first document validation.
+                    const visible = this.withEngine((engine) =>
+                        engine.has_many!(
+                            toWasmU64(txId),
+                            def.store,
+                            sourceRows!.map((row) => row.key)
+                        )
+                    );
+                    if (visible.length !== sourceRows.length) {
+                        throw remoteError(
+                            'InternalError',
+                            `has_many outcome count mismatch: ${visible.length} != ${sourceRows.length}`
+                        );
+                    }
+                    rows = sourceRows.filter((_row, index) => visible[index]);
+                } else {
+                    // Old bindings and larger sources retain fresh full scans.
+                    rows = await this.readStoreScan(txId, def.store, EMPTY_RANGE);
+                    if (canRefreshVisibility && rows.length <= RECONCILE_DOCUMENT_CACHE_ROWS) {
+                        let inputBytes = 0;
+                        for (const row of rows) {
+                            inputBytes += row.key.byteLength + row.value.byteLength;
+                            if (inputBytes > RECONCILE_DOCUMENT_CACHE_BYTES) {
+                                break;
+                            }
+                        }
+                        if (inputBytes <= RECONCILE_DOCUMENT_CACHE_BYTES) {
+                            // This shares owned buffers with the JSON cache;
+                            // it does not retain a second copy of each value.
+                            sourceRows = rows;
+                        }
+                    }
+                }
                 for (const row of rows) {
-                    const logicalKey = extractLogicalIndexKey(def, row.value);
+                    const token = bytesToHex(row.key);
+                    const cached = documents.get(token);
+                    let document: unknown;
+                    if (cached && (cached.bytes === row.value || bytesEqual(cached.bytes, row.value))) {
+                        document = cached.document;
+                        cached.bytes = row.value;
+                    } else {
+                        document = decodeIndexedDocument(row.value);
+                        const previousBytes = cached?.inputBytes ?? 0;
+                        const inputBytes = row.key.byteLength + row.value.byteLength;
+                        if (
+                            (cached || documents.size < RECONCILE_DOCUMENT_CACHE_ROWS) &&
+                            cachedBytes - previousBytes + inputBytes <= RECONCILE_DOCUMENT_CACHE_BYTES
+                        ) {
+                            documents.set(token, { bytes: row.value, inputBytes, document });
+                            cachedBytes += inputBytes - previousBytes;
+                        } else if (cached) {
+                            documents.delete(token);
+                            cachedBytes -= previousBytes;
+                        }
+                    }
+                    const logicalKey = extractLogicalIndexKeyFromDocument(def, document);
                     if (logicalKey === null) {
                         continue;
                     }
@@ -1238,10 +1323,16 @@ class DbWorker implements WorkerApi {
             if (allowedStores && !allowedStores.has(change.store)) {
                 continue;
             }
-            const key = normalizeWasmBytes(change.key);
+            const key =
+                options.limit === undefined || changes.length < options.limit ? normalizeWasmBytes(change.key) : null;
             let value: Uint8Array | undefined;
             if (change.value !== undefined) {
+                // Keep validating the visible tail: an output limit has never
+                // suppressed its value-record corruption errors.
                 value = await this.decodeStoreValueForFeed(change.store, normalizeWasmBytes(change.value));
+            }
+            if (key === null) {
+                continue;
             }
             changes.push({
                 txId: fromWasmU64(change.txId),
@@ -1253,7 +1344,7 @@ class DbWorker implements WorkerApi {
         }
         return {
             latestTxId: fromWasmU64(feed.latestTxId),
-            changes: options.limit === undefined ? changes : changes.slice(0, options.limit)
+            changes
         };
     }
     setSchemaVersion(txId: number, version: number): Promise<void> {
@@ -1422,7 +1513,16 @@ class DbWorker implements WorkerApi {
                 cache_pages: this.currentCachePages()
             });
             const target = rebuiltEngine;
-            this.withEngine((engine) => engine.compact_into(target), { allowDuringMaintenance: true });
+            this.withEngine(
+                (engine) =>
+                    operation === 'rebuild'
+                        ? engine.compact_into_skipping_stores(target, [
+                              ...defs.map((def) => def.internalStore),
+                              INDEX_METADATA_STORE
+                          ])
+                        : engine.compact_into(target),
+                { allowDuringMaintenance: true }
+            );
             if (operation === 'rebuild' && defs.length > 0) {
                 // compact copies index entries as they are; rebuild regenerates
                 // them from the rows so stale entries do not survive.
@@ -1518,6 +1618,7 @@ class DbWorker implements WorkerApi {
         this.txChanges.delete(txId);
         this.txModes.delete(txId);
         this.txIndexSchemas.delete(txId);
+        this.txEnsuredRawStores.delete(txId);
         this.txIndexSchemaChanged.delete(txId);
         this.txStoreCompression.delete(txId);
     }
@@ -1815,21 +1916,68 @@ class DbWorker implements WorkerApi {
         if (isInternalStoreName(store) || this.storeCompressionForTx(txId, store) === false) {
             return rows;
         }
-        return await Promise.all(
-            rows.map(async (row) => ({
-                key: row.key,
-                value: await this.decodeStoreValue(txId, store, row.value)
-            }))
-        );
+        const values = rows.map((row) => row.value);
+        await this.decodeStoreValues(txId, store, values);
+        for (let index = 0; index < rows.length; index += 1) {
+            rows[index].value = values[index];
+        }
+        return rows;
+    }
+    private async decodeStoreValues(
+        txId: number,
+        store: string,
+        values: Array<Uint8Array | null>
+    ): Promise<Array<Uint8Array | null>> {
+        const state = { next: 0, failed: false, failure: undefined as unknown };
+        const decodeNext = async (): Promise<void> => {
+            while (!state.failed && state.next < values.length) {
+                const index = state.next++;
+                const value = values[index];
+                if (value === null) {
+                    continue;
+                }
+                try {
+                    values[index] = await this.decodeStoreValue(txId, store, value);
+                } catch (error) {
+                    if (!state.failed) {
+                        state.failed = true;
+                        state.failure = error;
+                    }
+                }
+            }
+        };
+        // Drain started decoders before publishing a failure. This preserves
+        // its original error and leaves no work running behind a rejected read.
+        await Promise.all(Array.from({ length: Math.min(COMPRESSED_READ_CONCURRENCY, values.length) }, decodeNext));
+        if (state.failed) {
+            throw state.failure;
+        }
+        return values;
     }
     private indexesForStoreInTx(txId: number, store: string): NormalizedIndexDef[] {
-        return indexesForStore(this.indexSchemaForTx(txId), store);
+        // Schema arrays are immutable and shared by transactions at begin.
+        // A schema replacement gets its own lookup; old readers keep theirs.
+        const schema = this.indexSchemaForTx(txId);
+        let byStore = this.indexesBySchema.get(schema);
+        if (!byStore) {
+            byStore = new Map<string, NormalizedIndexDef[]>();
+            for (const def of schema) {
+                const defs = byStore.get(def.store);
+                if (defs) {
+                    defs.push(def);
+                } else {
+                    byStore.set(def.store, [def]);
+                }
+            }
+            this.indexesBySchema.set(schema, byStore);
+        }
+        return byStore.get(store) ?? [];
     }
     private resolveIndexDefinition(txId: number, store: string, indexName: string): NormalizedIndexDef {
         if (!this.rawStoreExistsInTx(txId, store)) {
             throw remoteError('StoreNotFoundError', `store not found: ${store}`);
         }
-        const def = findIndexDefinition(this.indexSchemaForTx(txId), store, indexName);
+        const def = findIndexDefinition(this.indexesForStoreInTx(txId, store), store, indexName);
         if (!def) {
             throw remoteError('IndexNotFoundError', `index not found: ${store}.${indexName}`);
         }
@@ -1881,16 +2029,29 @@ class DbWorker implements WorkerApi {
         }
     }
     private ensureRawStore(txId: number, store: string): void {
+        const cacheable = this.txModes.get(txId) === 'readwrite';
+        if (cacheable && this.txEnsuredRawStores.get(txId)?.has(store)) {
+            return;
+        }
         this.ignoreNamedError('StoreExistsError', () => {
             this.withEngine((engine) => engine.create_store(toWasmU64(txId), store));
         });
+        if (cacheable) {
+            getOrInsert(this.txEnsuredRawStores, txId, () => new Set<string>()).add(store);
+        }
     }
     private clearRawStoreIfExists(txId: number, store: string): void {
-        this.ignoreNamedError('StoreNotFoundError', () => {
+        try {
             this.withEngine((engine) => engine.clear_store(toWasmU64(txId), store));
-        });
+        } catch (error) {
+            if (!isNamedError(error, 'StoreNotFoundError')) {
+                throw error;
+            }
+            this.txEnsuredRawStores.get(txId)?.delete(store);
+        }
     }
     private dropRawStoreIfExists(txId: number, store: string): void {
+        this.txEnsuredRawStores.get(txId)?.delete(store);
         this.ignoreNamedError('StoreNotFoundError', () => {
             this.withEngine((engine) => engine.drop_store(toWasmU64(txId), store));
         });
@@ -1909,10 +2070,13 @@ class DbWorker implements WorkerApi {
     }
     private readRawScan(txId: number, store: string, range: Range): ScanItem[] {
         const rows = this.withEngine((engine) => engine.scan(toWasmU64(txId), store, toWasmRange(range))) as ScanItem[];
-        return rows.map((row) => ({
-            key: normalizeWasmBytes(row.key),
-            value: normalizeWasmBytes(row.value)
-        }));
+        // wasm-bindgen creates a fresh array and fresh row objects for this
+        // scan, so normalization can retain both ownership containers.
+        for (const row of rows) {
+            row.key = normalizeWasmBytes(row.key);
+            row.value = normalizeWasmBytes(row.value);
+        }
+        return rows;
     }
     private putRawValue(txId: number, store: string, key: Uint8Array, value: Uint8Array): void {
         this.withEngine((engine) => engine.put(toWasmU64(txId), store, key, value));
@@ -1947,26 +2111,44 @@ class DbWorker implements WorkerApi {
         if (!def.unique) {
             return;
         }
-        const rows = this.readRawScan(txId, def.internalStore, indexKeyExactRange(logicalKey));
-        for (const row of rows) {
-            const decoded = decodeIndexEntryKey(row.key);
-            if (bytesEqual(decoded.primaryKey, primaryKey)) {
-                continue;
+        const physical = indexKeyExactRange(logicalKey);
+        let cursor: Uint8Array | null = null;
+        let chunkLimit = 1;
+        for (;;) {
+            const range: Range = { ...physical, limit: chunkLimit };
+            if (cursor !== null) {
+                range.gt = cursor;
+                delete range.gte;
             }
-            const value = await this.readStoreValue(txId, def.store, decoded.primaryKey);
-            if (value === null) {
-                this.cleanupStaleIndexRow(txId, def, row.key);
-                continue;
+            // A live conflict decides the operation. Do not materialize an
+            // unrelated tail; grow bounded chunks only while skipping rows.
+            const rows = this.readRawScan(txId, def.internalStore, range);
+            for (const row of rows) {
+                cursor = row.key;
+                const decoded = decodeIndexEntryKey(row.key);
+                if (bytesEqual(decoded.primaryKey, primaryKey)) {
+                    continue;
+                }
+                // Readwrite TTL cleanup and document errors stay in row order.
+                const value = await this.readStoreValue(txId, def.store, decoded.primaryKey);
+                if (value === null) {
+                    this.cleanupStaleIndexRow(txId, def, row.key);
+                    continue;
+                }
+                const currentLogicalKey = extractLogicalIndexKey(def, value);
+                if (currentLogicalKey === null || !bytesEqual(currentLogicalKey, logicalKey)) {
+                    this.cleanupStaleIndexRow(txId, def, row.key);
+                    continue;
+                }
+                throw remoteError(
+                    'UniqueIndexConstraintError',
+                    `unique index constraint violation on ${def.store}.${def.name}`
+                );
             }
-            const currentLogicalKey = extractLogicalIndexKey(def, value);
-            if (currentLogicalKey === null || !bytesEqual(currentLogicalKey, logicalKey)) {
-                this.cleanupStaleIndexRow(txId, def, row.key);
-                continue;
+            if (rows.length < chunkLimit) {
+                return;
             }
-            throw remoteError(
-                'UniqueIndexConstraintError',
-                `unique index constraint violation on ${def.store}.${def.name}`
-            );
+            chunkLimit = Math.min(INDEX_SCAN_RAW_CHUNK_ROWS, chunkLimit * 2);
         }
     }
     /**
@@ -1992,10 +2174,7 @@ class DbWorker implements WorkerApi {
         // row when a getByIndex/limit=1 must walk a long expired prefix.
         let staleChunkFloor = 1;
         for (;;) {
-            const chunkLimit = Math.min(
-                INDEX_SCAN_RAW_CHUNK_ROWS,
-                Math.max(limit - visible.length, staleChunkFloor)
-            );
+            const chunkLimit = Math.min(INDEX_SCAN_RAW_CHUNK_ROWS, Math.max(limit - visible.length, staleChunkFloor));
             const chunkRange: Range = { ...physical, limit: chunkLimit };
             if (resumeAfter !== null) {
                 if (reverse) {
@@ -2016,9 +2195,28 @@ class DbWorker implements WorkerApi {
                 throw error;
             }
             const visibleBefore = visible.length;
-            for (const row of rawRows) {
+            let batchStart = 0;
+            let batchEnd = 0;
+            let batch: ReturnType<DbWorker['readIndexPrimaryValues']> = null;
+            for (let index = 0; index < rawRows.length; index += 1) {
+                if (index === batchEnd) {
+                    batchStart = index;
+                    // A stale chunk can be larger than the remaining demand.
+                    // Never read primary values past the next possible limit.
+                    batchEnd = Math.min(rawRows.length, index + limit - visible.length);
+                    batch = this.readIndexPrimaryValues(txId, def, rawRows, batchStart, batchEnd);
+                }
+                const row = rawRows[index];
                 resumeAfter = row.key;
-                const resolved = await this.resolveVisibleIndexedRow(txId, def, row.key);
+                const resolved = batch
+                    ? await this.resolveVisibleIndexedValue(
+                          txId,
+                          def,
+                          row.key,
+                          batch.entries[index - batchStart],
+                          batch.values[index - batchStart]
+                      )
+                    : await this.resolveVisibleIndexedRow(txId, def, row.key);
                 if (!resolved) {
                     continue;
                 }
@@ -2034,24 +2232,70 @@ class DbWorker implements WorkerApi {
                 visible.length === visibleBefore ? Math.min(INDEX_SCAN_RAW_CHUNK_ROWS, chunkLimit * 2) : 1;
         }
     }
+    private readIndexPrimaryValues(
+        txId: number,
+        def: NormalizedIndexDef,
+        rows: ScanItem[],
+        start: number,
+        end: number
+    ): { entries: DecodedIndexEntryKey[]; values: Array<Uint8Array | null> } | null {
+        // Readwrite lookups may stage TTL expiry; keep their original row order.
+        if (this.txModes.get(txId) !== 'readonly' || end - start <= 1) {
+            return null;
+        }
+        let entries: DecodedIndexEntryKey[];
+        let values: Array<Uint8Array | null>;
+        try {
+            entries = rows.slice(start, end).map((row) => decodeIndexEntryKey(row.key));
+            values = this.withEngine((engine) =>
+                engine.get_many(
+                    toWasmU64(txId),
+                    def.store,
+                    entries.map((entry) => entry.primaryKey)
+                )
+            );
+        } catch {
+            // Readonly speculation has no transaction writes. Replay scalar
+            // reads so an earlier document error still precedes a later read
+            // or malformed-key error, as it does on the sequential path.
+            return null;
+        }
+        if (values.length !== entries.length) {
+            throw remoteError(
+                'InternalError',
+                `get_many outcome count mismatch: ${values.length} != ${entries.length}`
+            );
+        }
+        return { entries, values };
+    }
     private async resolveVisibleIndexedRow(
         txId: number,
         def: NormalizedIndexDef,
         physicalKey: Uint8Array
     ): Promise<ScanItem | null> {
         const decoded = decodeIndexEntryKey(physicalKey);
-        const value = await this.readStoreValue(txId, def.store, decoded.primaryKey);
-        if (value === null) {
+        const value = this.readRawValue(txId, def.store, decoded.primaryKey);
+        return this.resolveVisibleIndexedValue(txId, def, physicalKey, decoded, value);
+    }
+    private async resolveVisibleIndexedValue(
+        txId: number,
+        def: NormalizedIndexDef,
+        physicalKey: Uint8Array,
+        decoded: DecodedIndexEntryKey,
+        rawValue: Uint8Array | null
+    ): Promise<ScanItem | null> {
+        if (rawValue === null) {
             this.cleanupStaleIndexRow(txId, def, physicalKey);
             return null;
         }
+        const value = await this.decodeStoreValue(txId, def.store, normalizeWasmBytes(rawValue));
         const currentLogicalKey = extractLogicalIndexKey(def, value);
         if (currentLogicalKey === null || !bytesEqual(currentLogicalKey, decoded.logicalKey)) {
             this.cleanupStaleIndexRow(txId, def, physicalKey);
             return null;
         }
         return {
-            key: decoded.primaryKey.slice(),
+            key: decoded.primaryKey,
             value
         };
     }
@@ -2111,6 +2355,7 @@ class DbWorker implements WorkerApi {
         this.txChanges.clear();
         this.txModes.clear();
         this.txIndexSchemas.clear();
+        this.txEnsuredRawStores.clear();
         this.txIndexSchemaChanged.clear();
         this.txStoreCompression.clear();
     }

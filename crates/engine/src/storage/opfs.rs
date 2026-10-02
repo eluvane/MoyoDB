@@ -8,7 +8,7 @@ use crate::storage::backend::{FileBackend, FileSet};
 #[cfg(target_arch = "wasm32")]
 mod wasm_impl {
     use super::*;
-    use js_sys::{Promise, Uint8Array};
+    use js_sys::Promise;
     use serde::Deserialize;
     use wasm_bindgen::prelude::*;
     use wasm_bindgen_futures::JsFuture;
@@ -47,12 +47,12 @@ mod wasm_impl {
         #[wasm_bindgen(catch)]
         fn opfsRemoveDb(encoded_db_name: &str) -> std::result::Result<Promise, JsValue>;
         #[wasm_bindgen(catch)]
-        fn opfsReadAt(
+        fn opfsReadAtInto(
             session_id: u32,
             file_kind: u32,
             offset: u64,
-            len: usize,
-        ) -> std::result::Result<Uint8Array, JsValue>;
+            bytes: &mut [u8],
+        ) -> std::result::Result<u32, JsValue>;
         #[wasm_bindgen(catch)]
         fn opfsWriteAt(
             session_id: u32,
@@ -191,14 +191,17 @@ mod wasm_impl {
 
     impl FileBackend for OpfsBackend {
         fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
-            let bytes = opfsReadAt(self.session_id, self.file_kind, offset, len).map_err(js_err)?;
-            if bytes.length() as usize != len {
+            let mut bytes = vec![0u8; len];
+            // An outgoing mutable slice is a synchronous view of this owned
+            // WASM buffer. The shim must not retain it or call back into WASM.
+            let read = opfsReadAtInto(self.session_id, self.file_kind, offset, &mut bytes)
+                .map_err(js_err)?;
+            if read as usize > len {
                 return Err(EngineError::Storage(format!(
-                    "opfs short read buffer: expected {len}, got {}",
-                    bytes.length()
+                    "opfs read exceeded buffer: expected at most {len}, got {read}"
                 )));
             }
-            Ok(bytes.to_vec())
+            Ok(bytes)
         }
 
         fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {

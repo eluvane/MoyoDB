@@ -78,7 +78,9 @@ fn seed_catalog(store_count: usize, feed: bool) -> Engine<moyodb_engine::MemoryB
         )
         .unwrap();
     for index in 0..store_count {
-        engine.create_store(tx, &format!("store-{index:08}")).unwrap();
+        engine
+            .create_store(tx, &format!("store-{index:08}"))
+            .unwrap();
     }
     engine.put(tx, "store-00000000", b"key", b"before").unwrap();
     engine.commit_tx(tx).unwrap();

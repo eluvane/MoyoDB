@@ -46,6 +46,76 @@ fn snapshot_semantics_hold() {
 }
 
 #[test]
+fn missing_deletes_keep_roots_and_still_commit() -> Result<(), EngineError> {
+    let (_bundle, mut engine) = common::open_memory_engine("txn-missing-delete");
+    let seed = engine.begin_tx(TxMode::Readwrite)?;
+    engine.create_store(seed, "kv")?;
+    engine.put(seed, "kv", b"kept", b"original")?;
+    engine.commit_tx(seed)?;
+    let root_before = engine
+        .catalog()
+        .get("kv")
+        .ok_or_else(|| EngineError::Internal("missing seed store".into()))?
+        .store_root_page_id;
+    let stats_before = engine.stats()?;
+    let reader = engine.begin_tx(TxMode::Readonly)?;
+    let writer = engine.begin_tx(TxMode::Readwrite)?;
+    assert!(!engine.delete(writer, "kv", b"missing")?);
+    assert!(!engine.delete(writer, "kv", b"missing")?);
+    let committed = engine.commit_tx(writer)?;
+    let stats_after = engine.stats()?;
+    assert!(committed > stats_before.last_committed_txid);
+    assert_eq!(
+        stats_after.catalog_root_page_id,
+        stats_before.catalog_root_page_id
+    );
+    let root_after = engine
+        .catalog()
+        .get("kv")
+        .ok_or_else(|| EngineError::Internal("missing seed store".into()))?
+        .store_root_page_id;
+    assert_eq!(root_after, root_before);
+    assert_eq!(
+        engine.get(reader, "kv", b"kept")?,
+        Some(b"original".to_vec())
+    );
+    engine.rollback_tx(reader)?;
+    Ok(())
+}
+
+#[test]
+fn absent_delete_preserves_staged_ttl_cleanup_and_later_puts() -> Result<(), EngineError> {
+    let (_bundle, mut engine) = common::open_memory_engine("txn-delete-expired-stage");
+    let seed = engine.begin_tx(TxMode::Readwrite)?;
+    engine.create_store(seed, "kv")?;
+    engine.put(seed, "kv", b"expired", b"original")?;
+    engine.commit_tx(seed)?;
+    let reader = engine.begin_tx(TxMode::Readonly)?;
+    let writer = engine.begin_tx(TxMode::Readwrite)?;
+    engine.put_with_ttl(writer, "kv", b"expired", b"temporary", Some(0))?;
+    assert!(!engine.delete(writer, "kv", b"expired")?);
+    assert!(!engine.delete(writer, "kv", b"expired")?);
+    engine.put(writer, "kv", b"later", b"temporary")?;
+    assert!(engine.delete(writer, "kv", b"later")?);
+    assert!(!engine.delete(writer, "kv", b"later")?);
+    engine.put(writer, "kv", b"later", b"fresh")?;
+    engine.commit_tx(writer)?;
+    assert_eq!(
+        engine.get(reader, "kv", b"expired")?,
+        Some(b"original".to_vec())
+    );
+    engine.rollback_tx(reader)?;
+    let current = engine.begin_tx(TxMode::Readonly)?;
+    assert_eq!(engine.get(current, "kv", b"expired")?, None);
+    assert_eq!(
+        engine.get(current, "kv", b"later")?,
+        Some(b"fresh".to_vec())
+    );
+    engine.rollback_tx(current)?;
+    Ok(())
+}
+
+#[test]
 fn second_write_tx_is_rejected() {
     let (_bundle, mut engine) = common::open_memory_engine("txn-c");
     let tx = engine.begin_tx(TxMode::Readwrite).unwrap();

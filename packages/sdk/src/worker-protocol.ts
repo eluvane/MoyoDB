@@ -6,6 +6,10 @@ export const WORKER_PROTOCOL_VERSION = 1;
 export const WORKER_PROTOCOL_READY = 'moyodb:worker-protocol:ready';
 export const WORKER_PROTOCOL_REQUEST = 'moyodb:worker-protocol:request';
 export const WORKER_PROTOCOL_RESPONSE = 'moyodb:worker-protocol:response';
+export const WORKER_PROTOCOL_REQUEST_BATCH = 'moyodb:worker-protocol:request-batch';
+export const WORKER_PROTOCOL_RESPONSE_BATCH = 'moyodb:worker-protocol:response-batch';
+export const MAX_WORKER_BATCH_MESSAGES = 128;
+export const MAX_WORKER_BATCH_BYTES = 1024 * 1024;
 
 export const WORKER_COMMANDS = [
     'open',
@@ -136,6 +140,8 @@ interface PackedIndexScanPage {
 export type WorkerProtocolReadyMessage = {
     type: typeof WORKER_PROTOCOL_READY;
     version: typeof WORKER_PROTOCOL_VERSION;
+    /** Optional capability: peers without it continue using single messages. */
+    batching?: 1;
 };
 
 export type WorkerProtocolRequestMessage = {
@@ -147,6 +153,12 @@ export type WorkerProtocolRequestMessage = {
         args: PreparedWorkerCommandArgs<M>;
     };
 }[WorkerCommand];
+
+export interface WorkerProtocolRequestBatchMessage {
+    type: typeof WORKER_PROTOCOL_REQUEST_BATCH;
+    version: typeof WORKER_PROTOCOL_VERSION;
+    requests: WorkerProtocolRequestMessage[];
+}
 
 export interface SerializedWorkerError {
     name: string;
@@ -174,6 +186,12 @@ export interface WorkerProtocolErrorMessage {
 }
 
 export type WorkerProtocolResponseMessage = WorkerProtocolSuccessMessage | WorkerProtocolErrorMessage;
+
+export interface WorkerProtocolResponseBatchMessage {
+    type: typeof WORKER_PROTOCOL_RESPONSE_BATCH;
+    version: typeof WORKER_PROTOCOL_VERSION;
+    responses: WorkerProtocolResponseMessage[];
+}
 
 const WORKER_COMMAND_SET = new Set<string>(WORKER_COMMANDS);
 
@@ -208,11 +226,32 @@ export function isWorkerProtocolRequestMessage(value: unknown): value is WorkerP
     );
 }
 
+export function isWorkerProtocolRequestBatchMessage(value: unknown): value is WorkerProtocolRequestBatchMessage {
+    return isWorkerProtocolBatch(value, WORKER_PROTOCOL_REQUEST_BATCH, 'requests');
+}
+
+export function isWorkerProtocolResponseBatchMessage(value: unknown): value is WorkerProtocolResponseBatchMessage {
+    return isWorkerProtocolBatch(value, WORKER_PROTOCOL_RESPONSE_BATCH, 'responses');
+}
+
+function isWorkerProtocolBatch(value: unknown, type: string, items: string): boolean {
+    return (
+        isRecord(value) &&
+        value.type === type &&
+        value.version === WORKER_PROTOCOL_VERSION &&
+        Array.isArray(value[items]) &&
+        value[items].length > 0 &&
+        value[items].length <= MAX_WORKER_BATCH_MESSAGES
+    );
+}
+
 export function isWorkerProtocolEnvelope(value: unknown): value is { type: string; id?: unknown } {
     return (
         isRecord(value) &&
         (value.type === WORKER_PROTOCOL_REQUEST ||
             value.type === WORKER_PROTOCOL_RESPONSE ||
+            value.type === WORKER_PROTOCOL_REQUEST_BATCH ||
+            value.type === WORKER_PROTOCOL_RESPONSE_BATCH ||
             value.type === WORKER_PROTOCOL_READY)
     );
 }
@@ -235,6 +274,15 @@ export function serializeWorkerError(error: unknown): SerializedWorkerError {
 }
 
 export function deserializeWorkerError(error: SerializedWorkerError): Error {
+    if (
+        !isRecord(error) ||
+        typeof error.name !== 'string' ||
+        typeof error.message !== 'string' ||
+        (error.code !== undefined && typeof error.code !== 'string') ||
+        (error.stack !== undefined && typeof error.stack !== 'string')
+    ) {
+        throw workerProtocolError('WorkerProtocolError', 'invalid serialized worker error');
+    }
     const deserialized = new Error(error.message);
     deserialized.name = error.name || error.code || 'Error';
     if (error.stack) {
@@ -275,6 +323,34 @@ export function prepareWorkerCommandPayload<M extends WorkerCommand>(
                 args: [mode, inner, (prepared.args as unknown[]).slice(1)],
                 transfer: prepared.transfer
             };
+        }
+    }
+
+    if (
+        command === 'get' ||
+        command === 'has' ||
+        command === 'delete' ||
+        command === 'getByIndex' ||
+        command === 'put'
+    ) {
+        const keyIndex = command === 'getByIndex' ? 3 : 2;
+        let copiedArgs: unknown[] | null = null;
+        let transfer: Transferable[] | null = null;
+        for (let index = keyIndex; index <= (command === 'put' ? 3 : keyIndex); index += 1) {
+            const value = args[index];
+            if (
+                value instanceof Uint8Array &&
+                value.buffer instanceof ArrayBuffer &&
+                (value.byteOffset !== 0 || value.byteLength !== value.buffer.byteLength)
+            ) {
+                const owned = copyToOwnedUint8Array(value);
+                copiedArgs ??= [...args];
+                copiedArgs[index] = owned;
+                (transfer ??= []).push(owned.buffer);
+            }
+        }
+        if (copiedArgs !== null) {
+            return { args: copiedArgs, transfer: transfer ?? EMPTY_TRANSFERABLES };
         }
     }
 
@@ -545,6 +621,68 @@ export function collectTransferablesForValue(value: unknown): Transferable[] {
     const seen = new WeakSet<object>();
     collectTransferableBuffers(value, buffers, seen);
     return buffers.size === 0 ? EMPTY_TRANSFERABLES : Array.from(buffers);
+}
+
+/**
+ * Snapshot at the original postMessage point, before a batching microtask can
+ * observe further caller/API mutations. Newly prepared buffers move into this
+ * snapshot; ordinary caller buffers are cloned once and then moved on delivery.
+ */
+export function captureWorkerPayload<T>(
+    value: T,
+    transfer: Transferable[]
+): { value: T; transfer: Transferable[]; byteLength: number } {
+    const captured =
+        transfer.length > 0
+            ? structuredClone(value, { transfer: transfer.length === 1 ? transfer : Array.from(new Set(transfer)) })
+            : structuredClone(value);
+    const buffers = new Set<ArrayBuffer>();
+    const seen = new WeakSet<object>();
+    let byteLength = 0;
+    const visit = (item: unknown): void => {
+        if (typeof item === 'string') {
+            byteLength += 8 + item.length * 2;
+            return;
+        }
+        if (item === null || typeof item !== 'object') {
+            byteLength += 8;
+            return;
+        }
+        if (seen.has(item)) return;
+        seen.add(item);
+        byteLength += 8;
+        if (item instanceof ArrayBuffer) {
+            buffers.add(item);
+            byteLength += item.byteLength;
+        } else if (typeof SharedArrayBuffer !== 'undefined' && item instanceof SharedArrayBuffer) {
+            byteLength += item.byteLength;
+        } else if (ArrayBuffer.isView(item)) {
+            visit(item.buffer);
+        } else if (Array.isArray(item)) {
+            for (const child of item) visit(child);
+        } else if (item instanceof Map) {
+            for (const [key, child] of item) {
+                visit(key);
+                visit(child);
+            }
+        } else if (item instanceof Set) {
+            for (const child of item) visit(child);
+        } else {
+            const record = item as Record<string, unknown>;
+            for (const key in record) {
+                if (Object.prototype.hasOwnProperty.call(record, key)) {
+                    byteLength += 8 + key.length * 2;
+                    visit(record[key]);
+                }
+            }
+        }
+    };
+    visit(captured);
+    return {
+        value: captured,
+        transfer: buffers.size === 0 ? EMPTY_TRANSFERABLES : Array.from(buffers),
+        byteLength
+    };
 }
 
 function collectDirectBinaryTransferable(value: unknown): Transferable[] {

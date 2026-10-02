@@ -104,6 +104,15 @@ impl StoredValue {
         })
     }
 
+    pub(crate) fn decode_envelope_parts(prefix: &[u8], value: Vec<u8>) -> Result<Self> {
+        let expires_at_ms = decode_envelope_expiry(prefix)?;
+        validate_value(&value)?;
+        Ok(Self {
+            value,
+            expires_at_ms,
+        })
+    }
+
     pub fn decode_for_store(store_flags: u64, bytes: &[u8]) -> Result<Self> {
         if store_uses_system_raw_values(store_flags) {
             return Ok(Self::plain(bytes.to_vec()));

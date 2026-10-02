@@ -178,16 +178,24 @@ mod tests {
         ));
         assert_eq!(
             *wal.reads.borrow(),
-            vec![(0, READ_CHUNK_SIZE), (READ_CHUNK_SIZE as u64, READ_CHUNK_SIZE)]
+            vec![
+                (0, READ_CHUNK_SIZE),
+                (READ_CHUNK_SIZE as u64, READ_CHUNK_SIZE)
+            ]
         );
         assert!(reader.current.len() <= READ_CHUNK_SIZE);
-        assert!(reader.next.as_ref().is_none_or(|next| next.len() <= READ_CHUNK_SIZE));
+        assert!(reader
+            .next
+            .as_ref()
+            .is_none_or(|next| next.len() <= READ_CHUNK_SIZE));
         Ok(())
     }
 
     #[test]
     fn sequential_headers_and_records_do_not_reread_chunks() -> Result<()> {
-        let bytes: Vec<u8> = (0..READ_CHUNK_SIZE * 3 + 77).map(|i| (i * 17) as u8).collect();
+        let bytes: Vec<u8> = (0..READ_CHUNK_SIZE * 3 + 77)
+            .map(|i| (i * 17) as u8)
+            .collect();
         let wal = CountingBackend::new(MemoryBackend::from_durable(bytes.clone()));
         let mut reader = WalReadBuffer::new(&wal, bytes.len() as u64);
         let mut offset = 0usize;

@@ -836,10 +836,8 @@ export async function openDB(name: string, options: OpenOptions = {}): Promise<D
     await requestPersistentStorageOnOpen(normalizedOptions);
     const entry = await acquireDbWorker(dbName, normalizedOptions);
     const db = new DBImpl(entry);
-    let keepHandle = false;
     try {
         if (requestedVersion === undefined) {
-            keepHandle = true;
             return db;
         }
         const [currentVersion, currentIndexes] = await Promise.all([db.getVersion(), loadNormalizedIndexes(entry)]);
@@ -854,7 +852,6 @@ export async function openDB(name: string, options: OpenOptions = {}): Promise<D
                     `database ${dbName} is already at schema version ${currentVersion}, but the requested index catalog does not match the committed schema`
                 );
             }
-            keepHandle = true;
             return db;
         }
         if (entry.refs > 1) {
@@ -869,14 +866,11 @@ export async function openDB(name: string, options: OpenOptions = {}): Promise<D
         }
         const targetIndexes = requestedIndexes ?? currentIndexes;
         await db.runSchemaMigration(currentVersion, requestedVersion, migrate, toPublicIndexDefinitions(targetIndexes));
-        keepHandle = true;
         return db;
     } catch (error) {
-        if (!keepHandle) {
-            try {
-                await db.close();
-            } catch {}
-        }
+        try {
+            await db.close();
+        } catch {}
         throw normalizeError(error);
     }
 }

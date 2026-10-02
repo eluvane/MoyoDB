@@ -3,15 +3,19 @@ mod catalog_delta;
 #[cfg(test)]
 mod catalog_tests;
 
+#[cfg(test)]
+mod commit_work_tests;
+
 use crate::btree::{
     apply_mutations, build_catalog_tree, build_tree_from_sorted, collect_keys_below, free_tree,
-    lookup, lookup_prefix, materialize_pending_value, pending_value_prefix, BuiltTree, KvPair,
-    Mutation, PageAllocator, PageImages, PendingValue, RangeSpec, SortedTreeBuilder, TreeIter,
+    lookup_stored_value, lookup_value_expiry, materialize_pending_value, pending_value_prefix,
+    BuiltTree, KvPair, Mutation, PageAllocator, PageImages, PendingValue, PointReadBatch,
+    RangeSpec, SortedTreeBuilder, TreeIter,
 };
 use crate::bytes::{validate_key, validate_store_name, validate_value};
 use crate::catalog::{CatalogMap, CatalogState, ChangeFeedPolicy};
 use crate::change_feed::{
-    decode_change_record_payload, encode_after_txid_key, encode_change_log_key,
+    decode_change_record_payload_ref, encode_after_txid_key, encode_change_log_key,
     encode_change_record_payload, is_internal_store_name, normalize_store_filter,
     validate_user_store_name, visible_store_count, visible_store_names, ChangeFeed,
     ChangeFeedOptions, ChangeKind, CHANGELOG_STORE_FLAGS, SYSTEM_CHANGELOG_STORE_NAME,
@@ -34,10 +38,9 @@ use crate::txn::{
     TransactionState, TxInner,
 };
 use crate::value::{
-    decode_envelope_expiry, store_compression_from_flags, store_flags_for_user_store,
-    store_uses_system_raw_values, store_uses_value_envelope, stored_value_expired,
-    StoreCompression, StoredValue, STORE_FLAG_COMPRESSION_MASK, STORE_FLAG_VALUE_ENVELOPE_V1,
-    VALUE_ENVELOPE_HEADER_SIZE,
+    store_compression_from_flags, store_flags_for_user_store, store_uses_system_raw_values,
+    store_uses_value_envelope, stored_value_expired, StoreCompression, StoredValue,
+    STORE_FLAG_COMPRESSION_MASK, STORE_FLAG_VALUE_ENVELOPE_V1, VALUE_ENVELOPE_HEADER_SIZE,
 };
 use crate::wal::{append_transaction, CommitRecord};
 use catalog_delta::{CatalogDelta, CatalogUpdate};
@@ -457,7 +460,7 @@ impl<B: FileBackend> Engine<B> {
         self.txns.clear();
         self.write_tx_open = None;
         let checkpoint = if self.health == EngineHealth::Healthy {
-            self.checkpoint_inner()
+            self.checkpoint_inner(None)
         } else {
             Ok(())
         };
@@ -493,12 +496,12 @@ impl<B: FileBackend> Engine<B> {
     /// The WAL is truncated only when memory has applied every flushed commit.
     pub fn checkpoint(&mut self) -> Result<()> {
         self.ensure_healthy()?;
-        self.checkpoint_inner().inspect_err(|err| {
+        self.checkpoint_inner(None).inspect_err(|err| {
             self.poison(format!("checkpoint failed: {err}"), None);
         })
     }
 
-    fn checkpoint_inner(&mut self) -> Result<()> {
+    fn checkpoint_inner(&mut self, known_wal_len: Option<u64>) -> Result<()> {
         if !self.pager.has_dirty() {
             return Ok(());
         }
@@ -515,7 +518,10 @@ impl<B: FileBackend> Engine<B> {
             ));
         }
 
-        let wal_len = self.wal.len()?;
+        let wal_len = match known_wal_len {
+            Some(len) => len,
+            None => self.wal.len()?,
+        };
         let generation = self
             .superblock
             .generation
@@ -699,6 +705,7 @@ impl<B: FileBackend> Engine<B> {
                 }
                 stage.dropped = true;
                 stage.mutations.clear();
+                stage.has_expiring_mutations = Some(false);
                 return Ok(());
             }
             let base_meta = rw
@@ -725,6 +732,7 @@ impl<B: FileBackend> Engine<B> {
                 return Err(EngineError::StoreNotFound(name.into()));
             }
             stage.mutations.clear();
+            stage.has_expiring_mutations = Some(false);
             stage.cleared = true;
             Ok(())
         })();
@@ -777,6 +785,68 @@ impl<B: FileBackend> Engine<B> {
         result
     }
 
+    /// Checks a batch using one TTL timestamp and returns flags in input order.
+    /// Committed expiry cleanup is applied only after a successful batch.
+    pub fn has_many<K: AsRef<[u8]>>(
+        &mut self,
+        tx_id: u64,
+        store: &str,
+        keys: &[K],
+    ) -> Result<Vec<bool>> {
+        validate_store_name(store)?;
+        for key in keys {
+            validate_key(key.as_ref())?;
+        }
+        let now_ms = now_unix_ms()?;
+        let mut tx = self.take_tx(tx_id)?;
+        let mut order: Vec<usize> = (0..keys.len()).collect();
+        order.sort_by(|left, right| keys[*left].as_ref().cmp(keys[*right].as_ref()));
+        let mut batch = PointReadBatch::default();
+        let result = (|| match &mut tx.inner {
+            TxInner::Readonly(readonly) => {
+                let meta = readonly
+                    .snapshot
+                    .catalog
+                    .get(store)
+                    .ok_or_else(|| EngineError::StoreNotFound(store.into()))?;
+                read_many_in_order(keys, &order, |key| {
+                    exists_committed_visible_in_batch(
+                        &mut self.pager,
+                        meta.store_root_page_id,
+                        meta.flags,
+                        key,
+                        now_ms,
+                        Some(&mut batch),
+                    )
+                })
+            }
+            TxInner::Readwrite(rw) => {
+                ensure_readwrite_store_visible(rw, store)?;
+                if let Some(stage) = rw.stores.get_mut(store) {
+                    normalize_expired_stage_mutations(stage, now_ms);
+                }
+                let mut expired_base_keys = Vec::new();
+                let values = read_many_in_order(keys, &order, |key| {
+                    exists_with_staged_deferred_base(
+                        &mut self.pager,
+                        rw,
+                        store,
+                        key,
+                        now_ms,
+                        &mut batch,
+                        &mut expired_base_keys,
+                    )
+                })?;
+                for key in expired_base_keys {
+                    expire_staged_key(rw, store, &key)?;
+                }
+                Ok(values)
+            }
+        })();
+        self.put_tx(tx);
+        result
+    }
+
     pub fn get_many<K: AsRef<[u8]>>(
         &mut self,
         tx_id: u64,
@@ -789,42 +859,40 @@ impl<B: FileBackend> Engine<B> {
         }
         let now_ms = now_unix_ms()?;
         let mut tx = self.take_tx(tx_id)?;
-        // Sorted lookups walk neighbouring leaves back to back and hit the cache.
         let mut order: Vec<usize> = (0..keys.len()).collect();
         order.sort_by(|left, right| keys[*left].as_ref().cmp(keys[*right].as_ref()));
-        let result = (|| {
-            let mut values = vec![None; keys.len()];
-            match &mut tx.inner {
-                TxInner::Readonly(readonly) => {
-                    let meta = readonly
-                        .snapshot
-                        .catalog
-                        .get(store)
-                        .ok_or_else(|| EngineError::StoreNotFound(store.into()))?;
-                    for index in order {
-                        values[index] = get_committed_visible(
-                            &mut self.pager,
-                            meta.store_root_page_id,
-                            meta.flags,
-                            keys[index].as_ref(),
-                            now_ms,
-                        )?;
-                    }
-                }
-                TxInner::Readwrite(rw) => {
-                    ensure_readwrite_store_visible(rw, store)?;
-                    for index in order {
-                        values[index] = get_with_staged(
-                            &mut self.pager,
-                            rw,
-                            store,
-                            keys[index].as_ref(),
-                            now_ms,
-                        )?;
-                    }
-                }
+        let mut batch = PointReadBatch::default();
+        let result = (|| match &mut tx.inner {
+            TxInner::Readonly(readonly) => {
+                let meta = readonly
+                    .snapshot
+                    .catalog
+                    .get(store)
+                    .ok_or_else(|| EngineError::StoreNotFound(store.into()))?;
+                read_many_in_order(keys, &order, |key| {
+                    get_committed_visible_in_batch(
+                        &mut self.pager,
+                        meta.store_root_page_id,
+                        meta.flags,
+                        key,
+                        now_ms,
+                        Some(&mut batch),
+                    )
+                })
             }
-            Ok(values)
+            TxInner::Readwrite(rw) => {
+                ensure_readwrite_store_visible(rw, store)?;
+                read_many_in_order(keys, &order, |key| {
+                    get_with_staged_in_batch(
+                        &mut self.pager,
+                        rw,
+                        store,
+                        key,
+                        now_ms,
+                        Some(&mut batch),
+                    )
+                })
+            }
         })();
         self.put_tx(tx);
         result
@@ -1178,13 +1246,13 @@ impl<B: FileBackend> Engine<B> {
         while let Some(pair) = iter.next(&mut self.pager)? {
             let record_txid = decode_change_log_record_txid(&pair.key)?;
             let payload = materialize_pending_value(&mut self.pager, pair.value)?;
-            let record = decode_change_record_payload(record_txid, &payload)?;
+            let record = decode_change_record_payload_ref(&payload)?;
             if let Some(filter) = store_filter.as_ref() {
-                if !filter.contains(&record.store) {
+                if !filter.contains(record.store) {
                     continue;
                 }
             }
-            changes.push(record);
+            changes.push(record.into_owned(record_txid));
             if changes.len() >= limit {
                 break;
             }
@@ -1253,6 +1321,16 @@ impl<B: FileBackend> Engine<B> {
     /// Crash safety comes from the caller: the target generation is only
     /// published (control file swap) after this returns.
     pub fn compact_into(&mut self, target: &mut Engine<B>) -> Result<u64> {
+        self.compact_into_skipping_stores(target, &[])
+    }
+
+    /// Compacts into a fresh target, omitting only the explicitly named
+    /// internal stores. SDK rebuild uses this before regenerating its indexes.
+    pub fn compact_into_skipping_stores(
+        &mut self,
+        target: &mut Engine<B>,
+        skip_stores: &[String],
+    ) -> Result<u64> {
         self.ensure_healthy()?;
         target.ensure_healthy()?;
         if !self.txns.is_empty() || !target.txns.is_empty() {
@@ -1268,14 +1346,28 @@ impl<B: FileBackend> Engine<B> {
                 "compaction target must be a new, empty database".into(),
             ));
         }
-        let result = self.compact_into_inner(target);
+        let mut skipped_stores = std::collections::BTreeSet::new();
+        for name in skip_stores {
+            validate_store_name(name)?;
+            if !is_internal_store_name(name) {
+                return Err(EngineError::InvalidRange(format!(
+                    "only internal stores may be skipped during compaction: {name}"
+                )));
+            }
+            skipped_stores.insert(name.as_str());
+        }
+        let result = self.compact_into_inner(target, &skipped_stores);
         if let Err(err) = &result {
             target.poison(format!("compaction failed: {err}"), None);
         }
         result
     }
 
-    fn compact_into_inner(&mut self, target: &mut Engine<B>) -> Result<u64> {
+    fn compact_into_inner(
+        &mut self,
+        target: &mut Engine<B>,
+        skipped_stores: &std::collections::BTreeSet<&str>,
+    ) -> Result<u64> {
         let now_ms = now_unix_ms()?;
         let new_txid = self
             .superblock
@@ -1284,17 +1376,17 @@ impl<B: FileBackend> Engine<B> {
             .ok_or_else(|| EngineError::Internal("commit txid overflow".into()))?;
         let mut alloc = PageAllocator::new(target.superblock.next_page_id);
         let mut stores = CatalogMap::new();
-        // SDK-owned internal stores (secondary indexes, index metadata) are
-        // copied as they are; only the change log is left behind, and the
-        // target's feed floor is set past it.
-        let sources: Vec<(String, StoreMetadata)> = self
-            .catalog
-            .iter()
-            .filter(|(name, _)| name.as_str() != SYSTEM_CHANGELOG_STORE_NAME)
-            .map(|(name, meta)| (name.clone(), meta.clone()))
-            .collect();
-
-        for (name, meta) in sources {
+        let mut page_batch = Vec::with_capacity(crate::pager::PAGE_WRITE_BATCH_PAGES);
+        let mut page_buffer = Vec::new();
+        // Default compaction preserves every SDK-owned internal store. Rebuild
+        // may explicitly omit its known indexes; other internal stores survive.
+        // The change log is left behind, and the target's feed floor is past it.
+        for (name, meta) in self.catalog.iter() {
+            if name.as_str() == SYSTEM_CHANGELOG_STORE_NAME
+                || skipped_stores.contains(name.as_str())
+            {
+                continue;
+            }
             let mut builder = SortedTreeBuilder::new();
             let mut iter = TreeIter::new(
                 &mut self.pager,
@@ -1307,16 +1399,22 @@ impl<B: FileBackend> Engine<B> {
                 }
                 let value = materialize_pending_value(&mut self.pager, pair.value)?;
                 builder.push(&pair.key, &value, &mut alloc)?;
-                for (page_id, bytes) in builder.drain_images() {
-                    target.pager.write_page_image(page_id, &bytes)?;
-                }
+                queue_compaction_images(
+                    &mut target.pager,
+                    &mut page_batch,
+                    &mut page_buffer,
+                    builder.drain_images(),
+                )?;
             }
             let built = builder.finish(&mut alloc)?;
-            for (page_id, bytes) in &built.page_images {
-                target.pager.write_page_image(*page_id, bytes)?;
-            }
+            queue_compaction_images(
+                &mut target.pager,
+                &mut page_batch,
+                &mut page_buffer,
+                built.page_images,
+            )?;
             stores.insert(
-                name,
+                name.clone(),
                 StoreMetadata {
                     store_root_page_id: built.root_page_id,
                     created_txid: new_txid,
@@ -1332,9 +1430,15 @@ impl<B: FileBackend> Engine<B> {
             stores,
         };
         let catalog = build_catalog_tree(&catalog_state, &mut alloc)?;
-        for (page_id, bytes) in &catalog.page_images {
-            target.pager.write_page_image(*page_id, bytes)?;
-        }
+        queue_compaction_images(
+            &mut target.pager,
+            &mut page_batch,
+            &mut page_buffer,
+            catalog.page_images,
+        )?;
+        target
+            .pager
+            .write_page_images(&mut page_batch, &mut page_buffer)?;
         target.pager.flush()?;
 
         let generation = target
@@ -1568,7 +1672,7 @@ impl<B: FileBackend> Engine<B> {
         catalog_update.publish(&mut self.catalog);
         self.change_feed_floor_txid = final_change_feed_floor_txid;
         self.change_feed_policy = final_change_feed_policy;
-        if let Err(err) = self.maybe_checkpoint() {
+        if let Err(err) = self.maybe_checkpoint(wal_offset) {
             self.poison(
                 format!("checkpoint after commit failed: {err}"),
                 Some(new_txid),
@@ -1578,17 +1682,17 @@ impl<B: FileBackend> Engine<B> {
         Ok(new_txid)
     }
 
-    fn maybe_checkpoint(&mut self) -> Result<()> {
+    fn maybe_checkpoint(&mut self, wal_len: u64) -> Result<()> {
         if !self.pager.has_dirty() {
             return Ok(());
         }
         if !self.checkpoint_failpoint_armed()
             && self.pager.dirty_page_count() < self.checkpoint_dirty_pages
-            && self.wal.len()? < self.checkpoint_wal_bytes
+            && wal_len < self.checkpoint_wal_bytes
         {
             return Ok(());
         }
-        self.checkpoint_inner()
+        self.checkpoint_inner(Some(wal_len))
     }
 
     fn checkpoint_failpoint_armed(&self) -> bool {
@@ -1886,6 +1990,25 @@ fn rewrite_store_fully<B: FileBackend>(
     builder.finish(alloc)
 }
 
+fn queue_compaction_images<B: FileBackend>(
+    pager: &mut Pager<B>,
+    batch: &mut PageImages,
+    buffer: &mut Vec<u8>,
+    images: PageImages,
+) -> Result<()> {
+    for (page_id, bytes) in images {
+        if batch.len() == crate::pager::PAGE_WRITE_BATCH_PAGES
+            || batch
+                .last()
+                .is_some_and(|(previous, _)| previous.checked_add(1) != Some(page_id))
+        {
+            pager.write_page_images(batch, buffer)?;
+        }
+        batch.push((page_id, bytes));
+    }
+    Ok(())
+}
+
 fn plan_snapshot_apply(
     view: &CommittedView<'_>,
     snapshot: SnapshotContents,
@@ -2073,6 +2196,13 @@ fn collect_change_payloads<B: FileBackend>(
 fn ensure_stage_for_write<'a>(rw: &'a mut ReadwriteTx, store: &str) -> Result<&'a mut StagedStore> {
     use std::collections::btree_map::Entry;
 
+    if rw.stores.contains_key(store) {
+        return rw
+            .stores
+            .get_mut(store)
+            .ok_or_else(|| EngineError::StoreNotFound(store.into()));
+    }
+
     match rw.stores.entry(store.to_string()) {
         Entry::Occupied(entry) => Ok(entry.into_mut()),
         Entry::Vacant(vacant) => {
@@ -2129,11 +2259,49 @@ fn mark_key_expired(stage: &mut StagedStore, key: &[u8]) {
 }
 
 fn normalize_expired_stage_mutations(stage: &mut StagedStore, now_ms: u64) {
+    if stage.has_expiring_mutations == Some(false) {
+        return;
+    }
+    let mut has_expiring_mutations = false;
     for mutation in stage.mutations.values_mut() {
-        if matches!(mutation, MutationValue::Put(stored) if stored.is_expired_at(now_ms)) {
-            *mutation = MutationValue::Delete;
+        #[cfg(test)]
+        commit_work_tests::record_ttl_examination();
+        match mutation {
+            MutationValue::Put(stored) if stored.is_expired_at(now_ms) => {
+                *mutation = MutationValue::Delete;
+            }
+            MutationValue::Put(stored) => {
+                has_expiring_mutations |= stored.expires_at_ms.is_some();
+            }
+            MutationValue::Delete => {}
         }
     }
+    stage.has_expiring_mutations = Some(has_expiring_mutations);
+}
+
+/// Resolves equal sorted keys once, cloning only the independently owned
+/// output values. Reading each distinct key lazily preserves error precedence.
+fn read_many_in_order<K: AsRef<[u8]>, V: Clone + Default>(
+    keys: &[K],
+    order: &[usize],
+    mut read: impl FnMut(&[u8]) -> Result<V>,
+) -> Result<Vec<V>> {
+    let mut values = vec![V::default(); keys.len()];
+    let mut start = 0;
+    while start < order.len() {
+        let key = keys[order[start]].as_ref();
+        let mut end = start + 1;
+        while end < order.len() && keys[order[end]].as_ref() == key {
+            end += 1;
+        }
+        let value = read(key)?;
+        for index in &order[start..end - 1] {
+            values[*index] = value.clone();
+        }
+        values[order[end - 1]] = value;
+        start = end;
+    }
+    Ok(values)
 }
 
 fn get_committed_visible<B: FileBackend>(
@@ -2143,9 +2311,19 @@ fn get_committed_visible<B: FileBackend>(
     key: &[u8],
     now_ms: u64,
 ) -> Result<Option<Vec<u8>>> {
-    match lookup(pager, root_page_id, key)? {
-        Some(raw_value) => {
-            let stored = StoredValue::decode_owned_for_store(store_flags, raw_value)?;
+    get_committed_visible_in_batch(pager, root_page_id, store_flags, key, now_ms, None)
+}
+
+fn get_committed_visible_in_batch<B: FileBackend>(
+    pager: &mut Pager<B>,
+    root_page_id: u64,
+    store_flags: u64,
+    key: &[u8],
+    now_ms: u64,
+    batch: Option<&mut PointReadBatch>,
+) -> Result<Option<Vec<u8>>> {
+    match lookup_stored_value(pager, root_page_id, key, store_flags, batch)? {
+        Some(stored) => {
             if stored.is_expired_at(now_ms) {
                 Ok(None)
             } else {
@@ -2156,8 +2334,7 @@ fn get_committed_visible<B: FileBackend>(
     }
 }
 
-/// Existence from the leaf cell alone, plus the 16-byte TTL header for
-/// enveloped stores. Overflow values are never read past their first page.
+/// Existence from the leaf cell alone, plus only the TTL header for enveloped stores.
 fn exists_committed_visible<B: FileBackend>(
     pager: &mut Pager<B>,
     root_page_id: u64,
@@ -2165,18 +2342,21 @@ fn exists_committed_visible<B: FileBackend>(
     key: &[u8],
     now_ms: u64,
 ) -> Result<bool> {
-    let enveloped =
-        store_uses_value_envelope(store_flags) && !store_uses_system_raw_values(store_flags);
-    let prefix_len = if enveloped {
-        VALUE_ENVELOPE_HEADER_SIZE
-    } else {
-        0
-    };
-    match lookup_prefix(pager, root_page_id, key, prefix_len)? {
+    exists_committed_visible_in_batch(pager, root_page_id, store_flags, key, now_ms, None)
+}
+
+fn exists_committed_visible_in_batch<B: FileBackend>(
+    pager: &mut Pager<B>,
+    root_page_id: u64,
+    store_flags: u64,
+    key: &[u8],
+    now_ms: u64,
+    batch: Option<&mut PointReadBatch>,
+) -> Result<bool> {
+    match lookup_value_expiry(pager, root_page_id, key, store_flags, batch)? {
         None => Ok(false),
-        Some(_) if !enveloped => Ok(true),
-        Some(prefix) => Ok(!matches!(
-            decode_envelope_expiry(&prefix)?,
+        Some(expiry) => Ok(!matches!(
+            expiry,
             Some(expires_at_ms) if now_ms >= expires_at_ms
         )),
     }
@@ -2234,6 +2414,17 @@ fn get_with_staged<B: FileBackend>(
     key: &[u8],
     now_ms: u64,
 ) -> Result<Option<Vec<u8>>> {
+    get_with_staged_in_batch(pager, rw, store, key, now_ms, None)
+}
+
+fn get_with_staged_in_batch<B: FileBackend>(
+    pager: &mut Pager<B>,
+    rw: &mut ReadwriteTx,
+    store: &str,
+    key: &[u8],
+    now_ms: u64,
+    batch: Option<&mut PointReadBatch>,
+) -> Result<Option<Vec<u8>>> {
     let (value, expired) = match staged_lookup(rw, store, key)? {
         StagedLookup::Staged(Some(stored)) => {
             if stored.is_expired_at(now_ms) {
@@ -2243,17 +2434,18 @@ fn get_with_staged<B: FileBackend>(
             }
         }
         StagedLookup::Staged(None) | StagedLookup::Absent => (None, false),
-        StagedLookup::Committed(meta) => match lookup(pager, meta.store_root_page_id, key)? {
-            Some(raw) => {
-                let stored = StoredValue::decode_owned_for_store(meta.flags, raw)?;
-                if stored.is_expired_at(now_ms) {
-                    (None, true)
-                } else {
-                    (Some(stored.value), false)
+        StagedLookup::Committed(meta) => {
+            match lookup_stored_value(pager, meta.store_root_page_id, key, meta.flags, batch)? {
+                Some(stored) => {
+                    if stored.is_expired_at(now_ms) {
+                        (None, true)
+                    } else {
+                        (Some(stored.value), false)
+                    }
                 }
+                None => (None, false),
             }
-            None => (None, false),
-        },
+        }
     };
     if expired {
         expire_staged_key(rw, store, key)?;
@@ -2268,6 +2460,17 @@ fn exists_with_staged<B: FileBackend>(
     key: &[u8],
     now_ms: u64,
 ) -> Result<bool> {
+    exists_with_staged_in_batch(pager, rw, store, key, now_ms, None)
+}
+
+fn exists_with_staged_in_batch<B: FileBackend>(
+    pager: &mut Pager<B>,
+    rw: &mut ReadwriteTx,
+    store: &str,
+    key: &[u8],
+    now_ms: u64,
+    batch: Option<&mut PointReadBatch>,
+) -> Result<bool> {
     let (exists, expired) = match staged_lookup(rw, store, key)? {
         StagedLookup::Staged(Some(stored)) => {
             let expired = stored.is_expired_at(now_ms);
@@ -2275,19 +2478,11 @@ fn exists_with_staged<B: FileBackend>(
         }
         StagedLookup::Staged(None) | StagedLookup::Absent => (false, false),
         StagedLookup::Committed(meta) => {
-            let enveloped =
-                store_uses_value_envelope(meta.flags) && !store_uses_system_raw_values(meta.flags);
-            let prefix_len = if enveloped {
-                VALUE_ENVELOPE_HEADER_SIZE
-            } else {
-                0
-            };
-            match lookup_prefix(pager, meta.store_root_page_id, key, prefix_len)? {
+            match lookup_value_expiry(pager, meta.store_root_page_id, key, meta.flags, batch)? {
                 None => (false, false),
-                Some(_) if !enveloped => (true, false),
-                Some(prefix) => {
+                Some(expiry) => {
                     let expired = matches!(
-                        decode_envelope_expiry(&prefix)?,
+                        expiry,
                         Some(expires_at_ms) if now_ms >= expires_at_ms
                     );
                     (!expired, expired)
@@ -2296,6 +2491,43 @@ fn exists_with_staged<B: FileBackend>(
         }
     };
     if expired {
+        expire_staged_key(rw, store, key)?;
+    }
+    Ok(exists)
+}
+
+/// Staged expiry is visible immediately; committed expiry is collected for
+/// publication only after every metadata lookup in the batch succeeds.
+fn exists_with_staged_deferred_base<B: FileBackend>(
+    pager: &mut Pager<B>,
+    rw: &mut ReadwriteTx,
+    store: &str,
+    key: &[u8],
+    now_ms: u64,
+    batch: &mut PointReadBatch,
+    expired_base_keys: &mut Vec<Vec<u8>>,
+) -> Result<bool> {
+    let (exists, expired_staged) = match staged_lookup(rw, store, key)? {
+        StagedLookup::Staged(Some(stored)) => {
+            let expired = stored.is_expired_at(now_ms);
+            (!expired, expired)
+        }
+        StagedLookup::Staged(None) | StagedLookup::Absent => (false, false),
+        StagedLookup::Committed(meta) => {
+            match lookup_value_expiry(pager, meta.store_root_page_id, key, meta.flags, Some(batch))?
+            {
+                None => (false, false),
+                Some(expiry) => {
+                    let expired = matches!(expiry, Some(timestamp) if now_ms >= timestamp);
+                    if expired {
+                        expired_base_keys.push(key.to_vec());
+                    }
+                    (!expired, false)
+                }
+            }
+        }
+    };
+    if expired_staged {
         expire_staged_key(rw, store, key)?;
     }
     Ok(exists)
@@ -2313,6 +2545,9 @@ fn put_with_staged_at<B: FileBackend>(
     let stage = ensure_stage_for_write(rw, store)?;
     if stage.dropped {
         return Err(EngineError::StoreNotFound(store.into()));
+    }
+    if value.expires_at_ms.is_some() {
+        stage.has_expiring_mutations = Some(true);
     }
     if value.expires_at_ms.is_some() && !store_uses_value_envelope(stage.flags) {
         stage.flags |= STORE_FLAG_VALUE_ENVELOPE_V1;
@@ -2334,6 +2569,12 @@ fn delete_with_staged_at<B: FileBackend>(
     now_ms: u64,
 ) -> Result<bool> {
     let existed = exists_with_staged(pager, rw, store, key, now_ms)?;
+    // The existence lookup already stages expired values for deletion. A
+    // genuinely absent key needs no mutation, and an earlier staged delete
+    // must remain in place. The transaction still commits normally.
+    if !existed {
+        return Ok(false);
+    }
     let stage = ensure_stage_for_write(rw, store)?;
     if stage.dropped {
         return Err(EngineError::StoreNotFound(store.into()));
@@ -2459,12 +2700,6 @@ fn scan_with_staged<B: FileBackend>(
                 let Some((key, mutation)) = staged_next else {
                     break;
                 };
-                if order == Ordering::Equal {
-                    base_next = match base.as_mut() {
-                        Some(iter) => iter.next(pager)?,
-                        None => None,
-                    };
-                }
                 if let MutationValue::Put(stored) = mutation {
                     if !stored.is_expired_at(now_ms) {
                         rows.push(KvPair {
@@ -2472,6 +2707,15 @@ fn scan_with_staged<B: FileBackend>(
                             value: stored.value.clone(),
                         });
                     }
+                }
+                if rows.len() >= limit {
+                    break;
+                }
+                if order == Ordering::Equal {
+                    base_next = match base.as_mut() {
+                        Some(iter) => iter.next(pager)?,
+                        None => None,
+                    };
                 }
                 staged_next = staged.next();
                 continue;
@@ -2491,6 +2735,9 @@ fn scan_with_staged<B: FileBackend>(
                     key: pair.key,
                     value: stored.value,
                 });
+            }
+            if rows.len() >= limit {
+                break;
             }
             base_next = match base.as_mut() {
                 Some(iter) => iter.next(pager)?,

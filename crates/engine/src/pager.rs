@@ -4,6 +4,9 @@ use crate::page::verify_page_image;
 use crate::storage::backend::FileBackend;
 use std::collections::{HashMap, VecDeque};
 
+// Bound the extra copy buffer while amortizing native/OPFS backend crossings.
+pub(crate) const PAGE_WRITE_BATCH_PAGES: usize = 64;
+
 #[derive(Debug)]
 struct CacheEntry {
     bytes: Vec<u8>,
@@ -105,6 +108,50 @@ impl<B: FileBackend> Pager<B> {
         Ok(())
     }
 
+    // Recovery supplies verified, consecutive images. Cache their owned
+    // buffers only after the write succeeds; publication still follows flush.
+    pub(crate) fn write_page_images(
+        &mut self,
+        images: &mut Vec<(u64, Vec<u8>)>,
+        buffer: &mut Vec<u8>,
+    ) -> Result<()> {
+        if images.is_empty() {
+            return Ok(());
+        }
+        if images.len() > PAGE_WRITE_BATCH_PAGES
+            || images
+                .windows(2)
+                .any(|pair| pair[0].0.checked_add(1) != Some(pair[1].0))
+        {
+            return Err(EngineError::Serialization(
+                "page image batch must be bounded and consecutive".into(),
+            ));
+        }
+        for (_, bytes) in images.iter() {
+            if bytes.len() != PAGE_SIZE {
+                return Err(EngineError::Serialization(format!(
+                    "page image wrong size: {}",
+                    bytes.len()
+                )));
+            }
+        }
+        let offset = page_offset(images[0].0);
+        if images.len() == 1 {
+            self.main.write_at(offset, &images[0].1)?;
+        } else {
+            buffer.clear();
+            buffer.reserve_exact(images.len() * PAGE_SIZE);
+            for (_, bytes) in images.iter() {
+                buffer.extend_from_slice(bytes);
+            }
+            self.main.write_at(offset, buffer)?;
+        }
+        for (page_id, bytes) in images.drain(..) {
+            self.store_cached_page(page_id, bytes, false);
+        }
+        Ok(())
+    }
+
     // Keeps a committed page visible without touching the main file.
     // Checkpoint writes these back; eviction must not drop them first.
     pub(crate) fn stage_page_image(&mut self, page_id: u64, bytes: Vec<u8>) -> Result<()> {
@@ -141,11 +188,37 @@ impl<B: FileBackend> Pager<B> {
             .collect();
         page_ids.sort_unstable();
         let Self { main, cache, .. } = self;
-        for page_id in page_ids {
-            let entry = cache
-                .get(&page_id)
-                .ok_or_else(|| EngineError::Internal("dirty pager entry disappeared".into()))?;
-            main.write_at(page_offset(page_id), &entry.bytes)?;
+        let mut batch = Vec::new();
+        let mut start = 0;
+        while start < page_ids.len() {
+            let mut end = start + 1;
+            while end < page_ids.len()
+                && end - start < PAGE_WRITE_BATCH_PAGES
+                && page_ids[end - 1].checked_add(1) == Some(page_ids[end])
+            {
+                end += 1;
+            }
+            let page_id = page_ids[start];
+            if end == start + 1 {
+                // Isolated pages need neither a copy nor a batch allocation.
+                let entry = cache
+                    .get(&page_id)
+                    .ok_or_else(|| EngineError::Internal("dirty pager entry disappeared".into()))?;
+                main.write_at(page_offset(page_id), &entry.bytes)?;
+            } else {
+                batch.clear();
+                batch.reserve_exact((end - start) * PAGE_SIZE);
+                for page_id in &page_ids[start..end] {
+                    let entry = cache.get(page_id).ok_or_else(|| {
+                        EngineError::Internal("dirty pager entry disappeared".into())
+                    })?;
+                    batch.extend_from_slice(&entry.bytes);
+                }
+                // Adjacent dirty images cover exactly this range. Gaps and
+                // clean pages are never included or filled with zero bytes.
+                main.write_at(page_offset(page_id), &batch)?;
+            }
+            start = end;
         }
         Ok(())
     }
@@ -280,21 +353,16 @@ impl<B: FileBackend> Pager<B> {
         if self.lru.len() <= compact_after {
             return;
         }
-        let mut compacted = VecDeque::with_capacity(self.cache.len() - self.dirty_count);
-        for (page_id, generation) in self.lru.drain(..) {
-            #[cfg(test)]
-            {
-                self.lru_entries_examined += 1;
-            }
-            let is_current = match self.cache.get(&page_id) {
-                Some(entry) => !entry.dirty && entry.generation == generation,
-                None => false,
-            };
-            if is_current {
-                compacted.push_back((page_id, generation));
-            }
+        #[cfg(test)]
+        {
+            self.lru_entries_examined += self.lru.len();
         }
-        self.lru = compacted;
+        let cache = &self.cache;
+        self.lru
+            .retain(|(page_id, generation)| match cache.get(page_id) {
+                Some(entry) => !entry.dirty && entry.generation == *generation,
+                None => false,
+            });
     }
 }
 
@@ -303,6 +371,118 @@ mod tests {
     use super::*;
     use crate::page::encode_leaf_page;
     use crate::storage::memory::MemoryBackend;
+
+    #[derive(Default)]
+    struct RecordingBackend {
+        inner: MemoryBackend,
+        writes: Vec<(u64, usize)>,
+        fail_write: Option<usize>,
+    }
+
+    impl FileBackend for RecordingBackend {
+        fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+            self.inner.read_at(offset, len)
+        }
+
+        fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+            self.writes.push((offset, bytes.len()));
+            if self.fail_write == Some(self.writes.len()) {
+                self.inner.write_at(offset, &bytes[..bytes.len() / 2])?;
+                return Err(EngineError::Storage("injected partial page batch".into()));
+            }
+            self.inner.write_at(offset, bytes)
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            self.inner.flush()
+        }
+
+        fn len(&self) -> Result<u64> {
+            self.inner.len()
+        }
+
+        fn truncate(&mut self, size: u64) -> Result<()> {
+            self.inner.truncate(size)
+        }
+
+        fn close(&mut self) -> Result<()> {
+            self.inner.close()
+        }
+    }
+
+    #[test]
+    fn checkpoint_batches_adjacent_pages_without_overwriting_gaps() -> Result<()> {
+        let mut pager = Pager::new(RecordingBackend::default(), 16);
+        let mut oracle = MemoryBackend::new();
+        // Distinct existing pages in both gaps must survive unchanged.
+        for page_id in [66, 68] {
+            let image = encode_leaf_page(page_id, 0, page_id + 100, &[])?;
+            pager.write_page_image(page_id, &image)?;
+            oracle.write_at(page_offset(page_id), &image)?;
+        }
+        pager.main.writes.clear();
+        for page_id in (1..=65).chain([67]).chain(69..=72) {
+            let image = encode_leaf_page(page_id, 0, 0, &[])?;
+            oracle.write_at(page_offset(page_id), &image)?;
+            pager.stage_page_image(page_id, image)?;
+        }
+        pager.write_back_dirty()?;
+        assert_eq!(
+            pager.main.writes,
+            [
+                (page_offset(1), 64 * PAGE_SIZE),
+                (page_offset(65), PAGE_SIZE),
+                (page_offset(67), PAGE_SIZE),
+                (page_offset(69), 4 * PAGE_SIZE),
+            ]
+        );
+        assert_eq!(pager.dirty_page_count(), 70);
+        let len = oracle.len()? as usize;
+        assert_eq!(pager.main.read_at(0, len)?, oracle.read_at(0, len)?);
+        pager.flush()?;
+        oracle.flush()?;
+        pager.mark_dirty_clean();
+        assert!(!pager.has_dirty());
+        assert_eq!(
+            pager.main.inner.durable_snapshot(),
+            oracle.durable_snapshot()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_page_batch_preserves_pins_and_can_be_rewritten() -> Result<()> {
+        let mut pager = Pager::new(RecordingBackend::default(), 8);
+        let mut oracle = MemoryBackend::new();
+        for page_id in 1..=130 {
+            let image = encode_leaf_page(page_id, 0, 0, &[])?;
+            oracle.write_at(page_offset(page_id), &image)?;
+            pager.stage_page_image(page_id, image)?;
+        }
+        pager.main.fail_write = Some(2);
+        assert!(matches!(
+            pager.write_back_dirty(),
+            Err(EngineError::Storage(_))
+        ));
+        assert_eq!(pager.dirty_page_count(), 130);
+        assert!(pager.cache.values().all(|entry| entry.dirty));
+        assert_eq!(pager.main.writes.len(), 2);
+        pager.main.fail_write = None;
+        pager.main.writes.clear();
+        pager.write_back_dirty()?;
+        assert_eq!(pager.main.writes.len(), 3);
+        let len = oracle.len()? as usize;
+        assert_eq!(pager.main.read_at(0, len)?, oracle.read_at(0, len)?);
+        pager.flush()?;
+        oracle.flush()?;
+        assert_eq!(
+            pager.main.inner.durable_snapshot(),
+            oracle.durable_snapshot()
+        );
+        pager.mark_dirty_clean();
+        assert_eq!(pager.dirty_page_count(), 0);
+        Ok(())
+    }
 
     #[test]
     fn read_survives_when_dirty_pages_pin_the_cache() -> Result<()> {
@@ -317,6 +497,41 @@ mod tests {
         assert_eq!(pager.read_page(3)?.len(), PAGE_SIZE);
         assert_eq!(pager.read_page(1)?.len(), PAGE_SIZE);
         assert_eq!(pager.read_page(2)?.len(), PAGE_SIZE);
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_batch_failure_can_retry_without_caching_partial_images() -> Result<()> {
+        let mut pager = Pager::new(RecordingBackend::default(), 8);
+        let mut oracle = MemoryBackend::new();
+        let mut images = Vec::new();
+        let mut buffer = Vec::new();
+        for page_id in 1..=3 {
+            let image = encode_leaf_page(page_id, 0, page_id + 10, &[])?;
+            oracle.write_at(page_offset(page_id), &image)?;
+            images.push((page_id, image));
+        }
+        pager.main.fail_write = Some(1);
+        assert!(matches!(
+            pager.write_page_images(&mut images, &mut buffer),
+            Err(EngineError::Storage(_))
+        ));
+        assert_eq!(images.len(), 3);
+        assert!(pager.cache.is_empty());
+        pager.main.fail_write = None;
+        pager.main.writes.clear();
+        pager.write_page_images(&mut images, &mut buffer)?;
+        assert!(images.is_empty());
+        assert_eq!(pager.main.writes, [(page_offset(1), 3 * PAGE_SIZE)]);
+        assert_eq!(pager.dirty_page_count(), 0);
+        let len = oracle.len()? as usize;
+        assert_eq!(pager.main.read_at(0, len)?, oracle.read_at(0, len)?);
+        pager.flush()?;
+        oracle.flush()?;
+        assert_eq!(
+            pager.main.inner.durable_snapshot(),
+            oracle.durable_snapshot()
+        );
         Ok(())
     }
 
@@ -392,7 +607,10 @@ mod tests {
         assert!(!pager.has_dirty());
         assert_eq!(pager.cache.len(), 2);
         for page_id in 1..=8 {
-            assert_eq!(pager.read_page(page_id)?, encode_leaf_page(page_id, 0, 0, &[])?);
+            assert_eq!(
+                pager.read_page(page_id)?,
+                encode_leaf_page(page_id, 0, 0, &[])?
+            );
         }
         // Page 8 is clean and MRU. Its stale queue record must not evict it
         // after it is dirtied again, even when every page is pinned.
@@ -408,7 +626,10 @@ mod tests {
         pager.mark_dirty_clean();
         assert_eq!(pager.cache.len(), 2);
         for page_id in 8..=16 {
-            assert_eq!(pager.read_page(page_id)?, encode_leaf_page(page_id, 0, 0, &[])?);
+            assert_eq!(
+                pager.read_page(page_id)?,
+                encode_leaf_page(page_id, 0, 0, &[])?
+            );
         }
         Ok(())
     }

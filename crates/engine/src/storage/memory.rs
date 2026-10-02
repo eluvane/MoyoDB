@@ -1,5 +1,6 @@
 use crate::error::{EngineError, Result};
 use crate::storage::backend::{FileBackend, FileSet};
+use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -8,8 +9,9 @@ struct MemoryFileState {
     working: Vec<u8>,
     durable: Vec<u8>,
     closed: bool,
-    dirty_start: Option<usize>,
-    dirty_end: usize,
+    dirty_extents: BTreeMap<usize, usize>,
+    #[cfg(test)]
+    flush_copy_bytes: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -30,8 +32,9 @@ impl MemoryBackend {
                 working: bytes.clone(),
                 durable: bytes,
                 closed: false,
-                dirty_start: None,
-                dirty_end: 0,
+                dirty_extents: BTreeMap::new(),
+                #[cfg(test)]
+                flush_copy_bytes: 0,
             })),
         }
     }
@@ -73,6 +76,11 @@ impl MemoryBackend {
     pub fn durable_snapshot(&self) -> Option<Vec<u8>> {
         FileBackend::durable_snapshot(self)
     }
+
+    #[cfg(test)]
+    pub fn flush_copy_bytes(&self) -> Result<usize> {
+        Ok(self.lock_state()?.flush_copy_bytes)
+    }
 }
 
 impl Default for MemoryBackend {
@@ -96,17 +104,41 @@ fn checked_end(start: usize, len: usize, what: &str) -> Result<usize> {
 }
 
 impl MemoryFileState {
-    fn mark_dirty(&mut self, start: usize, end: usize) {
+    fn mark_dirty(&mut self, mut start: usize, mut end: usize) {
         if start >= end {
             return;
         }
-        self.dirty_start = Some(self.dirty_start.map_or(start, |current| current.min(start)));
-        self.dirty_end = self.dirty_end.max(end);
+        if let Some((&previous_start, &previous_end)) =
+            self.dirty_extents.range(..=start).next_back()
+        {
+            if previous_end >= end {
+                return;
+            }
+            if previous_end >= start {
+                start = previous_start;
+                self.dirty_extents.remove(&previous_start);
+            }
+        }
+        loop {
+            let next = self
+                .dirty_extents
+                .range(start..)
+                .next()
+                .map(|(&next_start, &next_end)| (next_start, next_end));
+            let Some((next_start, next_end)) = next else {
+                break;
+            };
+            if next_start > end {
+                break;
+            }
+            end = end.max(next_end);
+            self.dirty_extents.remove(&next_start);
+        }
+        self.dirty_extents.insert(start, end);
     }
 
     fn clear_dirty(&mut self) {
-        self.dirty_start = None;
-        self.dirty_end = 0;
+        self.dirty_extents.clear();
     }
 }
 
@@ -139,8 +171,14 @@ impl FileBackend for MemoryBackend {
         }
         let start = to_index(offset, "write")?;
         let end = checked_end(start, bytes.len(), "write")?;
-        if end > state.working.len() {
+        let old_len = state.working.len();
+        if end > old_len {
             state.working.resize(end, 0);
+            // A shrink followed by regrowth must overwrite bytes still present
+            // in the previous durable image, including an empty sparse write.
+            if start > old_len {
+                state.mark_dirty(old_len, start);
+            }
         }
         state.working[start..end].copy_from_slice(bytes);
         state.mark_dirty(start, end);
@@ -152,20 +190,35 @@ impl FileBackend for MemoryBackend {
         if state.closed {
             return Err(EngineError::Storage("flush closed memory backend".into()));
         }
-        // Preserve durable-snapshot semantics, but copy only the dirty range instead
-        // of cloning the whole in-memory file on every flush/commit.
+        // Preserve durable-snapshot semantics and copy the union of dirty
+        // extents, without copying the clean gaps between sparse writes.
         let working_len = state.working.len();
         if state.durable.len() != working_len {
             state.durable.resize(working_len, 0);
         }
-        if let Some(start) = state.dirty_start {
-            let end = state.dirty_end.min(working_len);
-            if start < end {
-                let MemoryFileState {
-                    working, durable, ..
-                } = &mut *state;
-                durable[start..end].copy_from_slice(&working[start..end]);
+        #[cfg(test)]
+        let mut copied_bytes = 0;
+        {
+            let MemoryFileState {
+                working,
+                durable,
+                dirty_extents,
+                ..
+            } = &mut *state;
+            for (&start, &end) in dirty_extents.iter() {
+                let end = end.min(working_len);
+                if start < end {
+                    durable[start..end].copy_from_slice(&working[start..end]);
+                    #[cfg(test)]
+                    {
+                        copied_bytes += end - start;
+                    }
+                }
             }
+        }
+        #[cfg(test)]
+        {
+            state.flush_copy_bytes += copied_bytes;
         }
         state.clear_dirty();
         Ok(())

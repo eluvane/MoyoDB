@@ -1,5 +1,7 @@
 import { expect, test, type Page } from '@playwright/test';
 import type { WorkerProtocolClient } from '../src/worker-client';
+import type { WorkerApi } from '../src/worker-api';
+import type * as WorkerServerModule from '../src/worker-server';
 import { prepareMoyoDbPage, uniqueDbName } from './support';
 
 declare global {
@@ -113,6 +115,54 @@ async function prepareProtocolPage(page: Page): Promise<void> {
     await page.goto('/');
     await page.addScriptTag({ content: protocolHarnessScript });
 }
+
+test('worker server rejects foreign origins and accepts dedicated-worker messages', async ({ page }) => {
+    await page.goto('/');
+    const result = await page.evaluate(async () => {
+        const modulePath = '/src/worker-server.ts';
+        const { exposeWorkerApi } = (await import(modulePath)) as typeof WorkerServerModule;
+        let calls = 0;
+        const responseIds: number[] = [];
+        const scope = Object.assign(new EventTarget(), {
+            location: { origin: window.location.origin },
+            postMessage(message: { id?: number }) {
+                if (message.id !== undefined) responseIds.push(message.id);
+            }
+        });
+        const api: Pick<WorkerApi, 'begin'> = {
+            begin() {
+                calls += 1;
+                return Promise.resolve(calls);
+            }
+        };
+        const server = exposeWorkerApi(api as WorkerApi, scope as unknown as DedicatedWorkerGlobalScope);
+        try {
+            for (const [id, origin] of [
+                [1, 'https://foreign.example'],
+                [2, ''],
+                [3, window.location.origin]
+            ] as const) {
+                scope.dispatchEvent(
+                    new MessageEvent('message', {
+                        origin,
+                        data: {
+                            type: 'moyodb:worker-protocol:request',
+                            version: 1,
+                            id,
+                            command: 'begin',
+                            args: ['readonly']
+                        }
+                    })
+                );
+            }
+            await new Promise<void>((resolve) => setTimeout(resolve, 0));
+            return { calls, responseIds };
+        } finally {
+            server.close();
+        }
+    });
+    expect(result).toEqual({ calls: 2, responseIds: [2, 3] });
+});
 
 test('worker_protocol_request_response', async ({ page }) => {
     await prepareProtocolPage(page);

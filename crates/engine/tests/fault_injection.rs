@@ -551,3 +551,74 @@ fn recovery_case(config: &OpenConfig, fault: Fault, target: u64) -> bool {
 fn every_fault_during_crash_recovery_is_idempotent() {
     sweep(deferred_checkpoint(), recovery_case);
 }
+
+/// The dirty image set spans several bounded main-file write batches. Every
+/// failure, including a partial batch and a torn flush of multiple batches,
+/// must retain all acknowledged values in both restart and in-place recovery.
+fn large_checkpoint_case(config: &OpenConfig, fault: Fault, target: u64) -> bool {
+    let bundle = FaultBundle::new();
+    let mut engine =
+        Engine::open(DB, bundle.files(), config.clone()).expect("open checkpoint fixture");
+    let tx = engine
+        .begin_tx(TxMode::Readwrite)
+        .expect("begin checkpoint fixture");
+    engine
+        .create_store(tx, STORE)
+        .expect("create checkpoint fixture store");
+    engine.commit_tx(tx).expect("commit empty store");
+    engine.checkpoint().expect("checkpoint empty store");
+    let values: Rows = (0..8)
+        .map(|index| (key(index), vec![index as u8; 64 * 1024]))
+        .collect();
+    let tx = engine
+        .begin_tx(TxMode::Readwrite)
+        .expect("begin large values");
+    for (key, value) in &values {
+        engine.put(tx, STORE, key, value).expect("put large value");
+    }
+    let committed_txid = engine.commit_tx(tx).expect("acknowledge large values");
+    assert!(engine.stats().expect("dirty fixture stats").dirty_pages > 128);
+    bundle.arm(fault, target);
+    let checkpoint = engine.checkpoint();
+    let Some(trip) = bundle.tripped() else {
+        checkpoint.expect("checkpoint without an injected fault");
+        return false;
+    };
+    let ctx = format!("large checkpoint {fault:?} #{target} ({trip})");
+    assert!(
+        checkpoint.is_err(),
+        "{ctx}: checkpoint failure must be reported"
+    );
+    assert!(
+        engine.needs_recovery(),
+        "{ctx}: failed checkpoint must poison engine"
+    );
+    let mut restarted = reopen(&bundle.crash_copy(), config, &ctx);
+    assert_eq!(
+        dump(&mut restarted, &ctx),
+        values,
+        "{ctx}: acknowledged values lost after crash"
+    );
+    bundle.disarm();
+    let report = engine
+        .recover()
+        .unwrap_or_else(|err| panic!("{ctx}: recover failed: {err}"));
+    assert_eq!(report.last_committed_txid, committed_txid, "{ctx}");
+    assert_eq!(
+        dump(&mut engine, &ctx),
+        values,
+        "{ctx}: values lost after in-place recovery"
+    );
+    let mut restarted = reopen(&bundle.crash_copy(), config, &ctx);
+    assert_eq!(
+        dump(&mut restarted, &ctx),
+        values,
+        "{ctx}: recovered state was not durable"
+    );
+    true
+}
+
+#[test]
+fn every_fault_during_large_batched_checkpoint_preserves_commits() {
+    sweep(deferred_checkpoint(), large_checkpoint_case);
+}

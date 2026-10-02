@@ -10,7 +10,7 @@ const TYPE_BYTES = 0x50;
 const COMPOUND_ESCAPE = 0x00;
 const COMPOUND_ESCAPE_CONT = 0xff;
 const COMPOUND_TERM = 0x00;
-const F64_MASK = 0xffffffffffffffffn;
+const F64_MASK = BigInt('0xffffffffffffffff');
 export type CompoundKeyPart = string | number | boolean | null | Uint8Array;
 export type IndexKeyPrimitive = CompoundKeyPart;
 export function utf8Encode(value: string): Uint8Array {

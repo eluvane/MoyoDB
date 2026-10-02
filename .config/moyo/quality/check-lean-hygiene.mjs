@@ -26,13 +26,30 @@ if (!existsSync(lakefilePath)) {
             'proofs/moyodb_proofs/lakefile.lean must enable builtinLint := true so lake lint runs built-in Lean linters.'
         );
     }
+    for (const option of ['warningAsError', 'linter.all', 'linter.extra']) {
+        if (!lakefile.includes(`⟨\`${option}, true⟩`)) {
+            failures.push(`Lake must enable ${option} for the entire proof package.`);
+        }
+    }
+    if (!/lintDriver\s*:=\s*"lintLean"/u.test(lakefile)) {
+        failures.push('Lake must run the strict external Lean linter driver.');
+    }
 }
 
 if (!existsSync(manifestPath)) {
     failures.push('Missing committed Lake manifest proofs/moyodb_proofs/lake-manifest.json.');
 } else {
     try {
-        JSON.parse(readFileSync(manifestPath, 'utf8'));
+        const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+        const lakefile = readFileSync(lakefilePath, 'utf8');
+        for (const name of ['heron', 'JunkLinter', 'batteries']) {
+            const dependency = manifest.packages.find((candidate) => candidate.name === name);
+            if (!dependency || dependency.type !== 'git' || !/^[0-9a-f]{40}$/u.test(dependency.rev)) {
+                failures.push(`Lean linter ${name} must be locked to a full Git commit.`);
+            } else if (!lakefile.includes(`"${dependency.rev}"`) || dependency.inputRev !== dependency.rev) {
+                failures.push(`Lean linter ${name} source pin and manifest must agree.`);
+            }
+        }
     } catch (error) {
         failures.push(`Invalid lake-manifest.json: ${error.message}`);
     }
@@ -59,7 +76,11 @@ const banned = [
     { regex: /#eval!/u, label: '#eval! proof-hole bypass' },
     { regex: /^\s*import\s+all\b/mu, label: 'import all' },
     { regex: /set_option\s+autoImplicit\s+true/u, label: 'autoImplicit true' },
-    { regex: /set_option\s+linter\.[A-Za-z0-9_.]+\s+false/u, label: 'disabled Lean linter' }
+    { regex: /set_option\s+linter\.[A-Za-z0-9_.]+\s+false/u, label: 'disabled Lean linter' },
+    { regex: /⟨`linter\.[A-Za-z0-9_.]+,\s*false⟩/u, label: 'disabled Lake linter option' },
+    { regex: /set_option\s+warningAsError\s+false/u, label: 'warnings allowed instead of errors' },
+    { regex: /@\[[^\]]*\bnolint\b/u, label: 'suppressed Batteries linter' },
+    { regex: /set_option\s+heron\.reelaborating\s+true/u, label: 'Heron analysis bypass' }
 ];
 
 for (const file of collectLeanFiles(root)) {
@@ -70,7 +91,7 @@ for (const file of collectLeanFiles(root)) {
 }
 
 if (failures.length > 0) {
-    console.error(failures.join('\n'));
+    process.stderr.write(`${failures.join('\n')}\n`);
     process.exit(1);
 }
-console.log('Lean source hygiene policy passed.');
+process.stdout.write('Lean source hygiene policy passed.\n');

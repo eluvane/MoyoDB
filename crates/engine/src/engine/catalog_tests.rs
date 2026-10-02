@@ -96,7 +96,10 @@ fn live_snapshots_keep_old_roots_without_forcing_every_later_commit_to_copy() ->
     assert_eq!(engine.schema_version(), 7);
 
     let current = engine.begin_tx(TxMode::Readonly)?;
-    assert_eq!(engine.get(current, "new-store", b"key")?, Some(b"new".to_vec()));
+    assert_eq!(
+        engine.get(current, "new-store", b"key")?,
+        Some(b"new".to_vec())
+    );
     assert!(matches!(
         engine.get(current, &store_name(1), b"key"),
         Err(EngineError::StoreNotFound(_))
@@ -109,8 +112,14 @@ fn live_snapshots_keep_old_roots_without_forcing_every_later_commit_to_copy() ->
         engine.commit_tx(tx)?;
         engine.checkpoint()?;
         assert_eq!(Arc::as_ptr(&engine.catalog), current_map);
-        assert_eq!(engine.get(old, &store_name(0), b"key")?, Some(b"before".to_vec()));
-        assert_eq!(engine.get(old, &store_name(1), b"key")?, Some(b"before".to_vec()));
+        assert_eq!(
+            engine.get(old, &store_name(0), b"key")?,
+            Some(b"before".to_vec())
+        );
+        assert_eq!(
+            engine.get(old, &store_name(1), b"key")?,
+            Some(b"before".to_vec())
+        );
         assert!(matches!(
             engine.get(old, "new-store", b"key"),
             Err(EngineError::StoreNotFound(_))
@@ -147,7 +156,10 @@ fn empty_and_scalar_only_commits_do_not_detach_a_shared_store_map() -> Result<()
     assert_eq!(engine.superblock.catalog_root_page_id, root);
     assert_eq!(Arc::as_ptr(&engine.catalog), pointer);
     let wal = scan_wal_index(&bundle.wal)?;
-    assert_eq!(wal.last().unwrap().commit.changed_page_count, 0);
+    let last_commit = wal
+        .last()
+        .ok_or_else(|| EngineError::Internal("expected committed WAL transaction".into()))?;
+    assert_eq!(last_commit.commit.changed_page_count, 0);
     engine.rollback_tx(reader)?;
     assert_current_catalog(&mut engine)
 }
@@ -244,7 +256,11 @@ fn incremental_catalog_matches_full_builder_bytes_through_mixed_changes() -> Res
         let built = delta.build_tree(
             &mut pager,
             &catalog_view(&previous, root),
-            (expected.schema_version, expected.change_feed_floor_txid, expected.change_feed_policy),
+            (
+                expected.schema_version,
+                expected.change_feed_floor_txid,
+                expected.change_feed_policy,
+            ),
             &mut alloc,
         )?;
         let next_root = install_tree(&mut pager, built)?;
@@ -306,8 +322,14 @@ fn small_catalog_update_emits_and_retires_paths_not_the_catalog() -> Result<()> 
         )?;
         let incremental_pages = update.page_images.len();
         let retired_pages = alloc.freed().len();
-        assert!(incremental_pages <= 16, "{count} stores: {incremental_pages} images");
-        assert!(retired_pages <= 16, "{count} stores: {retired_pages} retirements");
+        assert!(
+            incremental_pages <= 16,
+            "{count} stores: {incremental_pages} images"
+        );
+        assert!(
+            retired_pages <= 16,
+            "{count} stores: {retired_pages} retirements"
+        );
         if count >= 1024 {
             assert!(incremental_pages < full_pages);
             assert!(retired_pages < full_pages);
@@ -319,7 +341,11 @@ fn small_catalog_update_emits_and_retires_paths_not_the_catalog() -> Result<()> 
         );
         let next_root = install_tree(&mut pager, update)?;
         assert_eq!(read_catalog(&mut pager, root)?, state);
-        state.stores.get_mut(&store_name(0)).unwrap().created_txid = 2;
+        state
+            .stores
+            .get_mut(&store_name(0))
+            .ok_or_else(|| EngineError::Internal("expected seeded catalog store".into()))?
+            .created_txid = 2;
         assert_eq!(read_catalog(&mut pager, next_root)?, state);
     }
     Ok(())
@@ -345,14 +371,22 @@ fn synthesized_legacy_feed_floor_survives_first_logged_commit_and_reopen() -> Re
     engine.put(tx, "store", b"key", b"value")?;
     engine.commit_tx(tx)?;
     let mut reopened = Engine::open(
-        "legacy-catalog", durable.crash_recovered_files(), OpenConfig::default(),
+        "legacy-catalog",
+        durable.crash_recovered_files(),
+        OpenConfig::default(),
     )?;
     assert_eq!(reopened.change_feed_floor_txid, floor);
     assert!(matches!(
         reopened.changes_since(0, ChangeFeedOptions::default()),
         Err(EngineError::ChangeFeedCompacted(_))
     ));
-    assert_eq!(reopened.changes_since(floor, ChangeFeedOptions::default())?.changes.len(), 1);
+    assert_eq!(
+        reopened
+            .changes_since(floor, ChangeFeedOptions::default())?
+            .changes
+            .len(),
+        1
+    );
     assert_current_catalog(&mut reopened)
 }
 
@@ -365,7 +399,10 @@ fn failed_wal_publication_keeps_memory_until_recovery() -> Result<()> {
     engine.drop_store(tx, &store_name(1))?;
     engine.set_schema_version(tx, 9)?;
     engine.set_failpoint(Some(Failpoint::AfterWalFlush));
-    assert!(matches!(engine.commit_tx(tx), Err(EngineError::InjectedFailure(_))));
+    assert!(matches!(
+        engine.commit_tx(tx),
+        Err(EngineError::InjectedFailure(_))
+    ));
     assert_eq!(Arc::as_ptr(&engine.catalog), pointer);
     assert!(engine.catalog.contains_key(&store_name(1)));
     assert_eq!(engine.schema_version(), 1);
@@ -373,11 +410,16 @@ fn failed_wal_publication_keeps_memory_until_recovery() -> Result<()> {
     assert_eq!(engine.schema_version(), 9);
     assert!(!engine.catalog.contains_key(&store_name(1)));
     let read = engine.begin_tx(TxMode::Readonly)?;
-    assert_eq!(engine.get(read, &store_name(0), b"key")?, Some(b"durable".to_vec()));
+    assert_eq!(
+        engine.get(read, &store_name(0), b"key")?,
+        Some(b"durable".to_vec())
+    );
     engine.rollback_tx(read)?;
     assert_current_catalog(&mut engine)?;
     let mut reopened = Engine::open(
-        "catalog-tests", bundle.crash_recovered_files(), OpenConfig::default(),
+        "catalog-tests",
+        bundle.crash_recovered_files(),
+        OpenConfig::default(),
     )?;
     assert_eq!(reopened.schema_version(), 9);
     assert_current_catalog(&mut reopened)
@@ -395,7 +437,10 @@ fn corrupt_catalog_path_fails_before_wal_or_metadata_publication() -> Result<()>
     engine.pager.discard_cache();
     let tx = engine.begin_tx(TxMode::Readwrite)?;
     engine.put(tx, &store_name(0), b"key", b"after")?;
-    assert!(matches!(engine.commit_tx(tx), Err(EngineError::Corruption(_))));
+    assert!(matches!(
+        engine.commit_tx(tx),
+        Err(EngineError::Corruption(_))
+    ));
     assert_eq!(bundle.wal.len()?, 0);
     assert_eq!(Arc::as_ptr(&engine.catalog), pointer);
     assert_eq!(engine.superblock.catalog_root_page_id, root);
@@ -410,9 +455,15 @@ fn shared_snapshot_serialization_keeps_the_original_map_shape() -> Result<()> {
     let (_, mut engine) = seeded_engine(4, false)?;
     let tx = engine.begin_tx(TxMode::Readonly)?;
     let snapshot = engine.txns[&tx].snapshot();
-    let value = serde_json::to_value(snapshot).unwrap();
-    assert_eq!(value["catalog"], serde_json::to_value(engine.catalog.as_ref()).unwrap());
-    let decoded: Snapshot = serde_json::from_value(value).unwrap();
+    let value = serde_json::to_value(snapshot)
+        .map_err(|error| EngineError::Serialization(error.to_string()))?;
+    assert_eq!(
+        value["catalog"],
+        serde_json::to_value(engine.catalog.as_ref())
+            .map_err(|error| EngineError::Serialization(error.to_string()))?
+    );
+    let decoded: Snapshot = serde_json::from_value(value)
+        .map_err(|error| EngineError::Serialization(error.to_string()))?;
     assert_eq!(decoded.catalog.as_ref(), engine.catalog.as_ref());
     assert_eq!(decoded.schema_version, snapshot.schema_version);
     assert_eq!(decoded.catalog_root_page_id, snapshot.catalog_root_page_id);
@@ -431,18 +482,26 @@ fn one_user_write_has_bounded_wal_page_count_with_and_without_change_feed() -> R
             let transactions = scan_wal_index(&bundle.wal)?;
             assert_eq!(transactions.len(), 1);
             let images = transactions[0].commit.changed_page_count;
-            assert!(images <= 20, "{count} stores, feed={feed}: {images} WAL images");
+            assert!(
+                images <= 20,
+                "{count} stores, feed={feed}: {images} WAL images"
+            );
             assert_current_catalog(&mut engine)?;
             println!(
                 "user_write_work stores={count} feed={feed} wal_images={images} wal_bytes={}",
                 bundle.wal.len()?,
             );
             let mut recovered = Engine::open(
-                "catalog-tests", bundle.crash_recovered_files(), OpenConfig::default(),
+                "catalog-tests",
+                bundle.crash_recovered_files(),
+                OpenConfig::default(),
             )?;
             assert_current_catalog(&mut recovered)?;
             let read = recovered.begin_tx(TxMode::Readonly)?;
-            assert_eq!(recovered.get(read, &store_name(0), b"key")?, Some(b"after".to_vec()));
+            assert_eq!(
+                recovered.get(read, &store_name(0), b"key")?,
+                Some(b"after".to_vec())
+            );
             recovered.rollback_tx(read)?;
         }
     }
@@ -474,10 +533,16 @@ fn policy_changes_and_retention_persist_across_recovery() -> Result<()> {
         engine.recover()?;
         assert_eq!(engine.change_feed_policy, policy);
         assert_current_catalog(&mut engine)?;
-        assert!(engine.changes_since(committed, ChangeFeedOptions::default())?.changes.is_empty());
+        assert!(engine
+            .changes_since(committed, ChangeFeedOptions::default())?
+            .changes
+            .is_empty());
         if policy.enabled {
             assert_eq!(
-                engine.changes_since(committed - 1, ChangeFeedOptions::default())?.changes.len(),
+                engine
+                    .changes_since(committed - 1, ChangeFeedOptions::default())?
+                    .changes
+                    .len(),
                 1,
             );
         }

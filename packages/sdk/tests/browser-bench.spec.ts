@@ -104,6 +104,12 @@ test.describe('browser benchmark smoke', () => {
         });
 
         expect(report.results.length).toBeGreaterThan(0);
+        expect(
+            report.results
+                .filter((result) => result.status === 'error')
+                .map(({ engine, workloadName, error }) => ({ engine, workloadName, error })),
+            'Every applicable benchmark workload must complete successfully.'
+        ).toEqual([]);
         if (!report.results.some((result) => result.status === 'ok')) {
             expect(report.results.every((result) => result.status === 'skipped')).toBeTruthy();
         }

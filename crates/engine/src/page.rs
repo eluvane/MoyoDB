@@ -1,4 +1,6 @@
-use crate::bytes::{read_u16_le, read_u32_le, read_u64_le, write_u16_le};
+use crate::bytes::{
+    read_u16_le, read_u32_le, read_u64_le, write_u16_le, write_u32_le, write_u64_le,
+};
 use crate::checksum::checksum_with_zeroed_region;
 use crate::error::{EngineError, Result};
 use crate::layout::{
@@ -315,18 +317,16 @@ pub fn encode_leaf_page(
 ) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; PAGE_SIZE];
     let mut upper = PAGE_SIZE;
-    let mut slots = Vec::with_capacity(cells.len());
-    for cell in cells {
-        let encoded = encode_leaf_cell(cell)?;
-        if upper < PAGE_HEADER_SIZE + (cells.len() * 2) + encoded.len() {
+    let lower = PAGE_HEADER_SIZE + cells.len() * 2;
+    for (index, cell) in cells.iter().enumerate() {
+        let use_overflow = cell.value_kind == ValueKind::Overflow;
+        let encoded_len = leaf_cell_size(cell.key.len(), cell.value.len(), use_overflow);
+        if upper < lower + encoded_len {
             return Err(EngineError::Serialization("leaf page overflow".into()));
         }
-        upper -= encoded.len();
-        buf[upper..upper + encoded.len()].copy_from_slice(&encoded);
-        slots.push(upper as u16);
-    }
-    for (i, slot) in slots.iter().enumerate() {
-        write_u16_le(&mut buf, PAGE_HEADER_SIZE + i * 2, *slot)?;
+        upper -= encoded_len;
+        encode_leaf_cell_into(&mut buf[upper..upper + encoded_len], cell)?;
+        write_u16_le(&mut buf, PAGE_HEADER_SIZE + index * 2, upper as u16)?;
     }
     write_page_header(
         &mut buf,
@@ -335,7 +335,7 @@ pub fn encode_leaf_page(
             page_kind: PageKind::Leaf,
             level,
             cell_count: cells.len() as u16,
-            lower: (PAGE_HEADER_SIZE + slots.len() * 2) as u16,
+            lower: lower as u16,
             upper: upper as u16,
             right_sibling_page_id,
         },
@@ -351,18 +351,15 @@ pub fn encode_internal_page(
 ) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; PAGE_SIZE];
     let mut upper = PAGE_SIZE;
-    let mut slots = Vec::with_capacity(cells.len());
-    for cell in cells {
-        let encoded = encode_internal_cell(cell)?;
-        if upper < PAGE_HEADER_SIZE + (cells.len() * 2) + encoded.len() {
+    let lower = PAGE_HEADER_SIZE + cells.len() * 2;
+    for (index, cell) in cells.iter().enumerate() {
+        let encoded_len = internal_cell_size(cell.separator.len());
+        if upper < lower + encoded_len {
             return Err(EngineError::Serialization("internal page overflow".into()));
         }
-        upper -= encoded.len();
-        buf[upper..upper + encoded.len()].copy_from_slice(&encoded);
-        slots.push(upper as u16);
-    }
-    for (i, slot) in slots.iter().enumerate() {
-        write_u16_le(&mut buf, PAGE_HEADER_SIZE + i * 2, *slot)?;
+        upper -= encoded_len;
+        encode_internal_cell_into(&mut buf[upper..upper + encoded_len], cell)?;
+        write_u16_le(&mut buf, PAGE_HEADER_SIZE + index * 2, upper as u16)?;
     }
     write_page_header(
         &mut buf,
@@ -371,7 +368,7 @@ pub fn encode_internal_page(
             page_kind: PageKind::Internal,
             level,
             cell_count: cells.len() as u16,
-            lower: (PAGE_HEADER_SIZE + slots.len() * 2) as u16,
+            lower: lower as u16,
             upper: upper as u16,
             right_sibling_page_id,
         },
@@ -430,7 +427,7 @@ pub fn should_overflow_value(value_len: usize) -> bool {
     value_len > INLINE_VALUE_LIMIT
 }
 
-fn encode_leaf_cell(cell: &LeafCell) -> Result<Vec<u8>> {
+fn encode_leaf_cell_into(dst: &mut [u8], cell: &LeafCell) -> Result<()> {
     let key_len = cell.key.len();
     let use_overflow = cell.value_kind == ValueKind::Overflow;
     let inline_value = if use_overflow {
@@ -438,16 +435,15 @@ fn encode_leaf_cell(cell: &LeafCell) -> Result<Vec<u8>> {
     } else {
         cell.value.as_slice()
     };
-    let mut out = Vec::with_capacity(leaf_cell_size(key_len, inline_value.len(), use_overflow));
-    out.extend_from_slice(&(key_len as u16).to_le_bytes());
-    out.push(cell.value_kind as u8);
-    out.push(0);
-    out.extend_from_slice(&cell.total_value_len.to_le_bytes());
-    out.extend_from_slice(&cell.overflow_head_page_id.to_le_bytes());
-    out.extend_from_slice(&(inline_value.len() as u32).to_le_bytes());
-    out.extend_from_slice(&cell.key);
-    out.extend_from_slice(inline_value);
-    Ok(out)
+    write_u16_le(dst, 0, key_len as u16)?;
+    dst[2] = cell.value_kind as u8;
+    dst[3] = 0;
+    write_u32_le(dst, 4, cell.total_value_len)?;
+    write_u64_le(dst, 8, cell.overflow_head_page_id)?;
+    write_u32_le(dst, 16, inline_value.len() as u32)?;
+    dst[20..20 + key_len].copy_from_slice(&cell.key);
+    dst[20 + key_len..].copy_from_slice(inline_value);
+    Ok(())
 }
 
 fn decode_leaf_cell(bytes: &[u8]) -> Result<LeafCell> {
@@ -512,13 +508,12 @@ fn decode_leaf_cell(bytes: &[u8]) -> Result<LeafCell> {
     })
 }
 
-fn encode_internal_cell(cell: &InternalCell) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(internal_cell_size(cell.separator.len()));
-    out.extend_from_slice(&(cell.separator.len() as u16).to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes());
-    out.extend_from_slice(&cell.child_page_id.to_le_bytes());
-    out.extend_from_slice(&cell.separator);
-    Ok(out)
+fn encode_internal_cell_into(dst: &mut [u8], cell: &InternalCell) -> Result<()> {
+    write_u16_le(dst, 0, cell.separator.len() as u16)?;
+    write_u16_le(dst, 2, 0)?;
+    write_u64_le(dst, 4, cell.child_page_id)?;
+    dst[12..].copy_from_slice(&cell.separator);
+    Ok(())
 }
 
 fn decode_internal_cell(bytes: &[u8]) -> Result<InternalCell> {

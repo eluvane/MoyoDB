@@ -11,10 +11,8 @@ const here = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
 const value = (flag) => {
     const index = args.indexOf(flag);
-    if (index < 0)
-        return undefined;
-    if (!args[index + 1] || args[index + 1].startsWith('--'))
-        throw new Error(`missing ${flag} value`);
+    if (index < 0) return undefined;
+    if (!args[index + 1] || args[index + 1].startsWith('--')) throw new Error(`missing ${flag} value`);
     return args[index + 1];
 };
 const source = resolve(value('--source-root') ?? join(here, '../src'));
@@ -32,19 +30,40 @@ try {
         });
         const errors = (result.diagnostics ?? []).filter((d) => d.category === ts.DiagnosticCategory.Error);
         if (errors.length)
-            throw new Error(ts.formatDiagnosticsWithColorAndContext(errors, {
-                getCanonicalFileName: (f) => f, getCurrentDirectory: () => source, getNewLine: () => '\n'
-            }));
+            throw new Error(
+                ts.formatDiagnosticsWithColorAndContext(errors, {
+                    getCanonicalFileName: (f) => f,
+                    getCurrentDirectory: () => source,
+                    getNewLine: () => '\n'
+                })
+            );
         const code = result.outputText.replace(/from '(\.\/[^']+)'/g, "from '$1.mjs'");
         await writeFile(join(output, `${name}.mjs`), code);
     }
-    await writeFile(join(output, 'worker-server.mjs'), `export let runtime;
+    await writeFile(
+        join(output, 'worker-server.mjs'),
+        `export let runtime;
 export function exposeWorkerApi(api) { runtime = api; }
-`);
-    const protocolNames = ['packedOptionalValues', 'unpackPackedBatchOpKeys', 'unpackPackedBatchOps',
-        'unpackPackedBinaryList', 'unpackPackedBinaryPairKeys', 'unpackPackedBinaryPairs', 'unpackPackedOptionalValues'];
-    await writeFile(join(output, 'worker-protocol.mjs'), protocolNames.map((name) => `export function ${name}() { throw new Error('packed transport is outside this fixture'); }`).join('\n'));
-    await writeFile(join(output, 'compression.mjs'), `
+`
+    );
+    const protocolNames = [
+        'packedOptionalValues',
+        'unpackPackedBatchOpKeys',
+        'unpackPackedBatchOps',
+        'unpackPackedBinaryList',
+        'unpackPackedBinaryPairKeys',
+        'unpackPackedBinaryPairs',
+        'unpackPackedOptionalValues'
+    ];
+    await writeFile(
+        join(output, 'worker-protocol.mjs'),
+        protocolNames
+            .map((name) => `export function ${name}() { throw new Error('packed transport is outside this fixture'); }`)
+            .join('\n')
+    );
+    await writeFile(
+        join(output, 'compression.mjs'),
+        `
 export function compressionFromStoreFlags(flags) {
     if (flags !== 0) throw new Error('compressed format is outside this fixture');
     return false;
@@ -56,32 +75,40 @@ export async function encodeStoreValueRecord(value, compression) {
 export function decodeStoreValueRecord() { throw new Error('compression codec is outside this fixture'); }
 export function wrapSnapshotWithCompression() { throw new Error('snapshot codec is outside this fixture'); }
 export function unwrapSnapshotCompression() { throw new Error('snapshot codec is outside this fixture'); }
-`);
+`
+    );
     await cp(join(here, '../tests/minimum-work-suite.mjs'), join(output, 'suite.mjs'));
-    await writeFile(join(output, 'suite-loader.mjs'), `
+    await writeFile(
+        join(output, 'suite-loader.mjs'),
+        `
 import './worker.mjs';
 import { runtime } from './worker-server.mjs';
 import * as indexing from './indexing.mjs';
 import * as codec from './codec.mjs';
 import { createSuite } from './suite.mjs';
 export const suite = createSuite({ runtime, indexing, codec });
-`);
+`
+    );
     if (keep) {
         console.log(`Portable fixture emitted to ${output}`);
-    }
-    else {
-        globalThis.self = { addEventListener() { }, removeEventListener() { } };
+    } else {
+        globalThis.self = { addEventListener() {}, removeEventListener() {} };
         await import(pathToFileURL(join(output, 'worker.mjs')).href);
-        const [{ runtime }, indexing, codec] = await Promise.all(['worker-server', 'indexing', 'codec'].map((name) => import(pathToFileURL(join(output, `${name}.mjs`)).href)));
+        const [{ runtime }, indexing, codec] = await Promise.all(
+            ['worker-server', 'indexing', 'codec'].map(
+                (name) => import(pathToFileURL(join(output, `${name}.mjs`)).href)
+            )
+        );
         const suite = createSuite({ runtime, indexing, codec });
-        const mode = args.includes('--measure-only') ? 'measure' : args.includes('--semantics-only') ? 'semantics' : 'all';
+        const mode = args.includes('--measure-only')
+            ? 'measure'
+            : args.includes('--semantics-only')
+              ? 'semantics'
+              : 'all';
         const result = mode === 'measure' ? await suite.measureWork() : await suite.runTests(mode === 'all');
         console.log(JSON.stringify({ source, node: process.version, typescript: ts.version, ...result }, null, 2));
-        if (result.failed > 0)
-            process.exitCode = 1;
+        if (result.failed > 0) process.exitCode = 1;
     }
-}
-finally {
-    if (!keep)
-        await rm(output, { recursive: true, force: true });
+} finally {
+    if (!keep) await rm(output, { recursive: true, force: true });
 }
