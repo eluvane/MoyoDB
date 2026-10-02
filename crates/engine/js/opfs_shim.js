@@ -207,13 +207,14 @@ async function readControlFile(dbRoot) {
         accessHandle.close();
     }
 }
-async function hasLegacyDataFiles(dbRoot) {
-    for (const fileName of FILE_NAMES) {
-        if (await lookupFileHandle(dbRoot, fileName)) {
-            return true;
-        }
+async function hasLegacyDataFiles(dbRoot, fileKind = 0) {
+    if (fileKind === FILE_NAMES.length) {
+        return false;
     }
-    return false;
+    if (await lookupFileHandle(dbRoot, FILE_NAMES[fileKind])) {
+        return true;
+    }
+    return await hasLegacyDataFiles(dbRoot, fileKind + 1);
 }
 // Resolves which directory holds the live database, failing closed on damage.
 //
@@ -274,19 +275,30 @@ function createGenerationName() {
     const randomPart = Array.from(randomBytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
     return `gen-${timePart}-${randomPart}`;
 }
+async function createGenerationDirectory(dbRoot) {
+    const generationName = createGenerationName();
+    if (await lookupDirectoryHandle(dbRoot, generationName)) {
+        return await createGenerationDirectory(dbRoot);
+    }
+    await dbRoot.getDirectoryHandle(generationName, { create: true });
+    return generationName;
+}
 async function getDbRoot(encodedDbName, createIfMissing) {
     const stackdb = await getOrCreateStackdbRoot();
-    let dbRoot = await lookupDirectoryHandle(stackdb, encodedDbName);
+    if (createIfMissing) {
+        // This already returns an existing directory. A failed lookup first
+        // adds a storage round trip to every newly created database.
+        return await stackdb.getDirectoryHandle(encodedDbName, { create: true });
+    }
+    const dbRoot = await lookupDirectoryHandle(stackdb, encodedDbName);
     if (!dbRoot) {
-        if (!createIfMissing) {
-            throw new Error(`database ${encodedDbName} does not exist`);
-        }
-        dbRoot = await stackdb.getDirectoryHandle(encodedDbName, { create: true });
+        throw new Error(`database ${encodedDbName} does not exist`);
     }
     return dbRoot;
 }
 async function removeLegacyDataFiles(dbRoot) {
-    for (const fileName of FILE_NAMES) {
+    await FILE_NAMES.reduce(async (previous, fileName) => {
+        await previous;
         try {
             await dbRoot.removeEntry(fileName);
         } catch (err) {
@@ -294,7 +306,7 @@ async function removeLegacyDataFiles(dbRoot) {
                 throw err;
             }
         }
-    }
+    }, Promise.resolve());
 }
 async function resolveActiveDataDir(dbRoot) {
     const activeGeneration = await resolveActiveGeneration(dbRoot);
@@ -326,7 +338,7 @@ function closeSession(sessionId) {
     for (const handle of session.handles.values()) {
         try {
             handle.close();
-        } catch (_err) {}
+        } catch {}
     }
     sessions.delete(sessionId);
 }
@@ -339,24 +351,35 @@ function closeSessionsForDb(encodedDbName) {
     }
 }
 async function openSessionForDir(dbPath, dirHandle, generationName) {
-    const handles = new Map();
-    try {
-        for (let fileKind = 0; fileKind < FILE_NAMES.length; fileKind += 1) {
-            const fileName = FILE_NAMES[fileKind];
+    // Generation resolution and legacy cleanup have already finished. Only
+    // independent file acquisitions overlap; no session is visible yet.
+    const opened = await Promise.allSettled(
+        FILE_NAMES.map(async (fileName) => {
             const fileHandle = await dirHandle.getFileHandle(fileName, { create: true });
             if (typeof fileHandle.createSyncAccessHandle !== 'function') {
                 throw new Error('createSyncAccessHandle is unavailable');
             }
-            const accessHandle = await fileHandle.createSyncAccessHandle();
-            handles.set(fileKind, accessHandle);
+            return await fileHandle.createSyncAccessHandle();
+        })
+    );
+    const handles = new Map();
+    for (let fileKind = 0; fileKind < opened.length; fileKind += 1) {
+        const result = opened[fileKind];
+        if (result.status === 'fulfilled') {
+            handles.set(fileKind, result.value);
         }
-    } catch (error) {
+    }
+    const failed = opened.find((result) => result.status === 'rejected');
+    if (failed) {
+        // Drain every acquisition before failing, including late successes.
+        // Promise.all would let those handles escape cleanup after rejection.
         for (const handle of handles.values()) {
             try {
                 handle.close();
-            } catch (_err) {}
+            } catch {}
         }
-        throw error;
+        // Preserve file-order error precedence, not completion-order races.
+        throw failed.reason;
     }
     const sessionId = nextSessionId;
     nextSessionId += 1;
@@ -457,11 +480,7 @@ export function opfsCloseSession(sessionId) {
 }
 export async function opfsPrepareRebuildTarget(encodedDbName) {
     const dbRoot = await getDbRoot(encodedDbName, true);
-    let generationName = createGenerationName();
-    while (await lookupDirectoryHandle(dbRoot, generationName)) {
-        generationName = createGenerationName();
-    }
-    await dbRoot.getDirectoryHandle(generationName, { create: true });
+    const generationName = await createGenerationDirectory(dbRoot);
     return { generationName };
 }
 // Publishes `generationName` as the live database. Resolves only after the
@@ -495,11 +514,12 @@ export async function opfsCleanupInactiveEntries(encodedDbName) {
             staleDirectories.push(name);
         }
     }
-    for (const name of staleDirectories) {
+    await staleDirectories.reduce(async (previous, name) => {
+        await previous;
         try {
             await dbRoot.removeEntry(name, { recursive: true });
-        } catch (_err) {}
-    }
+        } catch {}
+    }, Promise.resolve());
 }
 export async function opfsDbDirectorySize(encodedDbName) {
     const dbRoot = await lookupDirectoryHandle(await getOrCreateStackdbRoot(), encodedDbName);

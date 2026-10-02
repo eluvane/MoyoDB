@@ -4,6 +4,7 @@
 // being treated like a missing one.
 import assert from 'node:assert/strict';
 import { beforeEach, describe, test } from 'node:test';
+import { setImmediate as nextTurn } from 'node:timers/promises';
 
 const CONTROL_FILE_NAME = 'root-manifest.bin';
 const CONTROL_SLOT_SIZE = 4096;
@@ -159,9 +160,7 @@ async function seedDb({ control = null, generations = [], legacy = false } = {})
     const name = `db-${dbCounter}`;
     const stackdb = await opfsRoot.getDirectoryHandle('stackdb', { create: true });
     const dbRoot = await stackdb.getDirectoryHandle(name, { create: true });
-    for (const generation of generations) {
-        await dbRoot.getDirectoryHandle(generation, { create: true });
-    }
+    await Promise.all(generations.map((generation) => dbRoot.getDirectoryHandle(generation, { create: true })));
     let controlFile = null;
     if (control) {
         controlFile = (await dbRoot.getFileHandle(CONTROL_FILE_NAME, { create: true })).file;
@@ -509,6 +508,428 @@ describe('swapActiveGeneration', () => {
         await opfsSwapActiveGeneration(fresh.name, 'gen-c-3', null);
         assert.equal(await opfsReadActiveGeneration(fresh.name), 'gen-c-3');
         await opfsCleanupInactiveEntries(fresh.name);
-        assert.deepEqual(Array.from(fresh.dbRoot.children.keys()).sort(), ['gen-c-3', CONTROL_FILE_NAME]);
+        assert.deepEqual(Array.from(fresh.dbRoot.children.keys()).toSorted(), ['gen-c-3', CONTROL_FILE_NAME]);
+    });
+});
+
+// Resolve one wave of independent native calls at a time, in reverse order.
+// This measures dependencies, not browser latency or filesystem throughput.
+function queuedOpenIo(t, dir, { failStage, failKind, failure, unsupportedKind, closeFailureKind } = {}) {
+    const names = ['manifest.bin', 'main.bin', 'wal.bin'];
+    const getFile = dir.getFileHandle.bind(dir);
+    const work = { calls: [], waves: [], closed: [], live: new Set() };
+    let queued = [];
+    function defer(label, action) {
+        work.calls.push(label);
+        return new Promise((resolve, reject) => {
+            queued.push({
+                label,
+                run() {
+                    try {
+                        resolve(action());
+                    } catch (error) {
+                        reject(error);
+                    }
+                }
+            });
+        });
+    }
+    t.mock.method(dir, 'getFileHandle', (name, options) => {
+        const kind = names.indexOf(name);
+        if (kind < 0 || !options?.create) {
+            return getFile(name, options);
+        }
+        return defer(`file:${kind}`, async () => {
+            if (failStage === 'file' && failKind === kind) throw failure;
+            const file = await getFile(name, options);
+            if (unsupportedKind === kind) return {};
+            return {
+                createSyncAccessHandle() {
+                    return defer(`access:${kind}`, async () => {
+                        if (failStage === 'access' && failKind === kind) throw failure;
+                        const handle = await file.createSyncAccessHandle();
+                        work.live.add(kind);
+                        t.mock.method(handle, 'close', () => {
+                            work.closed.push(kind);
+                            work.live.delete(kind);
+                            if (closeFailureKind === kind) throw new Error('injected close failure');
+                        });
+                        t.mock.method(handle, 'write', () => assert.fail('opening must not write data'));
+                        t.mock.method(handle, 'flush', () => assert.fail('opening must not change flush semantics'));
+                        t.mock.method(handle, 'truncate', () => assert.fail('opening must not truncate data'));
+                        return handle;
+                    });
+                }
+            };
+        });
+    });
+    return {
+        work,
+        async finish(operation) {
+            let outcome;
+            operation.then(
+                (value) => {
+                    outcome = { ok: true, value };
+                },
+                (error) => {
+                    outcome = { ok: false, error };
+                }
+            );
+            async function drainTurn(turn) {
+                if (outcome !== undefined || turn === 32) return;
+                await nextTurn();
+                const ready = queued;
+                queued = [];
+                if (ready.length > 0) work.waves.push(ready.map(({ label }) => label));
+                for (const item of ready.toReversed()) item.run();
+                await drainTurn(turn + 1);
+            }
+            await drainTurn(0);
+            assert.notEqual(outcome, undefined, 'open failed to settle after draining native calls');
+            assert.equal(queued.length, 0, 'open returned with native calls still pending');
+            if (!outcome.ok) throw outcome.error;
+            return outcome.value;
+        }
+    };
+}
+
+describe('OPFS open work and failure cleanup', () => {
+    test('creates a missing DB with one directory request and preserves existing files', async (t) => {
+        const stackdb = await opfsRoot.getDirectoryHandle('stackdb', { create: true });
+        const getDirectory = stackdb.getDirectoryHandle.bind(stackdb);
+        const name = `open-new-${++dbCounter}`;
+        const calls = [];
+        t.mock.method(stackdb, 'getDirectoryHandle', (entry, options) => {
+            if (entry === name) calls.push(options.create);
+            return getDirectory(entry, options);
+        });
+        let session = await opfs.opfsOpenActiveDb(name);
+        try {
+            assert.deepEqual(calls, [true]);
+            opfs.opfsWriteAt(session.sessionId, 1, 0n, new Uint8Array([9, 8, 7]));
+        } finally {
+            opfsCloseSession(session.sessionId);
+        }
+        calls.length = 0;
+        session = await opfs.opfsOpenActiveDb(name);
+        try {
+            assert.deepEqual(calls, [true]);
+            assert.deepEqual(Array.from(opfsReadAt(session.sessionId, 1, 0n, 3)), [9, 8, 7]);
+        } finally {
+            opfsCloseSession(session.sessionId);
+        }
+    });
+
+    test('does not create a missing DB when createIfMissing is false', async () => {
+        const stackdb = await opfsRoot.getDirectoryHandle('stackdb', { create: true });
+        const name = `open-missing-${++dbCounter}`;
+        await assert.rejects(opfs.opfsOpenActiveDb(name, false), { message: `database ${name} does not exist` });
+        assert.equal(stackdb.children.has(name), false);
+        const collision = await stackdb.getFileHandle(name, { create: true });
+        await assert.rejects(opfs.opfsOpenActiveDb(name, true), { name: 'TypeMismatchError' });
+        await assert.rejects(opfs.opfsOpenActiveDb(name, false), { message: `database ${name} does not exist` });
+        assert.equal(stackdb.children.get(name), collision);
+    });
+
+    test('opens three files in two dependency waves with stable file-kind mapping', async (t) => {
+        const { name, dbRoot } = await seedDb();
+        const names = ['manifest.bin', 'main.bin', 'wal.bin'];
+        await Promise.all(
+            names.map(async (entry, kind) => {
+                const file = await dbRoot.getFileHandle(entry, { create: true });
+                file.file.bytes = new Uint8Array([kind + 1]);
+            })
+        );
+        const io = queuedOpenIo(t, dbRoot);
+        const { sessionId, generationName } = await io.finish(opfs.opfsOpenActiveDb(name, false));
+        try {
+            t.diagnostic(`file acquisitions: ${io.work.calls.length}; dependency waves: ${io.work.waves.length}`);
+            assert.equal(generationName, null);
+            assert.equal(io.work.calls.length, 6);
+            assert.equal(io.work.waves.length, 2);
+            assert.deepEqual(
+                io.work.waves.map((wave) => wave.toSorted()),
+                [
+                    ['file:0', 'file:1', 'file:2'],
+                    ['access:0', 'access:1', 'access:2']
+                ]
+            );
+            assert.equal(io.work.live.size, 3);
+            for (let kind = 0; kind < names.length; kind += 1) {
+                assert.deepEqual(Array.from(opfsReadAt(sessionId, kind, 0n, 1)), [kind + 1]);
+            }
+        } finally {
+            opfsCloseSession(sessionId);
+        }
+        assert.deepEqual(io.work.closed, [0, 1, 2]);
+        assert.equal(io.work.live.size, 0);
+    });
+
+    for (const failStage of ['file', 'access']) {
+        for (const failKind of [0, 1, 2]) {
+            test(`drains and closes successful opens after ${failStage} failure at kind ${failKind}`, async (t) => {
+                const { name, dbRoot } = await seedDb();
+                const failure = new DOMException('injected acquisition failure', 'NotAllowedError');
+                const io = queuedOpenIo(t, dbRoot, { failStage, failKind, failure });
+                await assert.rejects(io.finish(opfs.opfsOpenActiveDb(name, false)), (error) => error === failure);
+                assert.equal(io.work.live.size, 0);
+                assert.deepEqual(
+                    io.work.closed,
+                    [0, 1, 2].filter((kind) => kind !== failKind)
+                );
+                assert.equal(io.work.calls.filter((call) => call.startsWith('file:')).length, 3);
+            });
+        }
+    }
+
+    test('closes other handles when SyncAccessHandle is unavailable', async (t) => {
+        const { name, dbRoot } = await seedDb();
+        const io = queuedOpenIo(t, dbRoot, { unsupportedKind: 1 });
+        await assert.rejects(io.finish(opfs.opfsOpenActiveDb(name, false)), /createSyncAccessHandle is unavailable/);
+        assert.deepEqual(io.work.closed, [0, 2]);
+        assert.equal(io.work.live.size, 0);
+    });
+
+    test('attempts every close and preserves even a falsy acquisition error', async (t) => {
+        const { name, dbRoot } = await seedDb();
+        const io = queuedOpenIo(t, dbRoot, {
+            failStage: 'access',
+            failKind: 1,
+            failure: undefined,
+            closeFailureKind: 0
+        });
+        let rejected = false;
+        try {
+            await io.finish(opfs.opfsOpenActiveDb(name, false));
+        } catch (error) {
+            rejected = true;
+            assert.equal(error, undefined);
+        }
+        assert.equal(rejected, true);
+        assert.deepEqual(io.work.closed, [0, 2]);
+    });
+
+    test('waits for late handles before rejection, closes them, and does not publish a session', async (t) => {
+        const { name, dbRoot } = await seedDb();
+        const before = await opfs.opfsOpenActiveDb(name, false);
+        opfsCloseSession(before.sessionId);
+        const names = ['manifest.bin', 'main.bin', 'wal.bin'];
+        const gates = names.map(() => Promise.withResolvers());
+        const closed = [];
+        const started = [];
+        const handles = await Promise.all(
+            names.map(async (entry, kind) => {
+                const file = await dbRoot.getFileHandle(entry);
+                const handle = await file.createSyncAccessHandle();
+                t.mock.method(handle, 'close', () => closed.push(kind));
+                t.mock.method(file, 'createSyncAccessHandle', () => {
+                    started.push(kind);
+                    return gates[kind].promise;
+                });
+                return handle;
+            })
+        );
+        const failure = new Error('middle file failed');
+        let settled = false;
+        const opening = opfs.opfsOpenActiveDb(name, false);
+        const rejected = assert.rejects(opening, (error) => error === failure);
+        opening.then(
+            () => {
+                settled = true;
+            },
+            () => {
+                settled = true;
+            }
+        );
+        await nextTurn();
+        assert.deepEqual(started, [0, 1, 2]);
+        gates[0].resolve(handles[0]);
+        gates[1].reject(failure);
+        await nextTurn();
+        assert.equal(settled, false, 'failure escaped while the WAL handle was still pending');
+        assert.deepEqual(closed, []);
+        assert.throws(() => opfs.opfsLen(before.sessionId + 1, 0), /no OPFS session/);
+        gates[2].resolve(handles[2]);
+        await rejected;
+        assert.deepEqual(closed, [0, 2]);
+        t.mock.restoreAll();
+        const reopened = await opfs.opfsOpenActiveDb(name, false);
+        try {
+            assert.equal(reopened.sessionId, before.sessionId + 1);
+        } finally {
+            opfsCloseSession(reopened.sessionId);
+        }
+    });
+
+    test('reports the first file-order failure rather than the fastest failure', async (t) => {
+        const { name, dbRoot } = await seedDb();
+        const gates = [Promise.withResolvers(), Promise.withResolvers()];
+        const first = new Error('manifest failed later');
+        const last = new Error('WAL failed first');
+        const getFile = dbRoot.getFileHandle.bind(dbRoot);
+        let closed = false;
+        t.mock.method(dbRoot, 'getFileHandle', async (entry, options) => {
+            if (entry === 'manifest.bin') return gates[0].promise;
+            if (entry === 'wal.bin') return gates[1].promise;
+            const file = await getFile(entry, options);
+            if (entry === 'main.bin') {
+                t.mock.method(file, 'createSyncAccessHandle', async () => {
+                    const handle = new MemoryAccessHandle(file.file);
+                    t.mock.method(handle, 'close', () => {
+                        closed = true;
+                    });
+                    return handle;
+                });
+            }
+            return file;
+        });
+        const opening = opfs.opfsOpenActiveDb(name, false);
+        const rejected = assert.rejects(opening, (error) => error === first);
+        await nextTurn();
+        gates[1].reject(last);
+        await nextTurn();
+        gates[0].reject(first);
+        await rejected;
+        assert.equal(closed, true);
+    });
+
+    test('a legacy-cleanup failure prevents data-handle acquisition', async (t) => {
+        const generation = 'gen-open-2';
+        const { name, dbRoot } = await seedDb({
+            control: controlBytes(encodeControlSlot(1, generation)),
+            generations: [generation],
+            legacy: true
+        });
+        const io = queuedOpenIo(t, await dbRoot.getDirectoryHandle(generation));
+        const failure = new DOMException('legacy cleanup failed', 'NotAllowedError');
+        t.mock.method(dbRoot, 'removeEntry', async () => {
+            throw failure;
+        });
+        await assert.rejects(io.finish(opfs.opfsOpenActiveDb(name, false)), (error) => error === failure);
+        assert.deepEqual(io.work.calls, []);
+    });
+
+    test('does not open data files before corrupt control state is rejected', async (t) => {
+        const { name, dbRoot } = await seedDb({ control: new Uint8Array(8192) });
+        const io = queuedOpenIo(t, dbRoot);
+        await assert.rejects(io.finish(opfs.opfsOpenActiveDb(name, false)), { name: 'CorruptionError' });
+        assert.deepEqual(io.work.calls, []);
+        assert.deepEqual([...dbRoot.children.keys()], [CONTROL_FILE_NAME]);
+    });
+
+    test('published-generation open removes legacy files before acquiring data handles', async (t) => {
+        const generation = 'gen-open-1';
+        const { name, dbRoot } = await seedDb({
+            control: controlBytes(encodeControlSlot(1, generation)),
+            generations: [generation],
+            legacy: true
+        });
+        const dir = await dbRoot.getDirectoryHandle(generation);
+        const io = queuedOpenIo(t, dir);
+        const { sessionId, generationName } = await io.finish(opfs.opfsOpenActiveDb(name, false));
+        try {
+            assert.equal(generationName, generation);
+            assert.equal(dbRoot.children.has('manifest.bin'), false);
+            assert.deepEqual([...dir.children.keys()].toSorted(), ['main.bin', 'manifest.bin', 'wal.bin']);
+            assert.equal(io.work.waves.length, 2);
+        } finally {
+            opfsCloseSession(sessionId);
+        }
+    });
+});
+
+describe('OPFS serial storage operations', () => {
+    test('legacy detection stops at the first existing file', async (t) => {
+        const { name, dbRoot } = await seedDb({ control: new Uint8Array(8192), legacy: true });
+        const getFile = dbRoot.getFileHandle.bind(dbRoot);
+        const calls = [];
+        t.mock.method(dbRoot, 'getFileHandle', (entry, options) => {
+            calls.push(entry);
+            if (entry === 'main.bin' || entry === 'wal.bin') {
+                throw new DOMException('must not inspect later legacy files', 'NotAllowedError');
+            }
+            return getFile(entry, options);
+        });
+        assert.equal(await opfsReadActiveGeneration(name), null);
+        assert.deepEqual(calls, [CONTROL_FILE_NAME, 'manifest.bin']);
+    });
+
+    test('legacy detection propagates lookup errors before inspecting later files', async (t) => {
+        const { name, dbRoot } = await seedDb({ control: new Uint8Array(8192) });
+        const getFile = dbRoot.getFileHandle.bind(dbRoot);
+        const failure = new DOMException('main lookup denied', 'NotAllowedError');
+        const calls = [];
+        t.mock.method(dbRoot, 'getFileHandle', (entry, options) => {
+            calls.push(entry);
+            if (entry === 'main.bin') throw failure;
+            return getFile(entry, options);
+        });
+        await assert.rejects(opfsReadActiveGeneration(name), (error) => error === failure);
+        assert.deepEqual(calls, [CONTROL_FILE_NAME, 'manifest.bin', 'main.bin']);
+    });
+
+    test('legacy cleanup stops on failure before later deletions or data opens', async (t) => {
+        const generation = 'gen-serial-1';
+        const { name, dbRoot } = await seedDb({
+            control: controlBytes(encodeControlSlot(1, generation)),
+            generations: [generation],
+            legacy: true
+        });
+        await Promise.all(['main.bin', 'wal.bin'].map((entry) => dbRoot.getFileHandle(entry, { create: true })));
+        const io = queuedOpenIo(t, await dbRoot.getDirectoryHandle(generation));
+        const remove = dbRoot.removeEntry.bind(dbRoot);
+        const failure = new DOMException('main deletion denied', 'NotAllowedError');
+        const calls = [];
+        t.mock.method(dbRoot, 'removeEntry', (entry, options) => {
+            calls.push(entry);
+            if (entry === 'main.bin') throw failure;
+            return remove(entry, options);
+        });
+        await assert.rejects(io.finish(opfs.opfsOpenActiveDb(name, false)), (error) => error === failure);
+        assert.deepEqual(calls, ['manifest.bin', 'main.bin']);
+        assert.equal(dbRoot.children.has('manifest.bin'), false);
+        assert.equal(dbRoot.children.has('main.bin'), true);
+        assert.equal(dbRoot.children.has('wal.bin'), true);
+        assert.deepEqual(io.work.calls, []);
+    });
+
+    test('stale cleanup waits for each deletion and continues after a failure', async (t) => {
+        const active = 'gen-serial-1';
+        const stale = ['gen-serial-2', 'gen-serial-3'];
+        const { name, dbRoot } = await seedDb({
+            control: controlBytes(encodeControlSlot(1, active)),
+            generations: [active, ...stale, 'unrelated']
+        });
+        const remove = dbRoot.removeEntry.bind(dbRoot);
+        const first = Promise.withResolvers();
+        const started = [];
+        t.mock.method(dbRoot, 'removeEntry', (entry, options) => {
+            if (!stale.includes(entry)) return remove(entry, options);
+            assert.deepEqual(options, { recursive: true });
+            started.push(entry);
+            return entry === stale[0] ? first.promise : remove(entry, options);
+        });
+        const cleanup = opfsCleanupInactiveEntries(name);
+        await nextTurn();
+        assert.deepEqual(started, [stale[0]]);
+        first.reject(new DOMException('stale deletion denied', 'NotAllowedError'));
+        await cleanup;
+        assert.deepEqual(started, stale);
+        assert.deepEqual([...dbRoot.children.keys()].toSorted(), [active, stale[0], CONTROL_FILE_NAME, 'unrelated']);
+    });
+
+    test('rebuild preparation retries a name collision without modifying the existing generation', async (t) => {
+        const { name, dbRoot } = await seedDb({ generations: ['gen-ya-01010101'] });
+        const existing = await dbRoot.getDirectoryHandle('gen-ya-01010101');
+        const file = await existing.getFileHandle('main.bin', { create: true });
+        file.file.bytes = new Uint8Array([9, 8, 7]);
+        let attempts = 0;
+        t.mock.method(Date, 'now', () => 1234);
+        t.mock.method(crypto, 'getRandomValues', (bytes) => bytes.fill(++attempts));
+        const result = await opfs.opfsPrepareRebuildTarget(name);
+        assert.deepEqual(result, { generationName: 'gen-ya-02020202' });
+        assert.equal(attempts, 2);
+        assert.deepEqual([...dbRoot.children.keys()], ['gen-ya-01010101', 'gen-ya-02020202']);
+        assert.deepEqual(Array.from(file.file.bytes), [9, 8, 7]);
     });
 });
