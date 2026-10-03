@@ -38,9 +38,10 @@ export interface BenchmarkStorageCleanupResult {
     errors: string[];
 }
 
-// MoyoDB has no relaxed mode: every commit flushes WAL, main file, and manifest
-// before it resolves. IndexedDB is therefore measured with `strict` by default.
-const MOYODB_DURABILITY = 'strict: WAL, main file, and manifest are flushed before commit resolves';
+// MoyoDB commits become durable at the WAL flush. Bounded checkpoints install
+// pages in the main file and flush the manifest. IndexedDB defaults to `strict`.
+const MOYODB_DURABILITY =
+    'strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest';
 
 export const defaultBenchOptions: BenchOptions = {
     engines: ['moyodb', 'indexeddb'],

@@ -1,11 +1,15 @@
 mod read_buffer;
 
-use crate::checksum::checksum_with_zeroed_region;
+#[cfg(test)]
+mod generated_tests;
+
+use crate::bytes::read_u32_le;
+use crate::checksum::{checksum_with_zeroed_region, crc32_with_generated_page};
 use crate::error::{EngineError, Result};
 use crate::layout::{
     unsafe_read_struct, wal_record_total_len, WalCommitBody, WalPageImageBodyHeader,
-    WalRecordHeader, WalTag, PAGE_SIZE, WAL_COMMIT_BODY_SIZE, WAL_MAGIC,
-    WAL_PAGE_IMAGE_BODY_HEADER_SIZE, WAL_RECORD_CHECKSUM_OFFSET, WAL_RECORD_HEADER_SIZE,
+    WalRecordHeader, WalTag, PAGE_HEADER_CHECKSUM_OFFSET, PAGE_SIZE, WAL_COMMIT_BODY_SIZE,
+    WAL_MAGIC, WAL_PAGE_IMAGE_BODY_HEADER_SIZE, WAL_RECORD_CHECKSUM_OFFSET, WAL_RECORD_HEADER_SIZE,
 };
 use crate::page::verify_page_image;
 use crate::pager::{Pager, PAGE_WRITE_BATCH_PAGES};
@@ -54,7 +58,7 @@ pub fn append_page_image_record<B: FileBackend>(
     let mut record = Vec::with_capacity(wal_record_total_len(
         WAL_PAGE_IMAGE_BODY_HEADER_SIZE + bytes.len(),
     ));
-    encode_page_image_record_into(&mut record, txid, page_id, bytes)?;
+    encode_page_image_record_into::<false>(&mut record, txid, page_id, bytes)?;
     wal.write_at(*offset, &record)?;
     *offset += record.len() as u64;
     Ok(())
@@ -73,6 +77,29 @@ pub fn append_commit_record<B: FileBackend>(
 }
 
 pub fn append_transaction<B: FileBackend>(
+    wal: &mut B,
+    offset: &mut u64,
+    txid: u64,
+    page_images: &[(u64, Vec<u8>)],
+    commit: &CommitRecord,
+) -> Result<()> {
+    append_transaction_inner::<false, B>(wal, offset, txid, page_images, commit)
+}
+
+/// Appends immutable page images just produced by the engine's page encoders.
+/// Their existing page checksums can be combined into the WAL checksum without
+/// rehashing their payload. External images use `append_transaction` instead.
+pub(crate) fn append_generated_transaction<B: FileBackend>(
+    wal: &mut B,
+    offset: &mut u64,
+    txid: u64,
+    page_images: &[(u64, Vec<u8>)],
+    commit: &CommitRecord,
+) -> Result<()> {
+    append_transaction_inner::<true, B>(wal, offset, txid, page_images, commit)
+}
+
+fn append_transaction_inner<const GENERATED: bool, B: FileBackend>(
     wal: &mut B,
     offset: &mut u64,
     txid: u64,
@@ -108,7 +135,7 @@ pub fn append_transaction<B: FileBackend>(
     // payload and the record as separate Vecs doubles copies in append-heavy paths.
     let mut batch = Vec::with_capacity(capacity);
     for (page_id, bytes) in page_images {
-        encode_page_image_record_into(&mut batch, txid, *page_id, bytes)?;
+        encode_page_image_record_into::<GENERATED>(&mut batch, txid, *page_id, bytes)?;
     }
     encode_commit_record_into(&mut batch, commit);
 
@@ -420,7 +447,7 @@ pub fn replay_wal_transactions<B: FileBackend>(
     Ok(())
 }
 
-fn encode_page_image_record_into(
+fn encode_page_image_record_into<const GENERATED: bool>(
     out: &mut Vec<u8>,
     txid: u64,
     page_id: u64,
@@ -445,8 +472,21 @@ fn encode_page_image_record_into(
         reserved: 0,
     };
     out.extend_from_slice(body_header.as_bytes());
+    let checksum = if GENERATED {
+        // The record checksum field is still zero. The engine has not changed
+        // these generated page bytes since their page checksum was computed.
+        Some(crc32_with_generated_page(
+            &out[record_start..],
+            read_u32_le(bytes, PAGE_HEADER_CHECKSUM_OFFSET)?,
+        ))
+    } else {
+        None
+    };
     out.extend_from_slice(bytes);
-    finish_record_checksum(out, record_start);
+    match checksum {
+        Some(checksum) => set_record_checksum(out, record_start, checksum),
+        None => finish_record_checksum(out, record_start),
+    }
     Ok(())
 }
 
@@ -480,6 +520,10 @@ fn append_record_header(out: &mut Vec<u8>, tag: WalTag, payload_len: usize) -> u
 
 fn finish_record_checksum(out: &mut [u8], record_start: usize) {
     let checksum = checksum_with_zeroed_region(&out[record_start..], WAL_RECORD_CHECKSUM_OFFSET, 4);
+    set_record_checksum(out, record_start, checksum);
+}
+
+fn set_record_checksum(out: &mut [u8], record_start: usize, checksum: u32) {
     let checksum_start = record_start + WAL_RECORD_CHECKSUM_OFFSET;
     out[checksum_start..checksum_start + 4].copy_from_slice(&checksum.to_le_bytes());
 }

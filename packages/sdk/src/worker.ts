@@ -592,7 +592,7 @@ class DbWorker implements WorkerApi {
             return;
         }
         assertSecureContext();
-        await assertCapabilities();
+        assertCapabilities();
         this.dbName = request.dbName;
         this.events = new BroadcastChannel(`db:${request.dbName}:events`);
         this.lease = new OwnershipLease();
@@ -692,7 +692,7 @@ class DbWorker implements WorkerApi {
     }
     async deleteDB(dbName: string): Promise<void> {
         assertSecureContext();
-        await assertCapabilities();
+        assertCapabilities();
         const lease = new OwnershipLease();
         let failure: unknown = null;
         let acquired = false;
@@ -2387,24 +2387,21 @@ class DbWorker implements WorkerApi {
         this.persistenceBridge.close();
     }
 }
-async function assertCapabilities(): Promise<void> {
+function assertCapabilities(): void {
     if (typeof navigator.storage.getDirectory !== 'function') {
         throw remoteError('UnsupportedPlatformError', 'navigator.storage.getDirectory is unavailable');
     }
     if (typeof BroadcastChannel === 'undefined') {
         throw remoteError('UnsupportedPlatformError', 'BroadcastChannel is unavailable');
     }
-    const root = await navigator.storage.getDirectory();
-    const dir = await root.getDirectoryHandle('__moyodb_capability__', { create: true });
-    const file = await dir.getFileHandle('probe.bin', { create: true });
-    if (typeof file.createSyncAccessHandle !== 'function') {
+    // Real database handle acquisition validates storage access. A shared
+    // probe file adds I/O and can lock out otherwise independent databases.
+    if (
+        typeof FileSystemFileHandle === 'undefined' ||
+        typeof FileSystemFileHandle.prototype.createSyncAccessHandle !== 'function'
+    ) {
         throw remoteError('UnsupportedPlatformError', 'createSyncAccessHandle is unavailable');
     }
-    const handle = await file.createSyncAccessHandle();
-    handle.close();
-    try {
-        await dir.removeEntry('probe.bin');
-    } catch {}
 }
 function assertSecureContext() {
     if (!self.isSecureContext) {

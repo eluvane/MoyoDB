@@ -66,3 +66,35 @@ test('worker_lifecycle_close_reopen_smoke', async ({ page }) => {
     }, dbName);
     expect(value).toBe('1');
 });
+
+test('independent databases can open and write concurrently', async ({ page }) => {
+    await prepareMoyoDbPage(page);
+    const names = [uniqueDbName('concurrent-open-a'), uniqueDbName('concurrent-open-b')];
+    const results = await page.evaluate(async (dbNames) => {
+        const settled = await Promise.allSettled(
+            dbNames.map(async (name, index) => {
+                const db = await window.moyodb.openDB(name, { requestPersistence: false });
+                try {
+                    await db.createStore('kv');
+                    const key = window.moyodb.utf8Encode('key');
+                    await db.put('kv', key, window.moyodb.utf8Encode(`value-${index}`));
+                    const value = await db.get('kv', key);
+                    return value ? window.moyodb.utf8Decode(value) : null;
+                } finally {
+                    await db.close();
+                }
+            })
+        );
+        // Both workers finish before deletion, even if one open failed.
+        await Promise.all(dbNames.map((name) => window.moyodb.deleteDB(name)));
+        return settled.map((result) =>
+            result.status === 'fulfilled'
+                ? { status: result.status, value: result.value }
+                : { status: result.status, error: String(result.reason) }
+        );
+    }, names);
+    expect(results).toEqual([
+        { status: 'fulfilled', value: 'value-0' },
+        { status: 'fulfilled', value: 'value-1' }
+    ]);
+});

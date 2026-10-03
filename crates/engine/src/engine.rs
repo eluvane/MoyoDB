@@ -42,7 +42,7 @@ use crate::value::{
     store_uses_value_envelope, stored_value_expired, StoreCompression, StoredValue,
     STORE_FLAG_COMPRESSION_MASK, STORE_FLAG_VALUE_ENVELOPE_V1, VALUE_ENVELOPE_HEADER_SIZE,
 };
-use crate::wal::{append_transaction, CommitRecord};
+use crate::wal::{append_generated_transaction, CommitRecord};
 use catalog_delta::{CatalogDelta, CatalogUpdate};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -1636,7 +1636,7 @@ impl<B: FileBackend> Engine<B> {
         let mut wal_offset = self.wal.len()?;
         // From the first WAL byte on, a failure leaves the log tail and the
         // outcome of this commit unknown. Only recovery can say which it was.
-        let appended = append_transaction(
+        let appended = append_generated_transaction(
             &mut self.wal,
             &mut wal_offset,
             new_txid,
