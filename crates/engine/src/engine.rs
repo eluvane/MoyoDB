@@ -6,17 +6,20 @@ mod catalog_tests;
 #[cfg(test)]
 mod commit_work_tests;
 
+#[cfg(test)]
+mod paired_crc_tests;
+
 use crate::btree::{
-    apply_mutations, build_catalog_tree, build_tree_from_sorted, collect_keys_below, free_tree,
-    lookup_stored_value, lookup_value_expiry, materialize_pending_value, pending_value_prefix,
-    BuiltTree, KvPair, Mutation, PageAllocator, PageImages, PendingValue, PointReadBatch,
-    RangeSpec, SortedTreeBuilder, TreeIter,
+    apply_value_mutations, build_catalog_tree, build_tree_from_sorted, build_tree_from_values,
+    collect_keys_below, free_tree, lookup_stored_value, lookup_value_expiry,
+    materialize_pending_value, pending_value_prefix, BuiltTree, KvPair, PageAllocator, PageImages,
+    PendingValue, PointReadBatch, RangeSpec, SortedTreeBuilder, TreeIter,
 };
 use crate::bytes::{validate_key, validate_store_name, validate_value};
 use crate::catalog::{CatalogMap, CatalogState, ChangeFeedPolicy};
 use crate::change_feed::{
     decode_change_record_payload_ref, encode_after_txid_key, encode_change_log_key,
-    encode_change_record_payload, is_internal_store_name, normalize_store_filter,
+    encode_change_record_prefix, is_internal_store_name, normalize_store_filter,
     validate_user_store_name, visible_store_count, visible_store_names, ChangeFeed,
     ChangeFeedOptions, ChangeKind, CHANGELOG_STORE_FLAGS, SYSTEM_CHANGELOG_STORE_NAME,
 };
@@ -24,6 +27,7 @@ use crate::checksum;
 use crate::error::{EngineError, Result};
 use crate::layout::{StoreMetadata, SuperblockState};
 use crate::pager::Pager;
+use crate::prepared_value::PreparedValue;
 use crate::recovery::{
     ensure_openable_or_initialize, load_catalog_snapshot, recover_if_needed, write_superblock,
 };
@@ -65,6 +69,21 @@ struct CommitPlan {
     final_change_feed_policy: ChangeFeedPolicy,
     page_images: PageImages,
     catalog_root_page_id: u64,
+}
+
+struct PreparedChange<'a> {
+    kind: ChangeKind,
+    value: PreparedValue<'a>,
+}
+
+impl<'a> PreparedChange<'a> {
+    fn new(store: &str, key: &[u8], kind: ChangeKind, value: Option<&'a [u8]>) -> Result<Self> {
+        let prefix = encode_change_record_prefix(store, key, kind, value)?;
+        Ok(Self {
+            kind,
+            value: PreparedValue::prefixed(prefix, value.unwrap_or(&[])),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1776,6 +1795,7 @@ fn plan_commit<B: FileBackend>(
         if !stage.has_changes() {
             continue;
         }
+        let change_start = change_payloads.len();
         if final_policy.enabled && !is_internal_store_name(name) {
             collect_change_payloads(pager, name, stage, now_ms, &mut change_payloads)?;
         }
@@ -1786,7 +1806,14 @@ fn plan_commit<B: FileBackend>(
             catalog_delta.remove(view.catalog, name);
             continue;
         }
-        let Some(built) = build_store_commit(pager, stage, now_ms, alloc)? else {
+        let Some(built) = build_store_commit(
+            pager,
+            stage,
+            &mut change_payloads[change_start..],
+            now_ms,
+            alloc,
+        )?
+        else {
             continue;
         };
         page_images.extend(built.page_images);
@@ -1847,7 +1874,7 @@ fn plan_commit<B: FileBackend>(
                 .collect::<Result<_>>()?;
             let built = match log_meta.as_ref() {
                 Some(meta) => {
-                    let mut mutations: Vec<Mutation<'_>> = prune_keys
+                    let mut mutations: Vec<(&[u8], Option<&PreparedValue<'_>>)> = prune_keys
                         .iter()
                         .map(|key| (key.as_slice(), None))
                         .collect();
@@ -1855,15 +1882,15 @@ fn plan_commit<B: FileBackend>(
                         append_keys
                             .iter()
                             .zip(&change_payloads)
-                            .map(|(key, payload)| (key.as_slice(), Some(payload.as_slice()))),
+                            .map(|(key, payload)| (key.as_slice(), Some(&payload.value))),
                     );
-                    apply_mutations(pager, meta.store_root_page_id, &mutations, alloc)?
+                    apply_value_mutations(pager, meta.store_root_page_id, &mutations, alloc)?
                 }
-                None => build_tree_from_sorted(
+                None => build_tree_from_values(
                     append_keys
                         .iter()
                         .zip(&change_payloads)
-                        .map(|(key, payload)| (key.as_slice(), payload.as_slice())),
+                        .map(|(key, payload)| (key.as_slice(), &payload.value)),
                     alloc,
                 )?,
             };
@@ -1911,9 +1938,10 @@ fn plan_commit<B: FileBackend>(
 }
 
 /// Builds the new tree of one changed store, or `None` if it is unchanged.
-fn build_store_commit<B: FileBackend>(
+fn build_store_commit<'a, B: FileBackend>(
     pager: &mut Pager<B>,
-    stage: &StagedStore,
+    stage: &'a StagedStore,
+    changes: &mut [PreparedChange<'a>],
     now_ms: u64,
     alloc: &mut PageAllocator,
 ) -> Result<Option<BuiltTree>> {
@@ -1924,40 +1952,41 @@ fn build_store_commit<B: FileBackend>(
                 free_tree(pager, base.store_root_page_id, alloc)?;
             }
         }
-        let encoded = encode_stage_puts(stage)?;
-        return build_tree_from_sorted(
-            encoded.iter().map(|(key, value)| (*key, value.as_slice())),
-            alloc,
-        )
-        .map(Some);
+        let encoded = prepare_stage_puts(stage, changes)?;
+        return build_tree_from_values(encoded.iter().map(|(key, value)| (*key, value)), alloc)
+            .map(Some);
     }
     let base = base.ok_or_else(|| EngineError::Internal("missing base metadata".into()))?;
     if stage.force_full_rewrite {
-        return rewrite_store_fully(pager, base, stage, now_ms, alloc).map(Some);
+        return rewrite_store_fully(pager, base, stage, changes, now_ms, alloc).map(Some);
     }
     if stage.mutations.is_empty() {
         return Ok(None);
     }
-    let encoded = encode_stage_mutations(stage)?;
-    let mutations: Vec<Mutation<'_>> = encoded
+    let encoded = prepare_stage_mutations(stage, changes)?;
+    let mutations: Vec<_> = encoded
         .iter()
-        .map(|(key, value)| (*key, value.as_deref()))
+        .map(|(key, value)| (*key, value.as_ref()))
         .collect();
-    apply_mutations(pager, base.store_root_page_id, &mutations, alloc).map(Some)
+    apply_value_mutations(pager, base.store_root_page_id, &mutations, alloc).map(Some)
 }
 
 /// Re-encodes a whole store after its value format changed (a TTL put into a
 /// store created before value envelopes). Streams the old tree and the staged
 /// mutations in key order into a new tree, then retires the old one.
-fn rewrite_store_fully<B: FileBackend>(
+fn rewrite_store_fully<'a, B: FileBackend>(
     pager: &mut Pager<B>,
     base: &StoreMetadata,
-    stage: &StagedStore,
+    stage: &'a StagedStore,
+    changes: &mut [PreparedChange<'a>],
     now_ms: u64,
     alloc: &mut PageAllocator,
 ) -> Result<BuiltTree> {
     let mut builder = SortedTreeBuilder::new();
     let mut staged = stage.mutations.iter().peekable();
+    let mut change_puts = changes
+        .iter_mut()
+        .filter(|change| change.kind == ChangeKind::Put);
     let mut iter = TreeIter::new(pager, base.store_root_page_id, &RangeSpec::default())?;
     let mut base_next = iter.next(pager)?;
     loop {
@@ -1975,13 +2004,18 @@ fn rewrite_store_fully<B: FileBackend>(
                 base_next = iter.next(pager)?;
             }
             if let MutationValue::Put(stored) = mutation {
-                builder.push(key, &stored.encode_for_store(stage.flags)?, alloc)?;
+                let value = prepare_staged_value(stored, stage.flags, change_puts.next())?;
+                builder.push_value(key, &value, alloc)?;
             }
         } else if let Some(pair) = base_next.take() {
             let raw = materialize_pending_value(pager, pair.value)?;
             let stored = StoredValue::decode_owned_for_store(base.flags, raw)?;
             if !stored.is_expired_at(now_ms) {
-                builder.push(&pair.key, &stored.encode_for_store(stage.flags)?, alloc)?;
+                builder.push_value(
+                    &pair.key,
+                    &PreparedValue::stored(&stored, stage.flags)?,
+                    alloc,
+                )?;
             }
             base_next = iter.next(pager)?;
         }
@@ -2079,14 +2113,31 @@ fn plan_snapshot_apply(
     })
 }
 
-fn encode_stage_puts(stage: &StagedStore) -> Result<Vec<(&[u8], Vec<u8>)>> {
+fn prepare_staged_value<'a>(
+    stored: &'a StoredValue,
+    flags: u64,
+    change: Option<&mut PreparedChange<'a>>,
+) -> Result<PreparedValue<'a>> {
+    let mut value = PreparedValue::stored(stored, flags)?;
+    if let Some(change) = change {
+        value.share_payload_checksums(&mut change.value);
+    }
+    Ok(value)
+}
+
+fn prepare_stage_puts<'a>(
+    stage: &'a StagedStore,
+    changes: &mut [PreparedChange<'a>],
+) -> Result<Vec<(&'a [u8], PreparedValue<'a>)>> {
+    let mut change_puts = changes
+        .iter_mut()
+        .filter(|change| change.kind == ChangeKind::Put);
     stage
         .mutations
         .iter()
         .filter_map(|(key, mutation)| match mutation {
             MutationValue::Put(stored) => Some(
-                stored
-                    .encode_for_store(stage.flags)
+                prepare_staged_value(stored, stage.flags, change_puts.next())
                     .map(|encoded| (key.as_slice(), encoded)),
             ),
             MutationValue::Delete => None,
@@ -2094,15 +2145,25 @@ fn encode_stage_puts(stage: &StagedStore) -> Result<Vec<(&[u8], Vec<u8>)>> {
         .collect()
 }
 
-type EncodedMutation<'a> = (&'a [u8], Option<Vec<u8>>);
+type PreparedMutation<'a> = (&'a [u8], Option<PreparedValue<'a>>);
 
-fn encode_stage_mutations(stage: &StagedStore) -> Result<Vec<EncodedMutation<'_>>> {
+fn prepare_stage_mutations<'a>(
+    stage: &'a StagedStore,
+    changes: &mut [PreparedChange<'a>],
+) -> Result<Vec<PreparedMutation<'a>>> {
+    let mut change_puts = changes
+        .iter_mut()
+        .filter(|change| change.kind == ChangeKind::Put);
     stage
         .mutations
         .iter()
         .map(|(key, mutation)| {
             let encoded = match mutation {
-                MutationValue::Put(stored) => Some(stored.encode_for_store(stage.flags)?),
+                MutationValue::Put(stored) => Some(prepare_staged_value(
+                    stored,
+                    stage.flags,
+                    change_puts.next(),
+                )?),
                 MutationValue::Delete => None,
             };
             Ok((key.as_slice(), encoded))
@@ -2126,16 +2187,16 @@ fn decode_change_log_record_txid(key: &[u8]) -> Result<u64> {
 /// Encodes this stage's change records. Clearing or dropping a store is one
 /// store-level record; deletes are recorded only for keys that existed, which
 /// is checked from metadata without reading values.
-fn collect_change_payloads<B: FileBackend>(
+fn collect_change_payloads<'a, B: FileBackend>(
     pager: &mut Pager<B>,
     store_name: &str,
-    stage: &StagedStore,
+    stage: &'a StagedStore,
     now_ms: u64,
-    out: &mut Vec<Vec<u8>>,
+    out: &mut Vec<PreparedChange<'a>>,
 ) -> Result<()> {
     if stage.dropped {
         if stage.base_meta.is_some() && !stage.created {
-            out.push(encode_change_record_payload(
+            out.push(PreparedChange::new(
                 store_name,
                 &[],
                 ChangeKind::Drop,
@@ -2151,7 +2212,7 @@ fn collect_change_payloads<B: FileBackend>(
         stage.base_meta.as_ref()
     };
     if stage.cleared && base.is_some() {
-        out.push(encode_change_record_payload(
+        out.push(PreparedChange::new(
             store_name,
             &[],
             ChangeKind::Clear,
@@ -2160,7 +2221,7 @@ fn collect_change_payloads<B: FileBackend>(
     }
     for (key, mutation) in &stage.mutations {
         match mutation {
-            MutationValue::Put(stored) => out.push(encode_change_record_payload(
+            MutationValue::Put(stored) => out.push(PreparedChange::new(
                 store_name,
                 key,
                 ChangeKind::Put,
@@ -2180,7 +2241,7 @@ fn collect_change_payloads<B: FileBackend>(
                     key,
                     now_ms,
                 )? {
-                    out.push(encode_change_record_payload(
+                    out.push(PreparedChange::new(
                         store_name,
                         key,
                         ChangeKind::Delete,

@@ -9,7 +9,7 @@ use crate::error::{EngineError, Result};
 use crate::layout::{PageKind, ValueKind, PAGE_HEADER_SIZE, PAGE_SIZE};
 use crate::overflow::{
     free_overflow_chain, read_overflow_expiry, read_overflow_prefix, read_overflow_stored_value,
-    read_overflow_value, write_overflow_chain,
+    read_overflow_value, write_overflow_value,
 };
 use crate::page::{
     decode_internal_cell_ref, decode_leaf_cell_ref, decode_page_header_verified,
@@ -17,6 +17,7 @@ use crate::page::{
     should_overflow_value, InternalCell, LeafCell, PageHeaderInfo, MAX_TREE_LEVEL,
 };
 use crate::pager::Pager;
+use crate::prepared_value::ValueSource;
 use crate::storage::backend::FileBackend;
 use crate::value::{
     decode_envelope_expiry, store_uses_system_raw_values, store_uses_value_envelope, StoredValue,
@@ -99,6 +100,11 @@ pub struct BuiltTree {
 
 pub type PageImage = (u64, Vec<u8>);
 pub type PageImages = Vec<PageImage>;
+
+fn sorted_page_images(mut images: PageImages) -> PageImages {
+    images.sort_unstable_by_key(|(page_id, _)| *page_id);
+    images
+}
 
 /// A key and its new encoded value; `None` deletes the key.
 pub type Mutation<'a> = (&'a [u8], Option<&'a [u8]>);
@@ -441,6 +447,17 @@ pub fn build_tree_from_sorted<'a, I>(entries: I, alloc: &mut PageAllocator) -> R
 where
     I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
 {
+    build_tree_from_values(entries, alloc)
+}
+
+pub(crate) fn build_tree_from_values<'a, I, V>(
+    entries: I,
+    alloc: &mut PageAllocator,
+) -> Result<BuiltTree>
+where
+    V: ValueSource + ?Sized + 'a,
+    I: IntoIterator<Item = (&'a [u8], &'a V)>,
+{
     let mut writer = TreeWriter::new_detached(alloc);
     let mut cells = Vec::new();
     let mut previous: Option<&[u8]> = None;
@@ -468,7 +485,7 @@ pub struct SortedTreeBuilder {
     cells: Vec<LeafCell>,
     leaf_cost: usize,
     children: Vec<InternalCell>,
-    images: BTreeMap<u64, Vec<u8>>,
+    images: PageImages,
     last_key: Option<Vec<u8>>,
 }
 
@@ -484,12 +501,21 @@ impl SortedTreeBuilder {
             cells: Vec::new(),
             leaf_cost: 0,
             children: Vec::new(),
-            images: BTreeMap::new(),
+            images: Vec::new(),
             last_key: None,
         }
     }
 
     pub fn push(&mut self, key: &[u8], value: &[u8], alloc: &mut PageAllocator) -> Result<()> {
+        self.push_value(key, value, alloc)
+    }
+
+    pub(crate) fn push_value<V: ValueSource + ?Sized>(
+        &mut self,
+        key: &[u8],
+        value: &V,
+        alloc: &mut PageAllocator,
+    ) -> Result<()> {
         if let Some(last) = self.last_key.as_deref() {
             if compare_keys(last, key) != Ordering::Less {
                 return Err(EngineError::Internal(
@@ -512,7 +538,7 @@ impl SortedTreeBuilder {
 
     /// Hands back the page images produced so far so callers can stream them.
     pub fn drain_images(&mut self) -> PageImages {
-        std::mem::take(&mut self.images).into_iter().collect()
+        sorted_page_images(std::mem::take(&mut self.images))
     }
 
     pub fn finish(mut self, alloc: &mut PageAllocator) -> Result<BuiltTree> {
@@ -532,7 +558,7 @@ impl SortedTreeBuilder {
         self.images.extend(writer.into_images());
         Ok(BuiltTree {
             root_page_id,
-            page_images: self.images.into_iter().collect(),
+            page_images: sorted_page_images(self.images),
         })
     }
 
@@ -542,7 +568,7 @@ impl SortedTreeBuilder {
         let page_id = alloc.allocate();
         let min_key = cells[0].key.clone();
         self.images
-            .insert(page_id, encode_leaf_page(page_id, 0, 0, &cells)?);
+            .push((page_id, encode_leaf_page(page_id, 0, 0, &cells)?));
         self.children.push(InternalCell {
             separator: min_key,
             child_page_id: page_id,
@@ -628,6 +654,15 @@ pub fn apply_mutations<B: FileBackend>(
     pager: &mut Pager<B>,
     root_page_id: u64,
     mutations: &[Mutation<'_>],
+    alloc: &mut PageAllocator,
+) -> Result<BuiltTree> {
+    apply_value_mutations(pager, root_page_id, mutations, alloc)
+}
+
+pub(crate) fn apply_value_mutations<B: FileBackend, V: ValueSource + ?Sized>(
+    pager: &mut Pager<B>,
+    root_page_id: u64,
+    mutations: &[(&[u8], Option<&V>)],
     alloc: &mut PageAllocator,
 ) -> Result<BuiltTree> {
     if mutations
@@ -842,7 +877,11 @@ enum Child {
 struct TreeWriter<'a, B: FileBackend> {
     pager: Option<&'a mut Pager<B>>,
     alloc: &'a mut PageAllocator,
+    // Only tree nodes can be inspected or removed while collapsing the root.
+    // Overflow chains are final as soon as their sorted mutation is planned:
+    // merging/packing leaf runs moves those cells without replacing values.
     fresh: BTreeMap<u64, Vec<u8>>,
+    overflow_images: PageImages,
 }
 
 impl<'a> TreeWriter<'a, crate::storage::memory::MemoryBackend> {
@@ -851,6 +890,7 @@ impl<'a> TreeWriter<'a, crate::storage::memory::MemoryBackend> {
             pager: None,
             alloc,
             fresh: BTreeMap::new(),
+            overflow_images: Vec::new(),
         }
     }
 }
@@ -861,11 +901,15 @@ impl<'a, B: FileBackend> TreeWriter<'a, B> {
             pager: Some(pager),
             alloc,
             fresh: BTreeMap::new(),
+            overflow_images: Vec::new(),
         }
     }
 
-    fn into_images(self) -> PageImages {
-        self.fresh.into_iter().collect()
+    fn into_images(mut self) -> PageImages {
+        self.overflow_images.extend(self.fresh);
+        // Reusable ids and unpublished roots can make allocation order differ
+        // from file order. Preserve the ordered output used by WAL/replay I/O.
+        sorted_page_images(self.overflow_images)
     }
 
     fn pager(&mut self) -> Result<&mut Pager<B>> {
@@ -874,11 +918,11 @@ impl<'a, B: FileBackend> TreeWriter<'a, B> {
             .ok_or_else(|| EngineError::Internal("tree writer has no committed tree".into()))
     }
 
-    fn rewrite(
+    fn rewrite<V: ValueSource + ?Sized>(
         &mut self,
         page_id: u64,
         expected_level: Option<u8>,
-        mutations: &[Mutation<'_>],
+        mutations: &[(&[u8], Option<&V>)],
     ) -> Result<Run> {
         let node = read_node(self.pager()?, page_id, expected_level, mutations)?;
         self.alloc.free(page_id);
@@ -903,7 +947,11 @@ impl<'a, B: FileBackend> TreeWriter<'a, B> {
         }
     }
 
-    fn merge_leaf(&mut self, cells: Vec<LeafCell>, mutations: &[Mutation<'_>]) -> Result<Run> {
+    fn merge_leaf<V: ValueSource + ?Sized>(
+        &mut self,
+        cells: Vec<LeafCell>,
+        mutations: &[(&[u8], Option<&V>)],
+    ) -> Result<Run> {
         let mut out = Vec::with_capacity(cells.len() + mutations.len());
         let mut existing = cells.into_iter().peekable();
         for (key, value) in mutations {
@@ -920,7 +968,7 @@ impl<'a, B: FileBackend> TreeWriter<'a, B> {
                 }
             }
             if let Some(value) = value {
-                out.push(self.plan_cell(key, value)?);
+                out.push(self.plan_cell(key, *value)?);
             }
         }
         out.extend(existing);
@@ -944,12 +992,13 @@ impl<'a, B: FileBackend> TreeWriter<'a, B> {
         )
     }
 
-    fn plan_cell(&mut self, key: &[u8], value: &[u8]) -> Result<LeafCell> {
+    fn plan_cell<V: ValueSource + ?Sized>(&mut self, key: &[u8], value: &V) -> Result<LeafCell> {
+        let parts = value.parts();
         let total_value_len =
-            u32::try_from(value.len()).map_err(|_| EngineError::ValueTooLarge(value.len()))?;
-        if should_overflow_value(value.len()) {
-            let chain = write_overflow_chain(value, self.alloc)?;
-            self.fresh.extend(chain.pages);
+            u32::try_from(parts.len()).map_err(|_| EngineError::ValueTooLarge(parts.len()))?;
+        if should_overflow_value(parts.len()) {
+            let chain = write_overflow_value(value, self.alloc)?;
+            self.overflow_images.extend(chain.pages);
             Ok(LeafCell {
                 key: key.to_vec(),
                 value: Vec::new(),
@@ -960,7 +1009,7 @@ impl<'a, B: FileBackend> TreeWriter<'a, B> {
         } else {
             Ok(LeafCell {
                 key: key.to_vec(),
-                value: value.to_vec(),
+                value: parts.to_vec(),
                 value_kind: ValueKind::Inline,
                 total_value_len,
                 overflow_head_page_id: 0,
@@ -1023,7 +1072,12 @@ impl<'a, B: FileBackend> TreeWriter<'a, B> {
         match child {
             Child::Changed(run) => Ok(run),
             Child::Keep(cell) => {
-                let node = read_node(self.pager()?, cell.child_page_id, Some(child_level), &[])?;
+                let node = read_node::<_, [u8]>(
+                    self.pager()?,
+                    cell.child_page_id,
+                    Some(child_level),
+                    &[],
+                )?;
                 self.alloc.free(cell.child_page_id);
                 Ok(match node {
                     Node::Leaf(cells) => Run::Leaf(cells),
@@ -1139,9 +1193,9 @@ impl<'a, B: FileBackend> TreeWriter<'a, B> {
 
 /// For each child, the index range of mutations routed to it. Keys below the
 /// first separator belong to the first child, matching lookup routing.
-fn route_mutations(
+fn route_mutations<V: ?Sized>(
     children: &[InternalCell],
-    mutations: &[Mutation<'_>],
+    mutations: &[(&[u8], Option<&V>)],
 ) -> Vec<std::ops::Range<usize>> {
     let mut ranges = Vec::with_capacity(children.len());
     let mut start = 0usize;
@@ -1188,11 +1242,11 @@ fn split_groups(costs: &[usize]) -> Vec<usize> {
     groups
 }
 
-fn read_node<B: FileBackend>(
+fn read_node<B: FileBackend, V: ?Sized>(
     pager: &mut Pager<B>,
     page_id: u64,
     expected_level: Option<u8>,
-    mutations: &[Mutation<'_>],
+    mutations: &[(&[u8], Option<&V>)],
 ) -> Result<Node> {
     pager.with_page(page_id, |bytes| {
         let header = node_header(bytes, page_id, expected_level)?;

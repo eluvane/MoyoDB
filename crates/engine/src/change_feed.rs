@@ -153,6 +153,25 @@ pub fn encode_change_record_payload(
     kind: ChangeKind,
     value: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
+    encode_change_record(store, key, kind, value, true)
+}
+
+pub(crate) fn encode_change_record_prefix(
+    store: &str,
+    key: &[u8],
+    kind: ChangeKind,
+    value: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    encode_change_record(store, key, kind, value, false)
+}
+
+fn encode_change_record(
+    store: &str,
+    key: &[u8],
+    kind: ChangeKind,
+    value: Option<&[u8]>,
+    include_value: bool,
+) -> Result<Vec<u8>> {
     validate_user_store_name(store)?;
     validate_key(key)?;
 
@@ -195,7 +214,10 @@ pub fn encode_change_record_payload(
     })?;
 
     let mut out = Vec::with_capacity(
-        CHANGE_RECORD_HEADER_SIZE + store_bytes.len() + key.len() + value_bytes.len(),
+        CHANGE_RECORD_HEADER_SIZE
+            + store_bytes.len()
+            + key.len()
+            + if include_value { value_bytes.len() } else { 0 },
     );
     out.extend_from_slice(&CHANGE_RECORD_MAGIC);
     out.push(kind.to_tag());
@@ -205,7 +227,9 @@ pub fn encode_change_record_payload(
     out.extend_from_slice(&value_len.to_le_bytes());
     out.extend_from_slice(store_bytes);
     out.extend_from_slice(key);
-    out.extend_from_slice(value_bytes);
+    if include_value {
+        out.extend_from_slice(value_bytes);
+    }
     Ok(out)
 }
 

@@ -62,27 +62,41 @@ impl StoredValue {
     }
 
     pub fn encode_for_store(&self, store_flags: u64) -> Result<Vec<u8>> {
+        match self.encode_prefix(store_flags)? {
+            Some(prefix) => {
+                let mut out = Vec::with_capacity(prefix.len() + self.value.len());
+                out.extend_from_slice(&prefix);
+                out.extend_from_slice(&self.value);
+                Ok(out)
+            }
+            None => Ok(self.value.clone()),
+        }
+    }
+
+    pub(crate) fn encode_prefix(
+        &self,
+        store_flags: u64,
+    ) -> Result<Option<[u8; VALUE_ENVELOPE_HEADER_SIZE]>> {
         if store_uses_system_raw_values(store_flags) {
             if self.expires_at_ms.is_some() {
                 return Err(EngineError::Internal(
                     "attempted to store ttl value in a system raw-value store".into(),
                 ));
             }
-            return Ok(self.value.clone());
+            return Ok(None);
         }
 
         if store_uses_value_envelope(store_flags) {
-            let mut out = Vec::with_capacity(VALUE_ENVELOPE_HEADER_SIZE + self.value.len());
-            out.extend_from_slice(&VALUE_ENVELOPE_MAGIC);
-            out.extend_from_slice(&self.expires_at_ms.unwrap_or(0).to_le_bytes());
-            out.extend_from_slice(&self.value);
-            Ok(out)
+            let mut prefix = [0; VALUE_ENVELOPE_HEADER_SIZE];
+            prefix[..8].copy_from_slice(&VALUE_ENVELOPE_MAGIC);
+            prefix[8..].copy_from_slice(&self.expires_at_ms.unwrap_or(0).to_le_bytes());
+            Ok(Some(prefix))
         } else if self.expires_at_ms.is_some() {
             Err(EngineError::Internal(
                 "attempted to store ttl value in a legacy raw-value store".into(),
             ))
         } else {
-            Ok(self.value.clone())
+            Ok(None)
         }
     }
 

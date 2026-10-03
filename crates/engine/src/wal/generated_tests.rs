@@ -155,6 +155,15 @@ fn engine_commit_hashes_each_generated_page_payload_once() -> Result<()> {
             },
         )?;
         let setup = engine.begin_tx(TxMode::Readwrite)?;
+        // Isolate page-to-WAL reuse here. Paired user/change-feed payload
+        // hashing has separate coverage through the actual engine commit path.
+        engine.set_change_feed_policy(
+            setup,
+            crate::catalog::ChangeFeedPolicy {
+                enabled: false,
+                ..crate::catalog::ChangeFeedPolicy::default()
+            },
+        )?;
         engine.create_store(setup, "kv")?;
         engine.commit_tx(setup)?;
         let tx = engine.begin_tx(TxMode::Readwrite)?;

@@ -10,6 +10,7 @@ pub mod layout;
 pub mod overflow;
 pub mod page;
 pub mod pager;
+mod prepared_value;
 pub mod recovery;
 pub mod snapshot;
 pub mod storage;

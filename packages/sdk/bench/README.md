@@ -288,6 +288,97 @@ For separate OPFS, Worker-message, startup, and WASM-call accounting, add `--dia
 
 Verification performed for this pass: 200 native Rust tests (one pre-existing ignored test), native/WASM Clippy, 128 SDK work tests, 49 OPFS-shim tests, 83 Chromium correctness tests (benchmark and soak opt-ins skipped), one separate ten-second randomized model/reopen/snapshot test, typecheck, scoped formatting/lint, dependency checks, and the complete release SDK/WASM build. The 27 Criterion test-mode smoke cases were not timed native benchmarks. Firefox and WebKit were not run in this environment.
 
+## Payload planning follow-up (2026-10-03)
+
+This follow-up is based on `MoyoDB-dev` main `c90d16df28b17a97d13132a5dcef471a572f42b8`. Main advanced during the investigation, so the final comparison was rebuilt and rerun from that commit. Generated-WAL-CRC reuse, startup-probe removal, the OPFS append-offset cache and 4 MiB checkpoint batching are present in both final variants. This patch changes payload preparation and page planning. The [compact evidence](performance-gap-followup-2026-10-03.json) separates the final measurements from supporting historical experiments.
+
+### Full browser comparison
+
+Four fresh persistent Chromium 153.0.8010.0 profiles each held two immutable source origins. Visits alternated ABBA/BAAB/ABBA/BAAB; origin assignments also alternated. Each variant had one warmup per profile and eight measured samples overall. The IndexedDB column pools sixteen controls. Both variants use release WASM and unchanged stock public-SDK run/verify functions, with matching stock random seeds. There was no request interception or cache-policy change in this comparison.
+
+| Workload                                | Moyo before, ms | Moyo after, ms | Shared IndexedDB, ms | Gap before | Gap after |
+| --------------------------------------- | --------------: | -------------: | -------------------: | ---------: | --------: |
+| 1,000 values, 64 KiB; ten commits       |          344.55 |         254.60 |                70.85 |      4.86x |     3.59x |
+| 64 values, 1 MiB; eight commits         |          315.70 |         262.15 |                70.65 |      4.47x |     3.71x |
+| 1,000 separate commits, 128-byte values |          190.15 |         181.20 |               216.70 |      0.88x |     0.84x |
+| 10,000 pipelined reads                  |          148.20 |         149.20 |               165.30 |      0.90x |     0.90x |
+| Reverse scan, limit one                 |            0.95 |           0.80 |                 0.60 |      1.58x |     1.33x |
+| Fresh empty DB open                     |           39.90 |          42.25 |                 0.50 |     79.80x |    84.50x |
+
+Both large-write workloads improve in all four profile medians, reducing pooled Moyo medians by 26.1% and 17.0%. The other four rows do not establish a substantial consistent improvement. Small commits improved in three of four profiles in this final comparison; a slowdown observed before rebasing is retained only as historical evidence. Observations within a profile share host/cache conditions, and the pooled IndexedDB median does not remove host drift. No universal speedup is claimed.
+
+A separate two-sample instrumented small-commit check was slower after the change: mean engine-boundary time 99.70 → 117.10 ms and instrumented total 201.25 → 239.40 ms. The eight-sample balanced comparison above improved by 4.7%. These differing observations are preserved without claiming a substantial commit improvement.
+
+Explicit IndexedDB readwrite transactions request `strict` durability, and Moyo retains its existing WAL flush and checkpoint publication semantics. `indexedDB.open()` has an implicit versionchange transaction with no API durability option, so the open row compares API latency. Fresh empty open creates a new DB and Worker after capability/module preflight and warmups; it is not cold browser/network/module startup.
+
+Separate instrumented baseline opens spent 56.9–63.0 ms reaching Worker READY, then 21.8–22.4 ms loading/initializing the module, versus 6.1–8.4 ms in engine open. Instrumentation disables HTTP cache, so these phase timings are diagnostic only; engine timings include nested storage work. Pipelined reads retained 10,002 logical operations in 81 physical Worker messages each way, and reverse scan retained three serialized begin/scan/rollback round trips. Neither read workload made timed OPFS calls.
+
+The external starting numbers are not this experiment's baseline: current main already includes several performance passes, and this host uses a persistent headless browser on a container filesystem. The earlier separate persistence qualification verified strict IDB transaction configuration and both engines' data after complete browser shutdown/relaunch; it was a clean restart check, not a hardware power-loss test. Hosted flush latency does not establish physical-device power-loss latency.
+
+### Removed work and correctness boundary
+
+Fresh diagnostics on the final base placed 296.30 → 233.60 ms inside engine calls for 64 KiB writes, while nested synchronous storage time was 54.20 → 58.20 ms. For 1 MiB writes the corresponding figures were 277.20 → 223.55 ms and 60.45 → 58.65 ms. These are means of two separately instrumented samples. Engine-boundary time includes generated JS bindings, WASM and storage; the nested times must not be added. Together with unchanged write/flush work and the checksum/copy accounting below, this supports computation and temporary payload materialization as the primary removed cost.
+
+The historical investigation on `23ad23…` found approximately 80–95 ms of sampled CRC self time per large-write operation, mostly in the two overflow encodings. With shared payload preparation, sampled CRC self time was 42–49 ms: 38–42 ms in preparation and approximately 1–3 ms in overflow encoding. These are separate symbol-preserving profiling builds, with function-index mappings checked against identical noncustom sections. The new upstream commit did not change checksum/overflow/B-tree code, but these historical sampled timings are not subtracted from the final browser results.
+
+Main already reused generated-page checksums for WAL records. It still independently materialized and hashed the same staged payload for the user tree and CHG1 change feed. Prepared values now borrow that immutable payload with separate small prefixes. One checksum pass visits the union of the two encodings' chunk boundaries; CRC composition produces the original checksum for each independent page, including its header and zero padding. The private API requires pointer-and-length identity, and no checksum cache survives the pair or commit. Generic arbitrary-byte encoders and stored-page/WAL read validation remain intact.
+
+| Structural work per original workload       |     64 KiB before → after |      1 MiB before → after |
+| ------------------------------------------- | ------------------------: | ------------------------: |
+| Actual native checksum-input bytes          |  140,995,760 → 68,883,856 |  137,331,008 → 70,177,344 |
+| Payload bytes copied within commit planning | 262,144,000 → 131,072,000 | 268,435,456 → 134,217,728 |
+| Explicit overflow zero-fill bytes           |   139,264,000 → 6,580,000 |      135,790,592 → 44,800 |
+| Generated overflow pages                    |           34,000 → 34,000 |           33,152 → 33,152 |
+| Added chunk-checksum metadata               |         0 → 136,000 bytes |         0 → 132,608 bytes |
+| Measured main-file write calls              |                   47 → 47 |                   53 → 53 |
+| Measured main-file bytes                    | 139,534,336 → 139,534,336 | 135,897,088 → 135,897,088 |
+| Measured WAL bytes                          | 140,897,456 → 140,897,456 | 137,216,320 → 137,216,320 |
+| WAL/main/manifest flushes                   |           15/5/5 → 15/5/5 |           16/8/8 → 16/8/8 |
+
+Checksum-input counts were freshly measured on actual `c90d16…` main and the candidate's native stock-shape fixtures, over begin/put-many/commit with default checkpoints. Clean-cache publication order can change verification of a few 4 KiB metadata pages. Copy and explicit zero-fill counts are source-derived requests, not measured DRAM traffic or peak memory; SDK transport, WAL assembly and checkpoint assembly are excluded. Four planning payload copies become the two final independent user/feed page copies, and the encoder zeroes only the unused tail after directly initializing metadata and used bytes.
+
+Overflow images also leave the balanced-tree metadata map: tree nodes retain lookup/removal support, while final overflow images accumulate in a vector and returned images remain sorted by page ID. The isolated native allocation fixture grew from 12 to 95 metadata allocations across 8 to 512 chunks before this change, versus 13 to 13 afterward; required 4 KiB page buffers are excluded. Its regression gate also passes on the rebased candidate.
+
+Checkpoint batching and append-offset caching are unchanged from the common base. WAL/main/manifest barriers, checkpoint thresholds, dirty pins and failure ordering retain their semantics. The remaining large-write work includes two independent persisted user/feed chains, contiguous WAL assembly and copying dirty runs into checkpoint buffers. Removing those gathering copies requires a different ownership/buffer design; sharing persisted payloads requires a separate lifetime and reclamation design. This patch retains the storage format and those durable writes.
+
+### Scaling and reproduction
+
+The fixed-byte series uses 64 MiB of input and eight 8 MiB transactions at every value size. Two ABBA/BAAB profiles provide four Moyo samples per variant and eight IndexedDB controls. Pooled medians improved at all five sizes. Both profile medians improved at four sizes; the 64 KiB row had one slower profile, including a 355.7 ms candidate sample, which is retained in the raw evidence. Stock write verification samples at most 1,024 records in the larger record-count rows; both original large-write rows verify all their values. The stock deterministic generator has repeating low-entropy patterns, so these results do not establish arbitrary-entropy payload performance.
+
+| Value size | Values | Moyo before, ms | Moyo after, ms | Shared IndexedDB, ms |
+| ---------- | -----: | --------------: | -------------: | -------------------: |
+| 4 KiB      | 16,384 |          544.55 |         446.40 |               969.65 |
+| 16 KiB     |  4,096 |          358.50 |         291.90 |               417.00 |
+| 64 KiB     |  1,024 |          347.60 |         263.80 |                53.80 |
+| 256 KiB    |    256 |          320.40 |         261.70 |                36.20 |
+| 1 MiB      |     64 |          312.25 |         229.80 |                72.15 |
+
+A historical fixed-record crossover check used 2,048 values at 1008, 1024, 2048, 4033, 4050, 4066, 8192 and 16384 bytes, in batches of 256. Its raw samples, including outliers and near-neutral 1008/4050-byte rows, remain in the evidence with the old commit and artifact scope. That experiment informed the absence of a special pairing threshold; it is not a fresh comparison against `c90d16…`.
+
+Use independent Cargo target directories for separate worktrees; sharing a target can reuse a stale executable from another checkout. Install locked dependencies and Rust/WASM/Chromium tooling, then run from the patched repository root:
+
+```bash
+git worktree add --detach ../MoyoDB-before c90d16df28b17a97d13132a5dcef471a572f42b8
+(cd ../MoyoDB-before && npm ci && CARGO_TARGET_DIR="$PWD/target" npm run build:wasm:release --workspace @moyodb/sdk)
+npm ci
+CARGO_TARGET_DIR="$PWD/target" npm run build --workspace @moyodb/sdk
+
+node packages/sdk/scripts/bench-performance-abba.mjs --before ../MoyoDB-before --after . --profiles 4 --samples 1 --warmups 1 --out packages/sdk/bench/results/followup-full.json
+node packages/sdk/scripts/bench-performance-abba.mjs --before ../MoyoDB-before --after . --profiles 2 --samples 1 --warmups 1 --value-sizes 4096,16384,65536,262144,1048576 --total-bytes 67108864 --batch-bytes 8388608 --out packages/sdk/bench/results/followup-scaling.json
+node packages/sdk/scripts/bench-performance-abba.mjs --before ../MoyoDB-before --after . --profiles 1 --samples 2 --warmups 2 --value-sizes 1008,1024,2048,4033,4050,4066,8192,16384 --records 2048 --batch-size 256 --out packages/sdk/bench/results/followup-crossover.json
+
+cargo test --locked --workspace
+cargo test --locked -p moyodb-engine --lib stock_large_write_hash_work_accounting -- --ignored --nocapture
+CLIPPY_CONF_DIR=.config/moyo/build cargo clippy --locked --workspace --all-targets -- -D warnings
+CLIPPY_CONF_DIR=.config/moyo/build cargo clippy --locked --workspace --lib --target wasm32-unknown-unknown -- -D warnings
+```
+
+The runner verifies immutable sources, served JS/WASM/shim bytes, release mode, strict IDB configuration, matching transaction dimensions and content checksums within and across variants. Its full raw output records actual browser command lines. Keep compilation, unrelated benchmarks and tracked-file edits out of measurement windows; the runner checks both source fingerprints and tracked diff statistics.
+
+Regression tests compare complete pages against the previous encoder and complete WAL/checkpoint bytes against generic checksumming, including raw-to-TTL rewrites, compression flags, long keys, clear/drop and feed retention. Tests also cover crash publication boundaries, corrupted headers/payloads/padding, old snapshots with independent feed history and root collapse/reused IDs. Native work-accounting gates protect the removed checksum and metadata work.
+
+Fresh verification after rebasing: 217 native Rust tests; the separately invoked ignored stock checksum fixture; native/all-target and WASM Clippy with canonical repository configuration; rustfmt; 128 SDK work tests; 61 OPFS-shim tests; 83 Chromium correctness tests; TypeScript typecheck; and release SDK/WASM builds for both revisions. The normal native run ignored the stock fixture and one pre-existing test; the normal browser run skipped benchmark and soak opt-ins. A separate fresh full automatic 31-workload guard ran both revisions with one warmup and one sample per supported row: each passed 30 Moyo and 12 IndexedDB rows, with 20 expected unsupported rows and no errors. Its single-sample timings are not the headline comparison. Firefox, WebKit and a new soak run were not executed.
+
 ## Future baseline: SQLite WASM + OPFS
 
 SQLite WASM + OPFS is a serious future comparison target because the SQLite project publishes WebAssembly/JavaScript documentation and documents persistent browser storage options via OPFS. This suite does not claim SQLite comparison results until a reproducible workload and raw JSON output are added.

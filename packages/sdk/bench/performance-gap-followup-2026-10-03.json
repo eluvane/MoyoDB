@@ -1,0 +1,2712 @@
+{
+  "schemaVersion": 2,
+  "kind": "current-main payload planning follow-up: compact reproducibility evidence",
+  "repository": "https://github.com/eluvane/MoyoDB-dev",
+  "baseMain": "c90d16df28b17a97d13132a5dcef471a572f42b8",
+  "layout": {
+    "shapeColumns": ["recordCount", "keySize", "valueSize", "batchSize"],
+    "timesMs": "Workload order, then [Moyo samples, IndexedDB samples]. Raw floating-point timers are preserved without rounding.",
+    "warmups": "A warmup visit concatenates stock warmupSamples then its final rawSamples, all excluded from measured pools.",
+    "contentChecksums": "Workload order. One list shared by the two engines after exact equality checks; equal offsets match across variants.",
+    "pooledSummaryColumns": [
+      "moyoBeforeMedianMs",
+      "moyoAfterMedianMs",
+      "pooledIndexedDbMedianMs",
+      "gapBefore",
+      "gapAfter",
+      "moyoMedianLatencyChangePercent",
+      "moyoBeforeMeanMs",
+      "moyoAfterMeanMs",
+      "moyoMeanLatencyChangePercent"
+    ],
+    "medianDefinition": "Sort all measured samples in the stated pool; average the two middle values for an even count. Means are arithmetic. Positive latency change means slower.",
+    "diagnosticMetricKeys": [
+      ["engine", "*", "begin_tx"],
+      ["engine", "*", "commit_tx"],
+      ["engine", "*", "get"],
+      ["engine", "*", "needs_recovery"],
+      ["engine", "*", "open"],
+      ["engine", "*", "put"],
+      ["engine", "*", "put_many_packed"],
+      ["engine", "*", "rollback_tx"],
+      ["engine", "*", "scan"],
+      ["metadata", "*", "createSyncAccessHandle"],
+      ["metadata", "*", "getDirectory"],
+      ["metadata", "*", "getDirectoryHandle"],
+      ["metadata", "*", "getFileHandle"],
+      ["sdk", "*", "assertCapabilities"],
+      ["sdk", "*", "lease.acquire"],
+      ["sdk", "*", "loadWasm"],
+      ["sync", "main.bin", "flush"],
+      ["sync", "main.bin", "getSize"],
+      ["sync", "main.bin", "read"],
+      ["sync", "main.bin", "write"],
+      ["sync", "manifest.bin", "flush"],
+      ["sync", "manifest.bin", "getSize"],
+      ["sync", "manifest.bin", "read"],
+      ["sync", "manifest.bin", "write"],
+      ["sync", "wal.bin", "flush"],
+      ["sync", "wal.bin", "getSize"],
+      ["sync", "wal.bin", "truncate"],
+      ["sync", "wal.bin", "write"]
+    ],
+    "diagnosticMetricColumns": ["metricKeyIndex", "calls", "errors", "requestedBytes", "transferredBytes", "elapsedMs"],
+    "wireColumns": ["requests", "requestMessages", "responses", "responseMessages"],
+    "fullGuardColumns": ["workload", "engine", "status"],
+    "sourceFileColumns": ["sha256", "bytes"]
+  },
+  "environment": {
+    "node": "v24.19.0",
+    "platform": "linux/x64",
+    "playwright": "1.63.0",
+    "vite": "8.3.0",
+    "browser": {
+      "protocolVersion": "1.3",
+      "product": "HeadlessChrome/153.0.8010.0",
+      "revision": "@86cee6df69e0463a839c0cc8435c9d4c259434d3",
+      "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.8010.0 Safari/537.36",
+      "jsVersion": "15.3.76"
+    },
+    "cpuModel": "AMD EPYC 9V74 80-Core Processor",
+    "hostLogicalCpuCount": 9,
+    "cgroupCpuMax": "800000 100000",
+    "cgroupMemoryMaxBytes": 8589934592,
+    "filesystem": "container overlay filesystem",
+    "headless": true,
+    "persistentContext": true,
+    "sdkBuildMode": "development",
+    "wasmBuildMode": "release",
+    "indexedDbDurability": "strict",
+    "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+    "toolchain": {
+      "rustc": "1.98.1 (48a229cea 2026-09-01)",
+      "LLVM": "22.1.8",
+      "wasmPack": "0.15.0",
+      "wasmBindgen": "0.2.128",
+      "wasmOpt": "117 (version_117)",
+      "npm": "11.9.0"
+    },
+    "environmentInput": {
+      "file": "environment.json",
+      "sha256": "f45d34724027505edace0c0c7a11be042c9cbcd1fff19756a295520ab8186132"
+    }
+  },
+  "provenance": {
+    "fingerprintDigestDefinition": "SHA256 of UTF-8 compact JSON, no newline, sorted rows [relativePath, sha256, byteCount] from the raw report's entire files map.",
+    "allFingerprintedFiles": {
+      "before": { "count": 59, "digest": "6f2ec34215359b0635aeac6d948198bf2dd976d28cc6c8d9a0071aad55893cdf" },
+      "after": { "count": 62, "digest": "aba534c0976da8c58ee7a323c7de04f18e5a84482d1b8800d23be93c236fdd30" }
+    },
+    "identicalAcrossCurrentExperiments": true,
+    "harness": {
+      "path": "packages/sdk/scripts/bench-performance-abba.mjs",
+      "measuredSha256": "d2995a93617adfd2a148b44f061fae060521bdd09ea0068cec3d3ddb138af177",
+      "deliveredSha256": "06239a5b818b19992250d70136d856bfa27c751a0d8bb466c44ab97344b89b7e",
+      "qualification": "Measurements invoked an immutable prior runner copy. Delivered code differs only in two metadata filename-extension regexes whose unused groups became noncapturing for lint; workload and timing code is identical."
+    },
+    "commonInputs": {
+      "Cargo.lock": ["c521b9e189903da423100a7c78e37c7604ad8e09f1fdc7727b44158152dbd44e", 18741],
+      "Cargo.toml": ["a11b2103a6442577783172517b75de07b9e213294ba9f6136b77302bacbf1d6b", 1000],
+      "crates/engine/Cargo.toml": ["d53b9856fd8ea4c4ac7ea7d2a630a34acae737c0d1177ac9cc5cf48a784320a3", 1473],
+      "crates/engine/js/opfs_shim.js": ["a150bb42783f33714dd73cae46c1c270b882970a1b22f521072a0e911e893cc3", 24518],
+      "packages/sdk/bench/bench-runner.ts": ["6c2faee24566c70659aafd54d91cabad78f59eb938de5ce660c826069787c169", 23112],
+      "packages/sdk/bench/indexeddb-baseline.ts": [
+        "785b845054923197725e53eacdb89e6138245f03c81d63dbd5296ec8ad9d7eca",
+        19342
+      ],
+      "packages/sdk/bench/moyodb-baseline.ts": [
+        "bbf8070b21002c1ff5ce90527a925d9b3856ad97b6f8000ea862e7987b95266b",
+        41657
+      ],
+      "packages/sdk/bench/report.ts": ["5590ba3cb2a9433ac0ffcacbbcca9e3a15c28cbb9a21cd2506a9dda0ac0c0fc4", 6410],
+      "packages/sdk/bench/types.ts": ["aee113523a5224681194ac92336139c700e88caabdabbbb9c759bc9b7d9572a8", 3238],
+      "packages/sdk/bench/workloads.ts": ["d76dfa4d4cb715300aaa461c6acb2def0acc992834ede19b48b3cf3da56aefb0", 28233],
+      "rust-toolchain.toml": ["042b211293d3d5ce394453d124d342226fdac055e7ad27eed88c7292a29c1473", 107]
+    },
+    "changedProductionFiles": {
+      "crates/engine/src/prepared_value.rs": {
+        "before": null,
+        "after": ["4d355860212c57541bbc7f60e7bdfe27d9297eeb44d86bb832646b3e92de3ea9", 4729]
+      },
+      "crates/engine/src/btree.rs": {
+        "before": ["d8f9b35f558cf726824380892585c2f92e396ae9ef4b83c26122b5589e339a24", 61011],
+        "after": ["f9f76c4e622a1ef089f98335bcda6f7eb6014c88efed070af5daddf5e46c1cc2", 62804]
+      },
+      "crates/engine/src/change_feed.rs": {
+        "before": ["9fd60c5d50101c67d276db220cda45bdd7dad6c765adfaa4d4bdf7348fc9e401", 9088],
+        "after": ["7a162930d778fb30e738bc2fec704066d62d82a011723aa4860e706bb9b1cb12", 9609]
+      },
+      "crates/engine/src/checksum.rs": {
+        "before": ["8a24914b7999c7cc1abc8e62aebaa8c5b746328a50fc69141ecb18374826113b", 7048],
+        "after": ["23d9b5dd67ebca70a862a04d2284492bb880e8963997e0419882c07c9364acbf", 13073]
+      },
+      "crates/engine/src/engine.rs": {
+        "before": ["8634127b0cdae2b5891f0a9ef2df1e49d503d630fed3db78b4e8f2f4e9d57518", 96314],
+        "after": ["95cda45320ea57e26c13d605b2c87330694c76920216b43a7254973ad46c5127", 98135]
+      },
+      "crates/engine/src/lib.rs": {
+        "before": ["d9dc4fa8f2778217d90aa1e8d8d74d097d48daaf21566d07e888047f70ba7d9f", 998],
+        "after": ["59ed3940e43946bb7899f2fa994678c047122a133a519f41cdb987b663f3e041", 1018]
+      },
+      "crates/engine/src/overflow.rs": {
+        "before": ["ef9083b17623e758d4e198073822b794af95724eb833383273c99ba87b1f2f4e", 7561],
+        "after": ["d7a0e3228cb1cc855326cff600253efd92bf98a5e658aa30585bb36aabf34f95", 7835]
+      },
+      "crates/engine/src/page.rs": {
+        "before": ["e0585911a60f85b6ade01153d6446f190cc3b60145eea08b4aaafb82187f3d45", 21769],
+        "after": ["9599fb41d7a9f6b8ab38e7cb7b2eac99f40c480067f65872575d9cda5a1fb6e4", 22949]
+      },
+      "crates/engine/src/value.rs": {
+        "before": ["718f0e0846967cf7971e6152c8dc45d6b3e9015a7e9ad68aaa2d62011f1604dd", 6459],
+        "after": ["b7464536e2b51d0ff5542d98a4472dea6009a21905109b47b619408780023399", 6868]
+      }
+    },
+    "runtimeAssets": {
+      "packages/sdk/public/engine/moyodb_engine.js": {
+        "before": ["6e6cfc77bb68260b948c84ff3cdf12712c985377e37c805088b510890ac79efb", 67483],
+        "after": ["c4f572b5de10e70aba600a8fa46e69e136efd7ba7e81f2cb39339b82f27e4974", 67483]
+      },
+      "packages/sdk/public/engine/moyodb_engine_bg.wasm": {
+        "before": ["48e8f69fcbe4c6a70129adc1f0890eda207bc90fd72dd33f47c399c08c49aa75", 513953],
+        "after": ["618395a13c9a4403e484e52e7e56acb144da9ec6be038a517880368c895762a3", 538014]
+      },
+      "packages/sdk/public/engine/snippets/moyodb-engine-8ebe6af0cc2e81b7/js/opfs_shim.js": {
+        "before": ["a150bb42783f33714dd73cae46c1c270b882970a1b22f521072a0e911e893cc3", 24518],
+        "after": ["a150bb42783f33714dd73cae46c1c270b882970a1b22f521072a0e911e893cc3", 24518]
+      }
+    },
+    "upstreamAlreadyContains": [
+      "generated-page WAL CRC reuse",
+      "startup probe removal",
+      "exclusive OPFS append-offset cache",
+      "4 MiB checkpoint batching"
+    ]
+  },
+  "qualifications": [
+    "Each launch uses a fresh persistent Chromium profile; sources have immutable separate origins whose assignments alternate between launches.",
+    "Stock workload run and verify functions, inputs, transaction boundaries, strict durability options and timed regions are unchanged.",
+    "An untimed prepare wrapper assigns successive stock random seeds to corresponding samples in both engines and both variants.",
+    "HTTP artifact bytes are verified before and after each launch, outside every timed sample; no cache-control or request interception is installed.",
+    "Fresh empty database open is not cold browser/network/module startup; warmups and stock release-profile detection precede measured samples.",
+    "Headless persistent browser storage and fsync costs are specific to this host; no hardware power-loss guarantee is inferred from timings.",
+    "Current main advanced during the investigation. All final headline/scaling rows were rerun on c90d16df versus c90d16df plus this patch. Earlier supporting results are separately marked historical.",
+    "Headline four-profile observations contain 8 Moyo samples per variant and 16 pooled strict IndexedDB controls per workload. Samples share profile/host conditions and are not independent machines.",
+    "Moyo runs before IndexedDB within each visit. The pooled IndexedDB median is a descriptive common denominator; it does not remove host drift.",
+    "IndexedDB explicit readwrite transactions request strict durability. indexedDB.open uses an implicit versionchange transaction with no API durability choice; fresh empty open compares API latency, not identical controllable flush policies.",
+    "Fresh empty open creates a new DB and Worker after capability/module preflight and warmups. It is not cold browser/network/module startup.",
+    "Small commits use 1000 independent commits of 128-byte values. Large-write inputs, batch boundaries and stock run/verify code are shared between engines and revisions.",
+    "Original 1000x64KiB and 64x1MiB writes verify all records; scaling rows with more than 1024 values use the stock evenly spaced 1024-record sample.",
+    "The deterministic value generator has repeating low-entropy patterns; arbitrary-entropy payload performance was not measured.",
+    "Append-offset caching and 4 MiB checkpoint writes are already in the common base; this patch claims no reduction in their calls or barriers."
+  ],
+  "experiments": [
+    {
+      "input": {
+        "file": "c90-abba.json",
+        "sha256": "4a60ed7d6b8f4800f49dab6005d3d61bb949fce263d27f8bb9049cbc5098d308"
+      },
+      "startedAt": "2026-10-03T16:33:37.124Z",
+      "runnerSha256": "d2995a93617adfd2a148b44f061fae060521bdd09ea0068cec3d3ddb138af177",
+      "profileCount": 4,
+      "samplesPerMoyoVariant": 8,
+      "pooledIndexedDbControls": 16,
+      "warmupsPerVariantPerProfile": 1,
+      "workloads": [
+        {
+          "name": "open_empty_db",
+          "shape": [1, 0, 0, 1],
+          "transactionBoundaries": "database deletion/setup is outside measurement; timed region opens an empty DB and creates no store"
+        },
+        {
+          "name": "point_get_random_10k_pipelined",
+          "shape": [10000, 16, 256, 1000],
+          "transactionBoundaries": "setup/preload outside measurement; one readonly transaction; pipelined: all 10,000 single-key gets are issued before any result is awaited"
+        },
+        {
+          "name": "reverse_scan_limit_1",
+          "shape": [10000, 16, 256, 1000],
+          "transactionBoundaries": "setup/preload outside measurement; measurement reads the last key of the store with a reverse scan limited to one row"
+        },
+        {
+          "name": "small_tx_1000_commits",
+          "shape": [1000, 16, 128, 1],
+          "transactionBoundaries": "1,000 independent readwrite commits; keys/values and empty DB setup outside measurement"
+        },
+        {
+          "name": "large_value_64kb",
+          "shape": [1000, 16, 65536, 100],
+          "transactionBoundaries": "one readwrite transaction per 100 large values; data/setup outside measurement"
+        },
+        {
+          "name": "large_value_1mb",
+          "shape": [64, 16, 1048576, 8],
+          "transactionBoundaries": "one readwrite transaction per 8 large values; data/setup outside measurement"
+        }
+      ],
+      "profiles": [
+        {
+          "index": 0,
+          "order": ["before", "after", "after", "before"],
+          "warmups": [
+            {
+              "variant": "before",
+              "sampleOffset": 0,
+              "timesMs": [
+                [[94.90000000037253], [0.599999999627471]],
+                [[152.5], [197.80000000074506]],
+                [[1.599999999627471], [0.8000000007450581]],
+                [[178.69999999925494], [267.40000000037253]],
+                [[421], [78.20000000111759]],
+                [[347], [63.90000000037253]]
+              ]
+            },
+            {
+              "variant": "after",
+              "sampleOffset": 0,
+              "timesMs": [
+                [[92.59999999962747], [0.599999999627471]],
+                [[162.2000000011176], [207.80000000074506]],
+                [[1.5], [1.299999998882413]],
+                [[174.40000000037253], [241.2999999988824]],
+                [[252.19999999925494], [76.09999999962747]],
+                [[267.2000000011176], [68.30000000074506]]
+              ]
+            }
+          ],
+          "visits": [
+            {
+              "variant": "before",
+              "sampleOffset": 0,
+              "timesMs": [
+                [[53.30000000074506], [0.599999999627471]],
+                [[161.40000000037253], [197.30000000074506]],
+                [[0.8999999985098839], [0.599999999627471]],
+                [[208.30000000074506], [275.7000000011176]],
+                [[387.90000000037253], [61.20000000111759]],
+                [[314.59999999962747], [66.40000000037253]]
+              ],
+              "contentChecksums": [
+                [null],
+                ["10000:05ef9745"],
+                ["2:f9998de5"],
+                ["1000:d253e045"],
+                ["1000:e47bf105"],
+                ["64:9db455c5"]
+              ]
+            },
+            {
+              "variant": "after",
+              "sampleOffset": 0,
+              "timesMs": [
+                [[45.59999999962747], [0.40000000037252903]],
+                [[144.5], [169.2999999988824]],
+                [[0.8999999985098839], [0.599999999627471]],
+                [[178.2000000011176], [232.90000000037253]],
+                [[236], [74.19999999925494]],
+                [[260.2000000011176], [68.19999999925494]]
+              ],
+              "contentChecksums": [
+                [null],
+                ["10000:05ef9745"],
+                ["2:f9998de5"],
+                ["1000:d253e045"],
+                ["1000:e47bf105"],
+                ["64:9db455c5"]
+              ]
+            },
+            {
+              "variant": "after",
+              "sampleOffset": 1,
+              "timesMs": [
+                [[37], [0.40000000037252903]],
+                [[142], [152]],
+                [[0.8000000007450581], [0.8000000007450581]],
+                [[188.2000000011176], [188.59999999962747]],
+                [[274.59999999962747], [80.29999999888241]],
+                [[262.30000000074506], [77.5]]
+              ],
+              "contentChecksums": [
+                [null],
+                ["10000:5ea23145"],
+                ["2:f9998de5"],
+                ["1000:d253e045"],
+                ["1000:e47bf105"],
+                ["64:9db455c5"]
+              ]
+            },
+            {
+              "variant": "before",
+              "sampleOffset": 1,
+              "timesMs": [
+                [[39.59999999962747], [0.3999999985098839]],
+                [[181.7000000011176], [161.30000000074506]],
+                [[0.8999999985098839], [1.699999999254942]],
+                [[277.2000000011176], [206.2999999988824]],
+                [[339.59999999962747], [59.90000000037253]],
+                [[322.59999999962747], [75.80000000074506]]
+              ],
+              "contentChecksums": [
+                [null],
+                ["10000:5ea23145"],
+                ["2:f9998de5"],
+                ["1000:d253e045"],
+                ["1000:e47bf105"],
+                ["64:9db455c5"]
+              ]
+            }
+          ],
+          "moyoMedianChangePercent": [
+            -11.087190528206413, -16.496648207882338, -5.555555440577464, -24.531410916410003, -29.814432989741924,
+            -18.000627746002262
+          ],
+          "host": {
+            "timestamps": ["2026-10-03T16:33:37.472Z", "2026-10-03T16:34:29.091Z"],
+            "cpuUsageDeltaUsec": 80487986,
+            "cpuThrottledDeltaUsec": 0,
+            "memoryBytes": [6569086976, 7515922432]
+          }
+        },
+        {
+          "index": 1,
+          "order": ["after", "before", "before", "after"],
+          "warmups": [
+            {
+              "variant": "after",
+              "sampleOffset": 0,
+              "timesMs": [
+                [[79.80000000074506], [0.8000000007450581]],
+                [[134.7000000011176], [150.09999999962747]],
+                [[1.5], [0.7000000011175871]],
+                [[177.30000000074506], [216.7999999988824]],
+                [[265.7000000011176], [70.80000000074506]],
+                [[264.5], [66.19999999925494]]
+              ]
+            },
+            {
+              "variant": "before",
+              "sampleOffset": 0,
+              "timesMs": [
+                [[76.90000000037253], [0.6999999992549419]],
+                [[140.5], [135.69999999925494]],
+                [[1.200000001117587], [0.599999999627471]],
+                [[160], [256.7000000011176]],
+                [[307.40000000037253], [56.5]],
+                [[290.09999999962747], [73.40000000037253]]
+              ]
+            }
+          ],
+          "visits": [
+            {
+              "variant": "after",
+              "sampleOffset": 2,
+              "timesMs": [
+                [[42.19999999925494], [0.5]],
+                [[136.59999999962747], [205.5]],
+                [[0.6999999992549419], [0.599999999627471]],
+                [[180.7000000011176], [198.5]],
+                [[303.69999999925494], [77.70000000111759]],
+                [[283.40000000037253], [75.90000000037253]]
+              ],
+              "contentChecksums": [
+                [null],
+                ["10000:3ecbdd45"],
+                ["2:f9998de5"],
+                ["1000:d253e045"],
+                ["1000:e47bf105"],
+                ["64:9db455c5"]
+              ]
+            },
+            {
+              "variant": "before",
+              "sampleOffset": 2,
+              "timesMs": [
+                [[37.09999999962747], [0.599999999627471]],
+                [[144.5], [145.80000000074506]],
+                [[0.900000000372529], [0.599999999627471]],
+                [[163.2000000011176], [260.80000000074506]],
+                [[314.80000000074506], [55.80000000074506]],
+                [[337], [69.69999999925494]]
+              ],
+              "contentChecksums": [
+                [null],
+                ["10000:3ecbdd45"],
+                ["2:f9998de5"],
+                ["1000:d253e045"],
+                ["1000:e47bf105"],
+                ["64:9db455c5"]
+              ]
+            },
+            {
+              "variant": "before",
+              "sampleOffset": 3,
+              "timesMs": [
+                [[35.09999999962747], [0.5]],
+                [[115.70000000111759], [146.59999999962747]],
+                [[1], [0.900000000372529]],
+                [[185.09999999962747], [180.30000000074506]],
+                [[355.80000000074506], [80.70000000111759]],
+                [[315.2000000011176], [72.79999999888241]]
+              ],
+              "contentChecksums": [
+                [null],
+                ["10000:cc02a545"],
+                ["2:f9998de5"],
+                ["1000:d253e045"],
+                ["1000:e47bf105"],
+                ["64:9db455c5"]
+              ]
+            },
+            {
+              "variant": "after",
+              "sampleOffset": 3,
+              "timesMs": [
+                [[42.30000000074506], [0.599999999627471]],
+                [[149.09999999962747], [173.09999999962747]],
+                [[0.8000000007450581], [0.599999999627471]],
+                [[195.5], [198.59999999962747]],
+                [[233.5], [71.80000000074506]],
+                [[320.5], [62]]
+              ],
+              "contentChecksums": [
+                [null],
+                ["10000:cc02a545"],
+                ["2:f9998de5"],
+                ["1000:d253e045"],
+                ["1000:e47bf105"],
+                ["64:9db455c5"]
+              ]
+            }
+          ],
+          "moyoMedianChangePercent": [
+            17.03601108154014, 9.800153727143668, -21.05263159442642, 8.010335917402479, -19.892633462859944,
+            -7.405703771950678
+          ],
+          "host": {
+            "timestamps": ["2026-10-03T16:34:29.170Z", "2026-10-03T16:35:20.077Z"],
+            "cpuUsageDeltaUsec": 77341256,
+            "cpuThrottledDeltaUsec": 0,
+            "memoryBytes": [6753865728, 7545081856]
+          }
+        },
+        {
+          "index": 2,
+          "order": ["before", "after", "after", "before"],
+          "warmups": [
+            {
+              "variant": "before",
+              "sampleOffset": 0,
+              "timesMs": [
+                [[75.5], [0.7000000011175871]],
+                [[141.10000000149012], [227.69999999925494]],
+                [[1.599999999627471], [0.8000000007450581]],
+                [[158.2999999988824], [222.59999999962747]],
+                [[336.1000000014901], [71.40000000037253]],
+                [[334.5], [75]]
+              ]
+            },
+            {
+              "variant": "after",
+              "sampleOffset": 0,
+              "timesMs": [
+                [[79.5], [0.6999999992549419]],
+                [[158.7000000011176], [169.19999999925494]],
+                [[1.300000000745058], [0.6999999992549419]],
+                [[194.59999999962747], [197.90000000037253]],
+                [[227.59999999962747], [48.29999999888241]],
+                [[251], [64.09999999962747]]
+              ]
+            }
+          ],
+          "visits": [
+            {
+              "variant": "before",
+              "sampleOffset": 4,
+              "timesMs": [
+                [[41.90000000037253], [0.5]],
+                [[159.90000000037253], [143.2000000011176]],
+                [[1.300000000745058], [0.3999999985098839]],
+                [[194], [246.5]],
+                [[330.8999999985099], [62]],
+                [[328], [66.79999999888241]]
+              ],
+              "contentChecksums": [
+                [null],
+                ["10000:188ae345"],
+                ["2:f9998de5"],
+                ["1000:d253e045"],
+                ["1000:e47bf105"],
+                ["64:9db455c5"]
+              ]
+            },
+            {
+              "variant": "after",
+              "sampleOffset": 4,
+              "timesMs": [
+                [[46.90000000037253], [0.40000000037252903]],
+                [[158.5], [174.59999999962747]],
+                [[1.1000000014901161], [0.5]],
+                [[191.90000000037253], [223.69999999925494]],
+                [[249.09999999962747], [63.90000000037253]],
+                [[262], [64.29999999888241]]
+              ],
+              "contentChecksums": [
+                [null],
+                ["10000:188ae345"],
+                ["2:f9998de5"],
+                ["1000:d253e045"],
+                ["1000:e47bf105"],
+                ["64:9db455c5"]
+              ]
+            },
+            {
+              "variant": "after",
+              "sampleOffset": 5,
+              "timesMs": [
+                [[35.59999999962747], [0.40000000037252903]],
+                [[159.40000000037253], [189.40000000037253]],
+                [[0.900000000372529], [0.599999999627471]],
+                [[157.80000000074506], [183.30000000074506]],
+                [[255.10000000149012], [79.09999999962747]],
+                [[246.39999999850988], [74.09999999962747]]
+              ],
+              "contentChecksums": [
+                [null],
+                ["10000:aef35145"],
+                ["2:f9998de5"],
+                ["1000:d253e045"],
+                ["1000:e47bf105"],
+                ["64:9db455c5"]
+              ]
+            },
+            {
+              "variant": "before",
+              "sampleOffset": 5,
+              "timesMs": [
+                [[47.399999998509884], [0.5]],
+                [[146.09999999962747], [155.5]],
+                [[1], [0.5]],
+                [[183.40000000037253], [213.59999999962747]],
+                [[357.8999999985099], [69.90000000037253]],
+                [[316.09999999962747], [71.5]]
+              ],
+              "contentChecksums": [
+                [null],
+                ["10000:aef35145"],
+                ["2:f9998de5"],
+                ["1000:d253e045"],
+                ["1000:e47bf105"],
+                ["64:9db455c5"]
+              ]
+            }
+          ],
+          "moyoMedianChangePercent": [
+            -7.614781633782208, 3.888888889010622, -13.04347820805354, -7.339692633605621, -26.800232287558202,
+            -21.06815711864556
+          ],
+          "host": {
+            "timestamps": ["2026-10-03T16:35:20.164Z", "2026-10-03T16:36:10.623Z"],
+            "cpuUsageDeltaUsec": 76883520,
+            "cpuThrottledDeltaUsec": 0,
+            "memoryBytes": [6772633600, 7541891072]
+          }
+        },
+        {
+          "index": 3,
+          "order": ["after", "before", "before", "after"],
+          "warmups": [
+            {
+              "variant": "after",
+              "sampleOffset": 0,
+              "timesMs": [
+                [[78.90000000037253], [0.7999999988824129]],
+                [[159], [147.89999999850988]],
+                [[1.599999999627471], [0.7999999988824129]],
+                [[200.89999999850988], [217.80000000074506]],
+                [[258.40000000037253], [76.5]],
+                [[264.09999999962747], [67.69999999925494]]
+              ]
+            },
+            {
+              "variant": "before",
+              "sampleOffset": 0,
+              "timesMs": [
+                [[78.59999999962747], [0.6000000014901161]],
+                [[136.59999999962747], [147.59999999962747]],
+                [[1.900000000372529], [0.7999999988824129]],
+                [[167.09999999962747], [263.6000000014901]],
+                [[302.09999999962747], [57.09999999962747]],
+                [[319.2999999988824], [62.09999999962747]]
+              ]
+            }
+          ],
+          "visits": [
+            {
+              "variant": "after",
+              "sampleOffset": 6,
+              "timesMs": [
+                [[42.09999999962747], [0.2999999988824129]],
+                [[149.30000000074506], [149.90000000037253]],
+                [[0.8000000007450581], [0.5]],
+                [[164.2999999988824], [213.89999999850988]],
+                [[254.10000000149012], [100.09999999962747]],
+                [[263.1000000014901], [88.10000000149012]]
+              ],
+              "contentChecksums": [
+                [null],
+                ["10000:5819df45"],
+                ["2:f9998de5"],
+                ["1000:d253e045"],
+                ["1000:e47bf105"],
+                ["64:9db455c5"]
+              ]
+            },
+            {
+              "variant": "before",
+              "sampleOffset": 6,
+              "timesMs": [
+                [[40.20000000111759], [0.7000000011175871]],
+                [[126.10000000149012], [204]],
+                [[1.099999999627471], [0.6999999992549419]],
+                [[214.7000000011176], [270.2999999988824]],
+                [[349.5], [69.90000000037253]],
+                [[315.19999999925494], [67.90000000037253]]
+              ],
+              "contentChecksums": [
+                [null],
+                ["10000:5819df45"],
+                ["2:f9998de5"],
+                ["1000:d253e045"],
+                ["1000:e47bf105"],
+                ["64:9db455c5"]
+              ]
+            },
+            {
+              "variant": "before",
+              "sampleOffset": 7,
+              "timesMs": [
+                [[38.80000000074506], [0.40000000037252903]],
+                [[150.2999999988824], [154.30000000074506]],
+                [[0.6999999992549419], [0.40000000037252903]],
+                [[186.30000000074506], [219.5]],
+                [[333], [76.80000000074506]],
+                [[315.2999999988824], [95.59999999962747]]
+              ],
+              "contentChecksums": [
+                [null],
+                ["10000:72cef145"],
+                ["2:f9998de5"],
+                ["1000:d253e045"],
+                ["1000:e47bf105"],
+                ["64:9db455c5"]
+              ]
+            },
+            {
+              "variant": "after",
+              "sampleOffset": 7,
+              "timesMs": [
+                [[42.40000000037253], [0.6000000014901161]],
+                [[162.09999999962747], [179.19999999925494]],
+                [[0.8000000007450581], [0.5]],
+                [[181.69999999925494], [225.39999999850988]],
+                [[260.09999999962747], [65.5]],
+                [[247.2999999988824], [69.80000000074506]]
+              ],
+              "contentChecksums": [
+                [null],
+                ["10000:72cef145"],
+                ["2:f9998de5"],
+                ["1000:d253e045"],
+                ["1000:e47bf105"],
+                ["64:9db455c5"]
+              ]
+            }
+          ],
+          "moyoMedianChangePercent": [
+            6.962025313933773, 12.662807525308551, -11.111110973137395, -13.715710724057306, -24.65934065917691,
+            -19.048374305808025
+          ],
+          "host": {
+            "timestamps": ["2026-10-03T16:36:10.707Z", "2026-10-03T16:37:00.477Z"],
+            "cpuUsageDeltaUsec": 76174526,
+            "cpuThrottledDeltaUsec": 0,
+            "memoryBytes": [6791032832, 7584083968]
+          }
+        }
+      ],
+      "pooledSummary": [
+        [
+          39.90000000037253, 42.25, 0.5, 79.80000000074506, 84.5, 5.889724309788291, 41.675000000046566,
+          41.762499999953434, 0.20995800817460442
+        ],
+        [
+          148.19999999925494, 149.20000000018626, 165.29999999981374, 0.896551724134434, 0.9026013309156345,
+          0.6747638332903927, 148.21250000037253, 150.1875, 1.3325461750004264
+        ],
+        [
+          0.9500000001862645, 0.8000000007450581, 0.599999999627471, 1.583333334626837, 1.333333335402939,
+          -15.789473622294349, 0.974999999627471, 0.8500000003259629, -12.820512753771096
+        ],
+        [
+          190.15000000037253, 181.20000000018626, 216.69999999925494, 0.877480387637408, 0.8361790493807534,
+          -4.7068104129207144, 201.52500000060536, 179.78750000032596, -10.786502915377294
+        ],
+        [
+          344.54999999981374, 254.60000000149012, 70.8500000005588, 4.86309103736198, 3.5935074100138613,
+          -26.106515744702442, 346.17499999981374, 258.2750000001397, -25.39178161326535
+        ],
+        [
+          315.69999999925494, 262.15000000037253, 70.65000000037253, 4.468506723249686, 3.7105449398300103,
+          -16.962305986382265, 320.49999999976717, 268.1500000001397, -16.33385335402979
+        ]
+      ],
+      "allRowsOkAndShapeContentDurabilityParity": true
+    },
+    {
+      "input": {
+        "file": "c90-scaling.json",
+        "sha256": "e063473f3ba9dc59f08eb49eea9fe8ef859589eb1e2afd810f66d91d7e7c8cb2"
+      },
+      "startedAt": "2026-10-03T16:38:32.046Z",
+      "runnerSha256": "d2995a93617adfd2a148b44f061fae060521bdd09ea0068cec3d3ddb138af177",
+      "profileCount": 2,
+      "samplesPerMoyoVariant": 4,
+      "pooledIndexedDbControls": 8,
+      "warmupsPerVariantPerProfile": 1,
+      "workloads": [
+        {
+          "name": "large_value_scaling_4096b",
+          "shape": [16384, 16, 4096, 2048],
+          "transactionBoundaries": "8 readwrite transactions; batches of at most 2048 values; 67108864 total value bytes"
+        },
+        {
+          "name": "large_value_scaling_16384b",
+          "shape": [4096, 16, 16384, 512],
+          "transactionBoundaries": "8 readwrite transactions; batches of at most 512 values; 67108864 total value bytes"
+        },
+        {
+          "name": "large_value_scaling_65536b",
+          "shape": [1024, 16, 65536, 128],
+          "transactionBoundaries": "8 readwrite transactions; batches of at most 128 values; 67108864 total value bytes"
+        },
+        {
+          "name": "large_value_scaling_262144b",
+          "shape": [256, 16, 262144, 32],
+          "transactionBoundaries": "8 readwrite transactions; batches of at most 32 values; 67108864 total value bytes"
+        },
+        {
+          "name": "large_value_scaling_1048576b",
+          "shape": [64, 16, 1048576, 8],
+          "transactionBoundaries": "8 readwrite transactions; batches of at most 8 values; 67108864 total value bytes"
+        }
+      ],
+      "profiles": [
+        {
+          "index": 0,
+          "order": ["before", "after", "after", "before"],
+          "warmups": [
+            {
+              "variant": "before",
+              "sampleOffset": 0,
+              "timesMs": [
+                [[780.3000000007451], [1091.4000000003725]],
+                [[391.69999999925494], [487.5]],
+                [[322.59999999962747], [52.5]],
+                [[349.30000000074506], [36.100000001490116]],
+                [[311.40000000037253], [84.19999999925494]]
+              ]
+            },
+            {
+              "variant": "after",
+              "sampleOffset": 0,
+              "timesMs": [
+                [[427.90000000037253], [913.8999999985099]],
+                [[284], [409.59999999962747]],
+                [[238.09999999962747], [58.5]],
+                [[250.40000000037253], [35.30000000074506]],
+                [[226.09999999962747], [70.30000000074506]]
+              ]
+            }
+          ],
+          "visits": [
+            {
+              "variant": "before",
+              "sampleOffset": 0,
+              "timesMs": [
+                [[552], [920.8000000007451]],
+                [[336.80000000074506], [379.3999999985099]],
+                [[301.7999999988824], [60.09999999962747]],
+                [[308.30000000074506], [44.09999999962747]],
+                [[291.5], [73.19999999925494]]
+              ],
+              "contentChecksums": [
+                ["1024:1d1e4dc5"],
+                ["1024:c47c9dc5"],
+                ["1024:d8f6bdc5"],
+                ["256:c7184dc5"],
+                ["64:9db455c5"]
+              ]
+            },
+            {
+              "variant": "after",
+              "sampleOffset": 0,
+              "timesMs": [
+                [[451.19999999925494], [1038.6000000014901]],
+                [[263.19999999925494], [335]],
+                [[277.30000000074506], [54.30000000074506]],
+                [[269.59999999962747], [39.90000000037253]],
+                [[316.2000000011176], [81.09999999962747]]
+              ],
+              "contentChecksums": [
+                ["1024:1d1e4dc5"],
+                ["1024:c47c9dc5"],
+                ["1024:d8f6bdc5"],
+                ["256:c7184dc5"],
+                ["64:9db455c5"]
+              ]
+            },
+            {
+              "variant": "after",
+              "sampleOffset": 1,
+              "timesMs": [
+                [[441.59999999962747], [963.3999999985099]],
+                [[274.40000000037253], [396]],
+                [[355.69999999925494], [53.29999999888241]],
+                [[243.40000000037253], [33.90000000037253]],
+                [[223.69999999925494], [69.89999999850988]]
+              ],
+              "contentChecksums": [
+                ["1024:1d1e4dc5"],
+                ["1024:c47c9dc5"],
+                ["1024:d8f6bdc5"],
+                ["256:c7184dc5"],
+                ["64:9db455c5"]
+              ]
+            },
+            {
+              "variant": "before",
+              "sampleOffset": 1,
+              "timesMs": [
+                [[534.5], [975.9000000003725]],
+                [[365.2000000011176], [411.80000000074506]],
+                [[320], [46.100000001490116]],
+                [[321.8999999985099], [37.30000000074506]],
+                [[333], [75.89999999850988]]
+              ],
+              "contentChecksums": [
+                ["1024:1d1e4dc5"],
+                ["1024:c47c9dc5"],
+                ["1024:d8f6bdc5"],
+                ["256:c7184dc5"],
+                ["64:9db455c5"]
+              ]
+            }
+          ],
+          "moyoMedianChangePercent": [
+            -17.827887712942257, -23.418803419059685, 1.8012222581437198, -18.5972707076156, -13.546837469916328
+          ],
+          "host": {
+            "timestamps": ["2026-10-03T16:38:32.504Z", "2026-10-03T16:39:56.553Z"],
+            "cpuUsageDeltaUsec": 117155368,
+            "cpuThrottledDeltaUsec": 0,
+            "memoryBytes": [6573010944, 7169736704]
+          }
+        },
+        {
+          "index": 1,
+          "order": ["after", "before", "before", "after"],
+          "warmups": [
+            {
+              "variant": "after",
+              "sampleOffset": 0,
+              "timesMs": [
+                [[526], [866.0999999996275]],
+                [[295.90000000037253], [452.90000000037253]],
+                [[247.5], [81.09999999962747]],
+                [[271.40000000037253], [33.40000000037253]],
+                [[228.2000000011176], [87.40000000037253]]
+              ]
+            },
+            {
+              "variant": "before",
+              "sampleOffset": 0,
+              "timesMs": [
+                [[611.5], [1020.0999999996275]],
+                [[353.09999999962747], [373]],
+                [[329.90000000037253], [65.60000000149012]],
+                [[310.5], [36.79999999888241]],
+                [[276.19999999925494], [64.80000000074506]]
+              ]
+            }
+          ],
+          "visits": [
+            {
+              "variant": "after",
+              "sampleOffset": 2,
+              "timesMs": [
+                [[429.5], [822.7999999988824]],
+                [[309.3999999985099], [459]],
+                [[243.5], [58.09999999962747]],
+                [[261.59999999962747], [34.19999999925494]],
+                [[222.89999999850988], [76.30000000074506]]
+              ],
+              "contentChecksums": [
+                ["1024:1d1e4dc5"],
+                ["1024:c47c9dc5"],
+                ["1024:d8f6bdc5"],
+                ["256:c7184dc5"],
+                ["64:9db455c5"]
+              ]
+            },
+            {
+              "variant": "before",
+              "sampleOffset": 2,
+              "timesMs": [
+                [[537.0999999996275], [1041.300000000745]],
+                [[397.7999999988824], [542.2000000011176]],
+                [[377.09999999962747], [58.09999999962747]],
+                [[318.90000000037253], [35.09999999962747]],
+                [[288.7000000011176], [66.80000000074506]]
+              ],
+              "contentChecksums": [
+                ["1024:1d1e4dc5"],
+                ["1024:c47c9dc5"],
+                ["1024:d8f6bdc5"],
+                ["256:c7184dc5"],
+                ["64:9db455c5"]
+              ]
+            },
+            {
+              "variant": "before",
+              "sampleOffset": 3,
+              "timesMs": [
+                [[575], [933.5]],
+                [[351.7999999988824], [422.2000000011176]],
+                [[375.19999999925494], [47.79999999888241]],
+                [[331.7999999988824], [43.80000000074506]],
+                [[383.30000000074506], [71.10000000149012]]
+              ],
+              "contentChecksums": [
+                ["1024:1d1e4dc5"],
+                ["1024:c47c9dc5"],
+                ["1024:d8f6bdc5"],
+                ["256:c7184dc5"],
+                ["64:9db455c5"]
+              ]
+            },
+            {
+              "variant": "after",
+              "sampleOffset": 3,
+              "timesMs": [
+                [[525.2000000011176], [1094.300000000745]],
+                [[309.90000000037253], [446.69999999925494]],
+                [[250.30000000074506], [44.40000000037253]],
+                [[261.80000000074506], [33.69999999925494]],
+                [[235.90000000037253], [64.09999999962747]]
+              ],
+              "contentChecksums": [
+                ["1024:1d1e4dc5"],
+                ["1024:c47c9dc5"],
+                ["1024:d8f6bdc5"],
+                ["256:c7184dc5"],
+                ["64:9db455c5"]
+              ]
+            }
+          ],
+          "moyoMedianChangePercent": [
+            -14.153403470781644, -17.38260405539901, -34.36129203755435, -19.563546949289712, -31.726190476546023
+          ],
+          "host": {
+            "timestamps": ["2026-10-03T16:39:56.614Z", "2026-10-03T16:41:21.784Z"],
+            "cpuUsageDeltaUsec": 119914440,
+            "cpuThrottledDeltaUsec": 0,
+            "memoryBytes": [6767665152, 7207755776]
+          }
+        }
+      ],
+      "pooledSummary": [
+        [
+          544.5499999998137, 446.3999999994412, 969.6499999994412, 0.561594389728384, 0.46037229928293555,
+          -18.02405656053734, 549.6499999999069, 461.875, -15.969253161088282
+        ],
+        [
+          358.5, 291.8999999994412, 417.0000000009313, 0.8597122302139073, 0.6999999999970966, -18.577405857896455,
+          362.89999999990687, 289.22499999962747, -20.30173601551345
+        ],
+        [
+          347.59999999962747, 263.80000000074506, 53.799999999813735, 6.460966542766374, 4.903345724937888,
+          -24.108170310406273, 343.5249999994412, 281.70000000018626, -17.997234553338338
+        ],
+        [
+          320.3999999994412, 261.70000000018626, 36.200000000186265, 8.85082872922079, 7.229281767923749,
+          -18.32084893862588, 320.22499999962747, 259.10000000009313, -19.088141150630168
+        ],
+        [
+          312.25, 229.79999999981374, 72.15000000037253, 4.3277893277669826, 3.1850311850121584, -26.405124099339073,
+          324.12500000046566, 249.67499999981374, -22.969533359211713
+        ]
+      ],
+      "allRowsOkAndShapeContentDurabilityParity": true
+    }
+  ],
+  "structuralWork": {
+    "checksum": {
+      "kind": "native checksum input-byte accounting over begin/put-many/commit with default checkpoints",
+      "baseMain": "c90d16df28b17a97d13132a5dcef471a572f42b8",
+      "mainInput": {
+        "file": "c90-main-hash-work.log",
+        "sha256": "6a7e72e4d9fd83d0334a391aa651d42d07ed02ec4f44d8724459ad6f3e3d6a2c"
+      },
+      "candidateInput": {
+        "file": "c90-stock-hash-work.log",
+        "sha256": "948596ea9f37f994cb5b329a22dd74b8320bde0b920c1175b1538a9be60317d9"
+      },
+      "columns": [
+        "records",
+        "valueBytes",
+        "batchSize",
+        "actualMainHashedBytes",
+        "candidateGenericHashedBytes",
+        "candidatePreparedHashedBytes"
+      ],
+      "rows": [
+        [1000, 65536, 100, 140995760, 140983472, 68883856],
+        [64, 1048576, 8, 137331008, 137331008, 70177344]
+      ],
+      "qualification": "Actual main is an isolated native checkout instrumented with a test-only counter and stock-shape fixture. Candidate generic/prepared paths are compared in the same ignored fixture. Counts are not wall-clock results. Metadata verification may differ by a few 4 KiB pages because clean-cache publication traverses a HashMap."
+    },
+    "sourceDerived": {
+      "kind": "source-derived commit-planning copies and explicit overflow zero-fill requests; not measured DRAM traffic",
+      "layout": {
+        "pageBytes": 4096,
+        "overflowHeaderBytes": 46,
+        "overflowChunkBytes": 4050,
+        "userPrefixBytes": 16,
+        "changePrefixBytes": 32
+      },
+      "columns": [
+        "records",
+        "valueBytes",
+        "overflowPages",
+        "payloadCopyBytesBefore",
+        "payloadCopyBytesAfter",
+        "explicitZeroBytesBefore",
+        "explicitZeroBytesAfter",
+        "newChecksumMetadataBytes"
+      ],
+      "rows": [
+        [1000, 65536, 34000, 262144000, 131072000, 139264000, 6580000, 136000],
+        [64, 1048576, 33152, 268435456, 134217728, 135790592, 44800, 132608]
+      ],
+      "scope": "4 to 2 full payload copies inside commit planning; excludes SDK input/WAL/checkpoint gathering. Page checksum fields still receive final CRCs. Zero-fill counts are source-level requests; compiler/allocator behavior can differ. Prefix/Vec allocations are excluded from checksum metadata bytes."
+    }
+  },
+  "diagnostics": {
+    "kind": "separate instrumented browser diagnostics",
+    "variants": {
+      "before": {
+        "input": {
+          "file": "c90-diagnostic-before.json",
+          "sha256": "8d52c9af1fbdc1fb2056f82656a82c0bc6286059d279124195bf22519c1acdd1"
+        },
+        "generatedAt": "2026-10-03T16:41:55.018Z",
+        "runnerSha256": "04267eb944e807e297babe8cad63c7beefbcfccce1b5b504efbd9c89645a9410",
+        "workloads": {
+          "open_empty_db": [
+            {
+              "sample": 0,
+              "elapsedMs": 95.59999999962747,
+              "wire": [1, 1, 1, 1],
+              "metrics": [
+                [4, 1, 0, 0, 0, 6.099999999627471],
+                [9, 3, 0, 0, 0, 1.699999999254942],
+                [10, 1, 0, 0, 0, 0.5],
+                [11, 2, 0, 0, 0, 0.8999999985098839],
+                [12, 4, 1, 0, 0, 2.6999999955296516],
+                [13, 1, 0, 0, 0, 0],
+                [14, 1, 0, 0, 0, 1.099999999627471],
+                [15, 1, 0, 0, 0, 21.800000000745058],
+                [16, 1, 0, 0, 0, 0.09999999962747097],
+                [17, 1, 0, 0, 0, 0],
+                [19, 1, 0, 4096, 4096, 0.40000000037252903],
+                [20, 1, 0, 0, 0, 0],
+                [21, 1, 0, 0, 0, 0],
+                [22, 1, 0, 4096, 4096, 0.09999999962747097],
+                [23, 2, 0, 8192, 8192, 0.19999999925494194],
+                [24, 1, 0, 0, 0, 0],
+                [25, 3, 0, 0, 0, 0],
+                [26, 1, 0, 0, 0, 0.2000000011175871]
+              ],
+              "workerReadyElapsedMs": [63]
+            },
+            {
+              "sample": 1,
+              "elapsedMs": 91.09999999962747,
+              "wire": [1, 1, 1, 1],
+              "metrics": [
+                [4, 1, 0, 0, 0, 8.400000000372529],
+                [9, 3, 0, 0, 0, 5.199999997392297],
+                [10, 1, 0, 0, 0, 0.6999999992549419],
+                [11, 2, 0, 0, 0, 1.700000001117587],
+                [12, 4, 1, 0, 0, 2.900000002235174],
+                [13, 1, 0, 0, 0, 0.09999999962747097],
+                [14, 1, 0, 0, 0, 1.199999999254942],
+                [15, 1, 0, 0, 0, 22.40000000037253],
+                [16, 1, 0, 0, 0, 0],
+                [17, 1, 0, 0, 0, 0],
+                [19, 1, 0, 4096, 4096, 0.30000000074505806],
+                [20, 1, 0, 0, 0, 0],
+                [21, 1, 0, 0, 0, 0],
+                [22, 1, 0, 4096, 4096, 0],
+                [23, 2, 0, 8192, 8192, 0.30000000074505806],
+                [24, 1, 0, 0, 0, 0],
+                [25, 3, 0, 0, 0, 0],
+                [26, 1, 0, 0, 0, 0.30000000074505806]
+              ],
+              "workerReadyElapsedMs": [56.90000000037253]
+            }
+          ],
+          "point_get_random_10k_pipelined": [
+            {
+              "sample": 0,
+              "elapsedMs": 184.59999999962747,
+              "wire": [10002, 81, 10002, 81],
+              "metrics": [
+                [0, 1, 0, 0, 0, 0],
+                [2, 10000, 0, 0, 0, 42.00000001117587],
+                [3, 1, 0, 0, 0, 0],
+                [7, 1, 0, 0, 0, 0]
+              ]
+            },
+            {
+              "sample": 1,
+              "elapsedMs": 162.09999999962747,
+              "wire": [10002, 81, 10002, 81],
+              "metrics": [
+                [0, 1, 0, 0, 0, 0],
+                [2, 10000, 0, 0, 0, 38.19999999180436],
+                [3, 1, 0, 0, 0, 0],
+                [7, 1, 0, 0, 0, 0.09999999962747097]
+              ]
+            }
+          ],
+          "reverse_scan_limit_1": [
+            {
+              "sample": 0,
+              "elapsedMs": 0.900000000372529,
+              "wire": [3, 3, 3, 3],
+              "metrics": [
+                [0, 1, 0, 0, 0, 0],
+                [3, 1, 0, 0, 0, 0],
+                [7, 1, 0, 0, 0, 0],
+                [8, 1, 0, 0, 0, 0.09999999962747097]
+              ]
+            },
+            {
+              "sample": 1,
+              "elapsedMs": 0.599999999627471,
+              "wire": [3, 3, 3, 3],
+              "metrics": [
+                [0, 1, 0, 0, 0, 0],
+                [3, 1, 0, 0, 0, 0],
+                [7, 1, 0, 0, 0, 0],
+                [8, 1, 0, 0, 0, 0]
+              ]
+            }
+          ],
+          "small_tx_1000_commits": [
+            {
+              "sample": 0,
+              "elapsedMs": 216.40000000037253,
+              "wire": [1000, 1000, 1000, 1000],
+              "metrics": [
+                [0, 1000, 0, 0, 0, 2.6000000052154064],
+                [1, 1000, 0, 0, 0, 90.2999999858439],
+                [3, 1000, 0, 0, 0, 3.000000001862645],
+                [5, 1000, 0, 0, 0, 7.399999991059303],
+                [16, 1, 0, 0, 0, 0],
+                [19, 1, 0, 598016, 598016, 0.2000000011175871],
+                [20, 1, 0, 0, 0, 0],
+                [22, 1, 0, 4096, 4096, 0],
+                [23, 1, 0, 4096, 4096, 0],
+                [24, 1001, 0, 0, 0, 1.4999999981373549],
+                [26, 1, 0, 0, 0, 1.5],
+                [27, 1000, 0, 21265680, 21265680, 33.30000000074506]
+              ],
+              "commits": { "count": 1000, "failed": 0, "elapsedMs": 90.2999999858439, "opfsElapsedMs": 36.5 }
+            },
+            {
+              "sample": 1,
+              "elapsedMs": 186.09999999962747,
+              "wire": [1000, 1000, 1000, 1000],
+              "metrics": [
+                [0, 1000, 0, 0, 0, 1.9000000040978193],
+                [1, 1000, 0, 0, 0, 85.3999999742955],
+                [3, 1000, 0, 0, 0, 1.599999999627471],
+                [5, 1000, 0, 0, 0, 7.199999989941716],
+                [16, 1, 0, 0, 0, 0],
+                [19, 1, 0, 598016, 598016, 0.09999999962747097],
+                [20, 1, 0, 0, 0, 0],
+                [22, 1, 0, 4096, 4096, 0],
+                [23, 1, 0, 4096, 4096, 0],
+                [24, 1001, 0, 0, 0, 0.9999999981373549],
+                [26, 1, 0, 0, 0, 1.300000000745058],
+                [27, 1000, 0, 21265680, 21265680, 37.09999997727573]
+              ],
+              "commits": {
+                "count": 1000,
+                "failed": 0,
+                "elapsedMs": 85.3999999742955,
+                "opfsElapsedMs": 39.49999997578561
+              }
+            }
+          ],
+          "large_value_64kb": [
+            {
+              "sample": 0,
+              "elapsedMs": 333.69999999925494,
+              "wire": [30, 30, 30, 30],
+              "metrics": [
+                [0, 10, 0, 0, 0, 0.09999999962747097],
+                [1, 10, 0, 0, 0, 255.5000000037253],
+                [3, 10, 0, 0, 0, 0.09999999962747097],
+                [6, 10, 0, 0, 0, 26.700000002980232],
+                [16, 5, 0, 0, 0, 0],
+                [18, 19, 0, 77824, 77824, 0.2999999988824129],
+                [19, 47, 0, 139534336, 139534336, 23.899999994784594],
+                [20, 5, 0, 0, 0, 0],
+                [22, 5, 0, 20480, 20480, 0.7999999988824129],
+                [23, 5, 0, 20480, 20480, 0],
+                [24, 15, 0, 0, 0, 0.10000000149011612],
+                [26, 5, 0, 0, 0, 6.300000000745058],
+                [27, 10, 0, 140897456, 140897456, 21.800000002607703]
+              ],
+              "commits": {
+                "count": 10,
+                "failed": 0,
+                "elapsedMs": 255.5000000037253,
+                "opfsElapsedMs": 53.099999997764826
+              }
+            },
+            {
+              "sample": 1,
+              "elapsedMs": 363.19999999925494,
+              "wire": [30, 30, 30, 30],
+              "metrics": [
+                [0, 10, 0, 0, 0, 0],
+                [1, 10, 0, 0, 0, 283.29999999701977],
+                [3, 10, 0, 0, 0, 0],
+                [6, 10, 0, 0, 0, 26.90000000037253],
+                [16, 5, 0, 0, 0, 0],
+                [18, 19, 0, 77824, 77824, 0.6999999973922968],
+                [19, 47, 0, 139534336, 139534336, 24.300000002607703],
+                [20, 5, 0, 0, 0, 0],
+                [22, 5, 0, 20480, 20480, 0.2999999988824129],
+                [23, 5, 0, 20480, 20480, 0.2000000011175871],
+                [24, 15, 0, 0, 0, 0.09999999962747097],
+                [26, 5, 0, 0, 0, 6.800000000745058],
+                [27, 10, 0, 140897456, 140897456, 22.80000000447035]
+              ],
+              "commits": {
+                "count": 10,
+                "failed": 0,
+                "elapsedMs": 283.29999999701977,
+                "opfsElapsedMs": 55.000000005587935
+              }
+            }
+          ],
+          "large_value_1mb": [
+            {
+              "sample": 0,
+              "elapsedMs": 314.30000000074506,
+              "wire": [24, 24, 24, 24],
+              "metrics": [
+                [0, 8, 0, 0, 0, 0.09999999962747097],
+                [1, 8, 0, 0, 0, 254.80000000074506],
+                [3, 8, 0, 0, 0, 0.09999999962747097],
+                [6, 8, 0, 0, 0, 20.500000001862645],
+                [16, 8, 0, 0, 0, 0.09999999962747097],
+                [18, 21, 0, 86016, 86016, 0.8000000044703484],
+                [19, 53, 0, 135897088, 135897088, 24.300000002607703],
+                [20, 8, 0, 0, 0, 0],
+                [22, 8, 0, 32768, 32768, 0.30000000074505806],
+                [23, 8, 0, 32768, 32768, 0.3000000026077032],
+                [24, 16, 0, 0, 0, 0],
+                [26, 8, 0, 0, 0, 5.899999998509884],
+                [27, 8, 0, 137216320, 137216320, 20.199999999254942]
+              ],
+              "commits": {
+                "count": 8,
+                "failed": 0,
+                "elapsedMs": 254.80000000074506,
+                "opfsElapsedMs": 51.70000000670552
+              }
+            },
+            {
+              "sample": 1,
+              "elapsedMs": 328.90000000037253,
+              "wire": [24, 24, 24, 24],
+              "metrics": [
+                [0, 8, 0, 0, 0, 0],
+                [1, 8, 0, 0, 0, 255.19999999925494],
+                [3, 8, 0, 0, 0, 0.19999999925494194],
+                [6, 8, 0, 0, 0, 23.5],
+                [16, 8, 0, 0, 0, 0],
+                [18, 21, 0, 86016, 86016, 0.5000000018626451],
+                [19, 53, 0, 135897088, 135897088, 33.099999997764826],
+                [20, 8, 0, 0, 0, 0],
+                [22, 8, 0, 32768, 32768, 0.2000000011175871],
+                [23, 8, 0, 32768, 32768, 0],
+                [24, 16, 0, 0, 0, 0.20000000298023224],
+                [26, 8, 0, 0, 0, 5.300000000745058],
+                [27, 8, 0, 137216320, 137216320, 29.699999999254942]
+              ],
+              "commits": {
+                "count": 8,
+                "failed": 0,
+                "elapsedMs": 255.19999999925494,
+                "opfsElapsedMs": 68.90000000409782
+              }
+            }
+          ]
+        }
+      },
+      "after": {
+        "input": {
+          "file": "c90-diagnostic-after.json",
+          "sha256": "8b6a814eb4d1afeb17dd7679c8b3518adff9adcf7679d2600ebabeb713ab1657"
+        },
+        "generatedAt": "2026-10-03T16:42:08.244Z",
+        "runnerSha256": "04267eb944e807e297babe8cad63c7beefbcfccce1b5b504efbd9c89645a9410",
+        "workloads": {
+          "open_empty_db": [
+            {
+              "sample": 0,
+              "elapsedMs": 99.20000000111759,
+              "wire": [1, 1, 1, 1],
+              "metrics": [
+                [4, 1, 0, 0, 0, 7.300000000745058],
+                [9, 3, 0, 0, 0, 2.700000001117587],
+                [10, 1, 0, 0, 0, 0.6999999992549419],
+                [11, 2, 0, 0, 0, 0.8000000007450581],
+                [12, 4, 1, 0, 0, 4.0],
+                [13, 1, 0, 0, 0, 0],
+                [14, 1, 0, 0, 0, 1.300000000745058],
+                [15, 1, 0, 0, 0, 33.19999999925494],
+                [16, 1, 0, 0, 0, 0],
+                [17, 1, 0, 0, 0, 0],
+                [19, 1, 0, 4096, 4096, 0.6000000014901161],
+                [20, 1, 0, 0, 0, 0],
+                [21, 1, 0, 0, 0, 0],
+                [22, 1, 0, 4096, 4096, 0],
+                [23, 2, 0, 8192, 8192, 0.19999999925494194],
+                [24, 1, 0, 0, 0, 0.09999999962747097],
+                [25, 3, 0, 0, 0, 0],
+                [26, 1, 0, 0, 0, 0.30000000074505806]
+              ],
+              "workerReadyElapsedMs": [55.30000000074506]
+            },
+            {
+              "sample": 1,
+              "elapsedMs": 85.59999999962747,
+              "wire": [1, 1, 1, 1],
+              "metrics": [
+                [4, 1, 0, 0, 0, 7.299999998882413],
+                [9, 3, 0, 0, 0, 2.800000000745058],
+                [10, 1, 0, 0, 0, 0.5],
+                [11, 2, 0, 0, 0, 0.900000000372529],
+                [12, 4, 1, 0, 0, 4.5],
+                [13, 1, 0, 0, 0, 0.5],
+                [14, 1, 0, 0, 0, 0.8000000007450581],
+                [15, 1, 0, 0, 0, 23.299999998882413],
+                [16, 1, 0, 0, 0, 0.09999999962747097],
+                [17, 1, 0, 0, 0, 0],
+                [19, 1, 0, 4096, 4096, 0.5],
+                [20, 1, 0, 0, 0, 0],
+                [21, 1, 0, 0, 0, 0],
+                [22, 1, 0, 4096, 4096, 0],
+                [23, 2, 0, 8192, 8192, 0.19999999925494194],
+                [24, 1, 0, 0, 0, 0],
+                [25, 3, 0, 0, 0, 0],
+                [26, 1, 0, 0, 0, 0.2000000011175871]
+              ],
+              "workerReadyElapsedMs": [51.19999999925494]
+            }
+          ],
+          "point_get_random_10k_pipelined": [
+            {
+              "sample": 0,
+              "elapsedMs": 167.19999999925494,
+              "wire": [10002, 81, 10002, 81],
+              "metrics": [
+                [0, 1, 0, 0, 0, 0],
+                [2, 10000, 0, 0, 0, 47.300000013783574],
+                [3, 1, 0, 0, 0, 0],
+                [7, 1, 0, 0, 0, 0]
+              ]
+            },
+            {
+              "sample": 1,
+              "elapsedMs": 165,
+              "wire": [10002, 81, 10002, 81],
+              "metrics": [
+                [0, 1, 0, 0, 0, 0],
+                [2, 10000, 0, 0, 0, 40.30000000819564],
+                [3, 1, 0, 0, 0, 0],
+                [7, 1, 0, 0, 0, 0]
+              ]
+            }
+          ],
+          "reverse_scan_limit_1": [
+            {
+              "sample": 0,
+              "elapsedMs": 1.200000001117587,
+              "wire": [3, 3, 3, 3],
+              "metrics": [
+                [0, 1, 0, 0, 0, 0],
+                [3, 1, 0, 0, 0, 0],
+                [7, 1, 0, 0, 0, 0],
+                [8, 1, 0, 0, 0, 0.2000000011175871]
+              ]
+            },
+            {
+              "sample": 1,
+              "elapsedMs": 0.8000000007450581,
+              "wire": [3, 3, 3, 3],
+              "metrics": [
+                [0, 1, 0, 0, 0, 0],
+                [3, 1, 0, 0, 0, 0],
+                [7, 1, 0, 0, 0, 0],
+                [8, 1, 0, 0, 0, 0.19999999925494194]
+              ]
+            }
+          ],
+          "small_tx_1000_commits": [
+            {
+              "sample": 0,
+              "elapsedMs": 240,
+              "wire": [1000, 1000, 1000, 1000],
+              "metrics": [
+                [0, 1000, 0, 0, 0, 2.4999999962747097],
+                [1, 1000, 0, 0, 0, 100.30000003427267],
+                [3, 1000, 0, 0, 0, 1.8999999947845936],
+                [5, 1000, 0, 0, 0, 9.699999997392297],
+                [16, 1, 0, 0, 0, 0],
+                [19, 1, 0, 598016, 598016, 0.09999999962747097],
+                [20, 1, 0, 0, 0, 0],
+                [22, 1, 0, 4096, 4096, 0],
+                [23, 1, 0, 4096, 4096, 0],
+                [24, 1001, 0, 0, 0, 1.799999998882413],
+                [26, 1, 0, 0, 0, 1.599999999627471],
+                [27, 1000, 0, 21265680, 21265680, 36.60000001825392]
+              ],
+              "commits": {
+                "count": 1000,
+                "failed": 0,
+                "elapsedMs": 100.30000003427267,
+                "opfsElapsedMs": 40.10000001639128
+              }
+            },
+            {
+              "sample": 1,
+              "elapsedMs": 238.80000000074506,
+              "wire": [1000, 1000, 1000, 1000],
+              "metrics": [
+                [0, 1000, 0, 0, 0, 2.7999999932944775],
+                [1, 1000, 0, 0, 0, 106.40000002272427],
+                [3, 1000, 0, 0, 0, 2.100000001490116],
+                [5, 1000, 0, 0, 0, 8.499999994412065],
+                [16, 1, 0, 0, 0, 0],
+                [19, 1, 0, 598016, 598016, 2.400000000372529],
+                [20, 1, 0, 0, 0, 0],
+                [22, 1, 0, 4096, 4096, 0],
+                [23, 1, 0, 4096, 4096, 0],
+                [24, 1001, 0, 0, 0, 1.5999999977648258],
+                [26, 1, 0, 0, 0, 1.700000001117587],
+                [27, 1000, 0, 21265680, 21265680, 37.300000021234155]
+              ],
+              "commits": {
+                "count": 1000,
+                "failed": 0,
+                "elapsedMs": 106.40000002272427,
+                "opfsElapsedMs": 43.0000000204891
+              }
+            }
+          ],
+          "large_value_64kb": [
+            {
+              "sample": 0,
+              "elapsedMs": 304.19999999925494,
+              "wire": [30, 30, 30, 30],
+              "metrics": [
+                [0, 10, 0, 0, 0, 0.09999999962747097],
+                [1, 10, 0, 0, 0, 220.10000000335276],
+                [3, 10, 0, 0, 0, 0],
+                [6, 10, 0, 0, 0, 27.500000001862645],
+                [16, 5, 0, 0, 0, 0],
+                [18, 19, 0, 77824, 77824, 0.19999999925494194],
+                [19, 47, 0, 139534336, 139534336, 27.200000002980232],
+                [20, 5, 0, 0, 0, 0],
+                [22, 5, 0, 20480, 20480, 0.5],
+                [23, 5, 0, 20480, 20480, 0.09999999962747097],
+                [24, 15, 0, 0, 0, 0],
+                [26, 5, 0, 0, 0, 5.700000002980232],
+                [27, 10, 0, 140897456, 140897456, 26.59999999590218]
+              ],
+              "commits": {
+                "count": 10,
+                "failed": 0,
+                "elapsedMs": 220.10000000335276,
+                "opfsElapsedMs": 60.20000000111759
+              }
+            },
+            {
+              "sample": 1,
+              "elapsedMs": 274.5,
+              "wire": [30, 30, 30, 30],
+              "metrics": [
+                [0, 10, 0, 0, 0, 0.19999999925494194],
+                [1, 10, 0, 0, 0, 197.20000000484288],
+                [3, 10, 0, 0, 0, 0.09999999962747097],
+                [6, 10, 0, 0, 0, 22],
+                [16, 5, 0, 0, 0, 0],
+                [18, 19, 0, 77824, 77824, 0.19999999925494194],
+                [19, 47, 0, 139534336, 139534336, 25.299999997019768],
+                [20, 5, 0, 0, 0, 0],
+                [22, 5, 0, 20480, 20480, 0.599999999627471],
+                [23, 5, 0, 20480, 20480, 0],
+                [24, 15, 0, 0, 0, 0],
+                [26, 5, 0, 0, 0, 6.099999995902181],
+                [27, 10, 0, 140897456, 140897456, 23.899999994784594]
+              ],
+              "commits": {
+                "count": 10,
+                "failed": 0,
+                "elapsedMs": 197.20000000484288,
+                "opfsElapsedMs": 55.999999986961484
+              }
+            }
+          ],
+          "large_value_1mb": [
+            {
+              "sample": 0,
+              "elapsedMs": 282.19999999925494,
+              "wire": [24, 24, 24, 24],
+              "metrics": [
+                [0, 8, 0, 0, 0, 0],
+                [1, 8, 0, 0, 0, 215.39999999850988],
+                [3, 8, 0, 0, 0, 0.10000000149011612],
+                [6, 8, 0, 0, 0, 19.499999998137355],
+                [16, 8, 0, 0, 0, 0],
+                [18, 19, 0, 77824, 77824, 0.900000000372529],
+                [19, 53, 0, 135897088, 135897088, 27.699999997392297],
+                [20, 8, 0, 0, 0, 0],
+                [22, 8, 0, 32768, 32768, 0.10000000149011612],
+                [23, 8, 0, 32768, 32768, 0.30000000074505806],
+                [24, 16, 0, 0, 0, 0],
+                [26, 8, 0, 0, 0, 8.099999999627471],
+                [27, 8, 0, 137216320, 137216320, 28.599999997764826]
+              ],
+              "commits": {
+                "count": 8,
+                "failed": 0,
+                "elapsedMs": 215.39999999850988,
+                "opfsElapsedMs": 65.39999999664724
+              }
+            },
+            {
+              "sample": 1,
+              "elapsedMs": 260.90000000037253,
+              "wire": [24, 24, 24, 24],
+              "metrics": [
+                [0, 8, 0, 0, 0, 0.09999999962747097],
+                [1, 8, 0, 0, 0, 190.60000000149012],
+                [3, 8, 0, 0, 0, 0],
+                [6, 8, 0, 0, 0, 21.40000000037253],
+                [16, 8, 0, 0, 0, 0],
+                [18, 19, 0, 77824, 77824, 0.49999999813735485],
+                [19, 53, 0, 135897088, 135897088, 21.800000002607703],
+                [20, 8, 0, 0, 0, 0.09999999962747097],
+                [22, 8, 0, 32768, 32768, 0.2000000011175871],
+                [23, 8, 0, 32768, 32768, 0],
+                [24, 16, 0, 0, 0, 0],
+                [26, 8, 0, 0, 0, 5.800000000745058],
+                [27, 8, 0, 137216320, 137216320, 23.200000002980232]
+              ],
+              "commits": {
+                "count": 8,
+                "failed": 0,
+                "elapsedMs": 190.60000000149012,
+                "opfsElapsedMs": 51.400000005960464
+              }
+            }
+          ]
+        }
+      }
+    },
+    "qualifications": [
+      "Only run-phase measured samples; prepare/verify/cleanup and diagnostic snapshots are excluded from these deltas.",
+      "elapsedMs still includes hooks. SDK/engine method timings nest storage timings; never sum them as disjoint phases.",
+      "Diagnostic timing includes hooks and is not a headline A/B; physical counts/bytes are the structural comparison.",
+      "Metadata operations are aggregated across filenames. One failed getFileHandle on fresh open is the expected missing root manifest; all hook error lists were empty.",
+      "Missing metric means zero calls. Sync read-byte retention may differ by a few metadata pages because clean LRU publication traverses a HashMap."
+    ]
+  },
+  "diagnosticLayerComparison": {
+    "input": {
+      "file": "c90-diagnostic-comparison-summary.json",
+      "sha256": "a8c7ccc04897d382f2c7096cdd4aecfa18fc8541945f99e9c6cc8c38e013ff3e"
+    },
+    "qualification": "Instrumented browser diagnostic, two measured samples after one warmup. Engine boundary time includes generated JS bindings, WASM and nested storage; not pure CPU. Storage time is nested in engine time. Open includes cache-disabled diagnostic hooks and must not substitute for headline latency.",
+    "columns": [
+      "workload",
+      "instrumentedRunMsBefore",
+      "instrumentedRunMsAfter",
+      "engineBoundaryMsBefore",
+      "engineBoundaryMsAfter",
+      "syncStorageMsBefore",
+      "syncStorageMsAfter"
+    ],
+    "rows": [
+      [
+        "open_empty_db",
+        93.34999999962747,
+        92.40000000037253,
+        7.25,
+        7.2999999998137355,
+        0.9500000011175871,
+        1.1000000005587935
+      ],
+      [
+        "point_get_random_10k_pipelined",
+        173.34999999962747,
+        166.09999999962747,
+        40.15000000130385,
+        43.800000010989606,
+        0,
+        0
+      ],
+      ["reverse_scan_limit_1", 0.75, 1.0000000009313226, 0.049999999813735485, 0.20000000018626451, 0, 0],
+      [
+        "small_tx_1000_commits",
+        201.25,
+        239.40000000037253,
+        99.69999997597188,
+        117.1000000173226,
+        37.99999998789281,
+        41.55000001844019
+      ],
+      [
+        "large_value_64kb",
+        348.44999999925494,
+        289.34999999962747,
+        296.3000000016764,
+        233.60000000428408,
+        54.20000000111759,
+        58.19999999366701
+      ],
+      [
+        "large_value_1mb",
+        321.6000000005588,
+        271.54999999981374,
+        277.20000000018626,
+        223.54999999981374,
+        60.4500000057742,
+        58.65000000130385
+      ]
+    ]
+  },
+  "fullRegressionGuard": {
+    "kind": "full automatic stock regression guard; not headline latency evidence",
+    "variants": {
+      "before": {
+        "input": {
+          "file": "c90-full-guard-before.json",
+          "sha256": "9dc7d3ea975d149dcf5197589f09b960f2ba62e87e4721e865c9fe483efacb5b"
+        },
+        "workloadCount": 31,
+        "statusCounts": { "ok": 42, "skipped": 20 },
+        "okByEngine": { "moyodb": 30, "indexeddb": 12 },
+        "warmupsPerSupportedRow": 1,
+        "samplesPerSupportedRow": 1,
+        "comparableWorkloadsPassingContentAndShapeParity": 11,
+        "rows": [
+          ["noop_js_loop_1m", "moyodb", "ok"],
+          ["noop_js_loop_1m", "indexeddb", "skipped"],
+          ["noop_worker_roundtrip_10k", "moyodb", "ok"],
+          ["noop_worker_roundtrip_10k", "indexeddb", "skipped"],
+          ["worker_roundtrip_noop", "moyodb", "ok"],
+          ["worker_roundtrip_noop", "indexeddb", "skipped"],
+          ["worker_roundtrip_small_payload", "moyodb", "ok"],
+          ["worker_roundtrip_small_payload", "indexeddb", "skipped"],
+          ["worker_roundtrip_256b_payload", "moyodb", "ok"],
+          ["worker_roundtrip_256b_payload", "indexeddb", "skipped"],
+          ["worker_roundtrip_64kb_payload", "moyodb", "ok"],
+          ["worker_roundtrip_64kb_payload", "indexeddb", "skipped"],
+          ["worker_binary_transfer_64kb", "moyodb", "ok"],
+          ["worker_binary_transfer_64kb", "indexeddb", "skipped"],
+          ["noop_wasm_call_100k", "moyodb", "ok"],
+          ["noop_wasm_call_100k", "indexeddb", "skipped"],
+          ["encode_decode_10k_256b", "moyodb", "ok"],
+          ["encode_decode_10k_256b", "indexeddb", "skipped"],
+          ["opfs_raw_write_100mb", "moyodb", "ok"],
+          ["opfs_raw_write_100mb", "indexeddb", "skipped"],
+          ["opfs_raw_read_random_10k", "moyodb", "ok"],
+          ["opfs_raw_read_random_10k", "indexeddb", "skipped"],
+          ["sdk_put_1k_single_calls", "moyodb", "ok"],
+          ["sdk_put_1k_single_calls", "indexeddb", "skipped"],
+          ["sdk_bulk_put_10k", "moyodb", "ok"],
+          ["sdk_bulk_put_10k", "indexeddb", "skipped"],
+          ["engine_stage_put_10k_rollback", "moyodb", "ok"],
+          ["engine_stage_put_10k_rollback", "indexeddb", "skipped"],
+          ["engine_bulk_put_10k", "moyodb", "ok"],
+          ["engine_bulk_put_10k", "indexeddb", "skipped"],
+          ["indexeddb_bulk_put_10k", "moyodb", "skipped"],
+          ["indexeddb_bulk_put_10k", "indexeddb", "ok"],
+          ["open_empty_db", "moyodb", "ok"],
+          ["open_empty_db", "indexeddb", "ok"],
+          ["bulk_insert_10k", "moyodb", "ok"],
+          ["bulk_insert_10k", "indexeddb", "ok"],
+          ["point_get_random_10k", "moyodb", "ok"],
+          ["point_get_random_10k", "indexeddb", "ok"],
+          ["point_get_random_10k_pipelined", "moyodb", "ok"],
+          ["point_get_random_10k_pipelined", "indexeddb", "ok"],
+          ["point_get_random_10k_bulk", "moyodb", "ok"],
+          ["point_get_random_10k_bulk", "indexeddb", "skipped"],
+          ["range_scan_100", "moyodb", "ok"],
+          ["range_scan_100", "indexeddb", "ok"],
+          ["reverse_scan_limit_1", "moyodb", "ok"],
+          ["reverse_scan_limit_1", "indexeddb", "ok"],
+          ["range_scan_1000", "moyodb", "ok"],
+          ["range_scan_1000", "indexeddb", "ok"],
+          ["range_scan_10000", "moyodb", "ok"],
+          ["range_scan_10000", "indexeddb", "ok"],
+          ["small_tx_1000_commits", "moyodb", "ok"],
+          ["small_tx_1000_commits", "indexeddb", "ok"],
+          ["large_value_64kb", "moyodb", "ok"],
+          ["large_value_64kb", "indexeddb", "ok"],
+          ["large_value_1mb", "moyodb", "ok"],
+          ["large_value_1mb", "indexeddb", "ok"],
+          ["recovery_after_dirty_close", "moyodb", "ok"],
+          ["recovery_after_dirty_close", "indexeddb", "skipped"],
+          ["snapshot_export_import", "moyodb", "ok"],
+          ["snapshot_export_import", "indexeddb", "skipped"],
+          ["worker_roundtrip_overhead", "moyodb", "ok"],
+          ["worker_roundtrip_overhead", "indexeddb", "skipped"]
+        ]
+      },
+      "after": {
+        "input": {
+          "file": "c90-full-guard-after.json",
+          "sha256": "691d927d1fe47db9eb76fe3dbba111747d6fb7ea6397ea229fe09bc55c3ba81f"
+        },
+        "workloadCount": 31,
+        "statusCounts": { "ok": 42, "skipped": 20 },
+        "okByEngine": { "moyodb": 30, "indexeddb": 12 },
+        "warmupsPerSupportedRow": 1,
+        "samplesPerSupportedRow": 1,
+        "comparableWorkloadsPassingContentAndShapeParity": 11,
+        "rows": [
+          ["noop_js_loop_1m", "moyodb", "ok"],
+          ["noop_js_loop_1m", "indexeddb", "skipped"],
+          ["noop_worker_roundtrip_10k", "moyodb", "ok"],
+          ["noop_worker_roundtrip_10k", "indexeddb", "skipped"],
+          ["worker_roundtrip_noop", "moyodb", "ok"],
+          ["worker_roundtrip_noop", "indexeddb", "skipped"],
+          ["worker_roundtrip_small_payload", "moyodb", "ok"],
+          ["worker_roundtrip_small_payload", "indexeddb", "skipped"],
+          ["worker_roundtrip_256b_payload", "moyodb", "ok"],
+          ["worker_roundtrip_256b_payload", "indexeddb", "skipped"],
+          ["worker_roundtrip_64kb_payload", "moyodb", "ok"],
+          ["worker_roundtrip_64kb_payload", "indexeddb", "skipped"],
+          ["worker_binary_transfer_64kb", "moyodb", "ok"],
+          ["worker_binary_transfer_64kb", "indexeddb", "skipped"],
+          ["noop_wasm_call_100k", "moyodb", "ok"],
+          ["noop_wasm_call_100k", "indexeddb", "skipped"],
+          ["encode_decode_10k_256b", "moyodb", "ok"],
+          ["encode_decode_10k_256b", "indexeddb", "skipped"],
+          ["opfs_raw_write_100mb", "moyodb", "ok"],
+          ["opfs_raw_write_100mb", "indexeddb", "skipped"],
+          ["opfs_raw_read_random_10k", "moyodb", "ok"],
+          ["opfs_raw_read_random_10k", "indexeddb", "skipped"],
+          ["sdk_put_1k_single_calls", "moyodb", "ok"],
+          ["sdk_put_1k_single_calls", "indexeddb", "skipped"],
+          ["sdk_bulk_put_10k", "moyodb", "ok"],
+          ["sdk_bulk_put_10k", "indexeddb", "skipped"],
+          ["engine_stage_put_10k_rollback", "moyodb", "ok"],
+          ["engine_stage_put_10k_rollback", "indexeddb", "skipped"],
+          ["engine_bulk_put_10k", "moyodb", "ok"],
+          ["engine_bulk_put_10k", "indexeddb", "skipped"],
+          ["indexeddb_bulk_put_10k", "moyodb", "skipped"],
+          ["indexeddb_bulk_put_10k", "indexeddb", "ok"],
+          ["open_empty_db", "moyodb", "ok"],
+          ["open_empty_db", "indexeddb", "ok"],
+          ["bulk_insert_10k", "moyodb", "ok"],
+          ["bulk_insert_10k", "indexeddb", "ok"],
+          ["point_get_random_10k", "moyodb", "ok"],
+          ["point_get_random_10k", "indexeddb", "ok"],
+          ["point_get_random_10k_pipelined", "moyodb", "ok"],
+          ["point_get_random_10k_pipelined", "indexeddb", "ok"],
+          ["point_get_random_10k_bulk", "moyodb", "ok"],
+          ["point_get_random_10k_bulk", "indexeddb", "skipped"],
+          ["range_scan_100", "moyodb", "ok"],
+          ["range_scan_100", "indexeddb", "ok"],
+          ["reverse_scan_limit_1", "moyodb", "ok"],
+          ["reverse_scan_limit_1", "indexeddb", "ok"],
+          ["range_scan_1000", "moyodb", "ok"],
+          ["range_scan_1000", "indexeddb", "ok"],
+          ["range_scan_10000", "moyodb", "ok"],
+          ["range_scan_10000", "indexeddb", "ok"],
+          ["small_tx_1000_commits", "moyodb", "ok"],
+          ["small_tx_1000_commits", "indexeddb", "ok"],
+          ["large_value_64kb", "moyodb", "ok"],
+          ["large_value_64kb", "indexeddb", "ok"],
+          ["large_value_1mb", "moyodb", "ok"],
+          ["large_value_1mb", "indexeddb", "ok"],
+          ["recovery_after_dirty_close", "moyodb", "ok"],
+          ["recovery_after_dirty_close", "indexeddb", "skipped"],
+          ["snapshot_export_import", "moyodb", "ok"],
+          ["snapshot_export_import", "indexeddb", "skipped"],
+          ["worker_roundtrip_overhead", "moyodb", "ok"],
+          ["worker_roundtrip_overhead", "indexeddb", "skipped"]
+        ]
+      }
+    },
+    "sameBrowserVersionAndRevision": true,
+    "environmentRetry": {
+      "qualification": "An initial after-variant browser launch failed before any workload because its previous external browser path disappeared. The successful retry used a local copy of the same binary, with exact Browser.getVersion equality asserted before running rows. No timed samples were discarded; Node remained 24.19.0.",
+      "initialLaunchLog": {
+        "file": "c90-full-guard.log",
+        "sha256": "ba4432bf3c95699bb1d36f347abb927b74dfa8318ac1beba2b2a4eb243f3091e"
+      },
+      "successfulRetryLog": {
+        "file": "c90-full-guard-after-retry.log",
+        "sha256": "e07431a5635720ba6e2015829fd916f97f4fcafce7f29fa0994aa9d43486f1f7"
+      }
+    }
+  },
+  "verification": {
+    "baseMain": "c90d16df28b17a97d13132a5dcef471a572f42b8",
+    "candidate": "base plus this patch, after rebase",
+    "nativeRust": {
+      "input": {
+        "file": "c90-rust-tests.log",
+        "sha256": "23a6da3dccc07354d67e1f5f352215242be3d4af6eaff1e41289e23d312cf0c5"
+      },
+      "passed": 217,
+      "failed": 0,
+      "ignoredByDefault": 2,
+      "ignoredQualification": "One pre-existing ignored test and the separately executed stock checksum accounting fixture."
+    },
+    "sdkWork": {
+      "input": {
+        "file": "c90-sdk-work-tests.log",
+        "sha256": "25058c1bfcf945cf8396b0896e8554665e7f9d8258d9cb97030d64101ca2a9eb"
+      },
+      "passed": 128,
+      "failed": 0
+    },
+    "opfsShim": {
+      "input": {
+        "file": "c90-shim-tests.log",
+        "sha256": "65e69b2087590189aeac93e5ea9d5e0ae95f5a2e450c9d05a6474cf087517664"
+      },
+      "passed": 61,
+      "failed": 0
+    },
+    "chromiumCorrectness": {
+      "input": {
+        "file": "c90-browser-tests.log",
+        "sha256": "e86869c55b4c18191e60ee9a065adf04c6663ace68df691d23bcd688198f5326"
+      },
+      "passed": 83,
+      "optInSkipped": 2
+    },
+    "otherSuccessfulChecks": [
+      { "file": "c90-clippy-native.log", "sha256": "2f5358ea015e57e7f859c281dc358719cba717e22213658d9cd843547958a839" },
+      { "file": "c90-clippy-wasm.log", "sha256": "8feff83ca42049ffb9196ecd73d234f379085dfed17b01b8321247814310933d" },
+      { "file": "c90-typecheck.log", "sha256": "d08491235272fd0cd8cbcdd89fe11ee9da2f66fd080b4dc75648f2dd0a2c2cb2" },
+      { "file": "c90-rustfmt.log", "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
+      { "file": "c90-main-build.log", "sha256": "d00ce3bb1ee5b4e2e157d1f14c8de1ebec1ff5ae3f5d5b6fd59a99a829f6cb37" },
+      {
+        "file": "c90-candidate-build.log",
+        "sha256": "af142b9481197532bfc85bde3b68fc47a1d434a2582b38ddf233c46e22cafcc8"
+      }
+    ],
+    "reproductionCommands": [
+      "cargo test --locked --workspace",
+      "cargo test --locked -p moyodb-engine --lib stock_large_write_hash_work_accounting -- --ignored --nocapture",
+      "CLIPPY_CONF_DIR=.config/moyo/build cargo clippy --locked --workspace --all-targets -- -D warnings",
+      "CLIPPY_CONF_DIR=.config/moyo/build cargo clippy --locked --workspace --lib --target wasm32-unknown-unknown -- -D warnings"
+    ],
+    "notExecuted": ["Firefox", "WebKit", "new opt-in soak run", "hardware power-loss test"]
+  },
+  "historical": {
+    "baseMain": "23ad23b4854b59c5c2edfd1ef9f5cf1f697ec694",
+    "supersededBy": "c90d16df28b17a97d13132a5dcef471a572f42b8",
+    "scope": "Historical investigation before main advanced. The old candidate also added 4 MiB checkpoints, which are now upstream in both final variants. These are not the final baseline, scaling comparison, or evidence of a new checkpoint improvement.",
+    "input": {
+      "file": "performance-gap-evidence.json",
+      "sha256": "485a0c75e23b9a21a045d750c3abeed7f9d2868e584d5ea26ac6a465d3f92909"
+    },
+    "artifactProvenance": {
+      "allFingerprintedFiles": {
+        "before": { "count": 59, "digest": "a705af30cf7d64c8156f42558aba453dd6cbf45aa639f6dd13020c8020a0bfaa" },
+        "after": { "count": 62, "digest": "f6ee40ea45ee49632a6ef9e473db851e9d5a33e8a2622f0b17a707ff022d83f8" }
+      },
+      "runtimeAssets": {
+        "packages/sdk/public/engine/moyodb_engine.js": {
+          "before": ["c6a74e5451d1a2e79fc2330231a7410cff97059af33880d8befed76c98fd5b1b", 67238],
+          "after": ["e9962169b009f688d61171ecc0a42148f26726db9a2d471af93cb525698734d9", 67238]
+        },
+        "packages/sdk/public/engine/moyodb_engine_bg.wasm": {
+          "before": ["0ef2f629421430d5863412496e4f08a5fc457a9de917f8f0cdffeda67690d9a4", 513884],
+          "after": ["7af763734c24ab23767e60f11cc3571b3b0957a722561d90859a666c44a10687", 537947]
+        },
+        "packages/sdk/public/engine/snippets/moyodb-engine-8ebe6af0cc2e81b7/js/opfs_shim.js": {
+          "before": ["9c1ba7d3b4a2faeb2587a46eed05077eac9c6ee65701ec11b65fb25752167186", 22241],
+          "after": ["9c1ba7d3b4a2faeb2587a46eed05077eac9c6ee65701ec11b65fb25752167186", 22241]
+        }
+      },
+      "harness": {
+        "path": "packages/sdk/scripts/bench-performance-abba.mjs",
+        "measuredSha256": "d2995a93617adfd2a148b44f061fae060521bdd09ea0068cec3d3ddb138af177",
+        "deliveredSha256": "06239a5b818b19992250d70136d856bfa27c751a0d8bb466c44ab97344b89b7e",
+        "qualification": "After all measurements, lint-only edits made metadata filename-extension regex groups noncapturing. The measured runner hash is retained separately; stock workload functions/timed regions did not change."
+      }
+    },
+    "supportingExperiments": [
+      {
+        "input": {
+          "file": "crossover-small.json",
+          "sha256": "22896f83b17ad4fbdd180f5985a149d120be37634a096d6d721bde71f73eaa15"
+        },
+        "startedAt": "2026-10-03T15:52:28.804Z",
+        "runnerSha256": "d2995a93617adfd2a148b44f061fae060521bdd09ea0068cec3d3ddb138af177",
+        "profileCount": 1,
+        "samplesPerMoyoVariant": 4,
+        "pooledIndexedDbControls": 8,
+        "warmupsPerVariantPerProfile": 2,
+        "workloads": [
+          {
+            "name": "large_value_scaling_1008b",
+            "shape": [2048, 16, 1008, 256],
+            "transactionBoundaries": "8 readwrite transactions; batches of at most 256 values; 2064384 total value bytes"
+          },
+          {
+            "name": "large_value_scaling_1024b",
+            "shape": [2048, 16, 1024, 256],
+            "transactionBoundaries": "8 readwrite transactions; batches of at most 256 values; 2097152 total value bytes"
+          },
+          {
+            "name": "large_value_scaling_2048b",
+            "shape": [2048, 16, 2048, 256],
+            "transactionBoundaries": "8 readwrite transactions; batches of at most 256 values; 4194304 total value bytes"
+          },
+          {
+            "name": "large_value_scaling_4033b",
+            "shape": [2048, 16, 4033, 256],
+            "transactionBoundaries": "8 readwrite transactions; batches of at most 256 values; 8259584 total value bytes"
+          },
+          {
+            "name": "large_value_scaling_4050b",
+            "shape": [2048, 16, 4050, 256],
+            "transactionBoundaries": "8 readwrite transactions; batches of at most 256 values; 8294400 total value bytes"
+          },
+          {
+            "name": "large_value_scaling_4066b",
+            "shape": [2048, 16, 4066, 256],
+            "transactionBoundaries": "8 readwrite transactions; batches of at most 256 values; 8327168 total value bytes"
+          },
+          {
+            "name": "large_value_scaling_8192b",
+            "shape": [2048, 16, 8192, 256],
+            "transactionBoundaries": "8 readwrite transactions; batches of at most 256 values; 16777216 total value bytes"
+          },
+          {
+            "name": "large_value_scaling_16384b",
+            "shape": [2048, 16, 16384, 256],
+            "transactionBoundaries": "8 readwrite transactions; batches of at most 256 values; 33554432 total value bytes"
+          }
+        ],
+        "profiles": [
+          {
+            "index": 0,
+            "order": ["before", "after", "after", "before"],
+            "warmups": [
+              {
+                "variant": "before",
+                "sampleOffset": 0,
+                "timesMs": [
+                  [
+                    [48.19999999925494, 33.399999998509884],
+                    [109, 98.5]
+                  ],
+                  [
+                    [53, 75.90000000037253],
+                    [102.5, 80.80000000074506]
+                  ],
+                  [
+                    [47.19999999925494, 43.30000000074506],
+                    [86.69999999925494, 90.90000000037253]
+                  ],
+                  [
+                    [61.5, 59.19999999925494],
+                    [92.30000000074506, 135.80000000074506]
+                  ],
+                  [
+                    [85.29999999888241, 77.90000000037253],
+                    [126.09999999962747, 161]
+                  ],
+                  [
+                    [83.19999999925494, 125.80000000074506],
+                    [99.10000000149012, 101.19999999925494]
+                  ],
+                  [
+                    [168.5, 113.40000000037253],
+                    [170.2999999988824, 153.7999999988824]
+                  ],
+                  [
+                    [275.90000000037253, 258.80000000074506],
+                    [227.09999999962747, 202.5]
+                  ]
+                ]
+              },
+              {
+                "variant": "after",
+                "sampleOffset": 0,
+                "timesMs": [
+                  [
+                    [49, 31.09999999962747],
+                    [74.89999999850988, 69.09999999962747]
+                  ],
+                  [
+                    [47.30000000074506, 41],
+                    [94.69999999925494, 94.30000000074506]
+                  ],
+                  [
+                    [43.40000000037253, 42.5],
+                    [90.59999999962747, 83.90000000037253]
+                  ],
+                  [
+                    [55.19999999925494, 65.80000000074506],
+                    [132.09999999962747, 127.39999999850988]
+                  ],
+                  [
+                    [65.40000000037253, 66.09999999962747],
+                    [101.40000000037253, 107.5]
+                  ],
+                  [
+                    [71.5, 63.80000000074506],
+                    [138.90000000037253, 89.80000000074506]
+                  ],
+                  [
+                    [82.59999999962747, 81.40000000037253],
+                    [124, 140.5]
+                  ],
+                  [
+                    [150.80000000074506, 148.30000000074506],
+                    [185.80000000074506, 188.5]
+                  ]
+                ]
+              }
+            ],
+            "visits": [
+              {
+                "variant": "before",
+                "sampleOffset": 0,
+                "timesMs": [
+                  [
+                    [30, 25.899999998509884],
+                    [66, 110.5]
+                  ],
+                  [
+                    [49, 42.90000000037253],
+                    [71.20000000111759, 86.30000000074506]
+                  ],
+                  [
+                    [45.30000000074506, 45.79999999888241],
+                    [87.69999999925494, 102.60000000149012]
+                  ],
+                  [
+                    [64.40000000037253, 66.09999999962747],
+                    [120.29999999888241, 141.39999999850988]
+                  ],
+                  [
+                    [79.40000000037253, 77.09999999962747],
+                    [126.90000000037253, 95.39999999850988]
+                  ],
+                  [
+                    [76.89999999850988, 95.90000000037253],
+                    [114.5, 87.20000000111759]
+                  ],
+                  [
+                    [111, 132.80000000074506],
+                    [117.80000000074506, 101.89999999850988]
+                  ],
+                  [
+                    [223.5, 223.69999999925494],
+                    [248.59999999962747, 239.40000000037253]
+                  ]
+                ],
+                "contentChecksums": [
+                  ["1024:243555c5", "1024:243555c5"],
+                  ["1024:39b65dc5", "1024:39b65dc5"],
+                  ["1024:e215ddc5", "1024:e215ddc5"],
+                  ["1024:041bd5c5", "1024:041bd5c5"],
+                  ["1024:0f6b49c5", "1024:0f6b49c5"],
+                  ["1024:3be269c5", "1024:3be269c5"],
+                  ["1024:e793ddc5", "1024:e793ddc5"],
+                  ["1024:82d7ddc5", "1024:82d7ddc5"]
+                ]
+              },
+              {
+                "variant": "after",
+                "sampleOffset": 0,
+                "timesMs": [
+                  [
+                    [29.300000000745058, 28.199999999254942],
+                    [70.40000000037253, 110.69999999925494]
+                  ],
+                  [
+                    [39.59999999962747, 41.40000000037253],
+                    [69.5, 84]
+                  ],
+                  [
+                    [38.40000000037253, 42.20000000111759],
+                    [118.5, 97.80000000074506]
+                  ],
+                  [
+                    [64.90000000037253, 53.20000000111759],
+                    [140.7999999988824, 94.40000000037253]
+                  ],
+                  [
+                    [95.40000000037253, 58],
+                    [103.09999999962747, 144.40000000037253]
+                  ],
+                  [
+                    [59.80000000074506, 56.899999998509884],
+                    [91.69999999925494, 103.69999999925494]
+                  ],
+                  [
+                    [108.80000000074506, 90.30000000074506],
+                    [148.09999999962747, 136.80000000074506]
+                  ],
+                  [
+                    [144.90000000037253, 146.60000000149012],
+                    [218.59999999962747, 236.5]
+                  ]
+                ],
+                "contentChecksums": [
+                  ["1024:243555c5", "1024:243555c5"],
+                  ["1024:39b65dc5", "1024:39b65dc5"],
+                  ["1024:e215ddc5", "1024:e215ddc5"],
+                  ["1024:041bd5c5", "1024:041bd5c5"],
+                  ["1024:0f6b49c5", "1024:0f6b49c5"],
+                  ["1024:3be269c5", "1024:3be269c5"],
+                  ["1024:e793ddc5", "1024:e793ddc5"],
+                  ["1024:82d7ddc5", "1024:82d7ddc5"]
+                ]
+              },
+              {
+                "variant": "after",
+                "sampleOffset": 2,
+                "timesMs": [
+                  [
+                    [30.699999999254942, 30.40000000037253],
+                    [84.79999999888241, 75]
+                  ],
+                  [
+                    [37.59999999962747, 34.19999999925494],
+                    [81.70000000111759, 107.90000000037253]
+                  ],
+                  [
+                    [56, 45],
+                    [103.80000000074506, 87.30000000074506]
+                  ],
+                  [
+                    [53.70000000111759, 50.59999999962747],
+                    [158.40000000037253, 122.59999999962747]
+                  ],
+                  [
+                    [115, 59.79999999888241],
+                    [102.09999999962747, 101.80000000074506]
+                  ],
+                  [
+                    [113, 58.80000000074506],
+                    [103.10000000149012, 95.40000000037253]
+                  ],
+                  [
+                    [78.29999999888241, 106.40000000037253],
+                    [165, 154.30000000074506]
+                  ],
+                  [
+                    [154.60000000149012, 155.69999999925494],
+                    [222.89999999850988, 260.19999999925494]
+                  ]
+                ],
+                "contentChecksums": [
+                  ["1024:243555c5", "1024:243555c5"],
+                  ["1024:39b65dc5", "1024:39b65dc5"],
+                  ["1024:e215ddc5", "1024:e215ddc5"],
+                  ["1024:041bd5c5", "1024:041bd5c5"],
+                  ["1024:0f6b49c5", "1024:0f6b49c5"],
+                  ["1024:3be269c5", "1024:3be269c5"],
+                  ["1024:e793ddc5", "1024:e793ddc5"],
+                  ["1024:82d7ddc5", "1024:82d7ddc5"]
+                ]
+              },
+              {
+                "variant": "before",
+                "sampleOffset": 2,
+                "timesMs": [
+                  [
+                    [31.40000000037253, 30.199999999254942],
+                    [91.60000000149012, 102.69999999925494]
+                  ],
+                  [
+                    [49.69999999925494, 40.79999999888241],
+                    [68.59999999962747, 91.20000000111759]
+                  ],
+                  [
+                    [58.399999998509884, 48.20000000111759],
+                    [104, 115.80000000074506]
+                  ],
+                  [
+                    [119, 61.29999999888241],
+                    [110.5, 130.5]
+                  ],
+                  [
+                    [139.30000000074506, 72.80000000074506],
+                    [115.19999999925494, 128.90000000037253]
+                  ],
+                  [
+                    [91.69999999925494, 94.19999999925494],
+                    [145.69999999925494, 151.90000000037253]
+                  ],
+                  [
+                    [110.10000000149012, 120.59999999962747],
+                    [124.79999999888241, 122.59999999962747]
+                  ],
+                  [
+                    [239, 216.5],
+                    [210, 226.90000000037253]
+                  ]
+                ],
+                "contentChecksums": [
+                  ["1024:243555c5", "1024:243555c5"],
+                  ["1024:39b65dc5", "1024:39b65dc5"],
+                  ["1024:e215ddc5", "1024:e215ddc5"],
+                  ["1024:041bd5c5", "1024:041bd5c5"],
+                  ["1024:0f6b49c5", "1024:0f6b49c5"],
+                  ["1024:3be269c5", "1024:3be269c5"],
+                  ["1024:e793ddc5", "1024:e793ddc5"],
+                  ["1024:82d7ddc5", "1024:82d7ddc5"]
+                ]
+              }
+            ],
+            "moyoMedianChangePercent": [
+              -0.830564780969345, -15.995647444023941, -7.2340425520025615, -18.08429118602669, -0.8306709269936485,
+              -36.20225927786941, -15.069084628050955, -32.64758497238773
+            ],
+            "host": {
+              "timestamps": ["2026-10-03T15:52:29.217Z", "2026-10-03T15:53:26.167Z"],
+              "cpuUsageDeltaUsec": 110824310,
+              "cpuThrottledDeltaUsec": 0,
+              "memoryBytes": [6556422144, 7709323264]
+            }
+          }
+        ],
+        "pooledSummary": [
+          [
+            30.09999999962747, 29.850000000558794, 88.20000000018626, 0.3412698412648969, 0.3384353741552807,
+            -0.830564780969345, 29.37499999953434, 29.649999999906868, 0.9361702140489925
+          ],
+          [
+            45.950000000186265, 38.59999999962747, 82.8500000005588, 0.5546167773068962, 0.4659022329434777,
+            -15.995647444023941, 45.59999999962747, 38.1999999997206, -16.228070175366938
+          ],
+          [
+            47.0, 43.60000000055879, 103.20000000111759, 0.4554263565842153, 0.42248062015587823, -7.2340425520025615,
+            49.424999999813735, 45.40000000037253, -8.143651996876834
+          ],
+          [
+            65.25, 53.45000000111759, 126.54999999981374, 0.5156064796530703, 0.4223627024985876, -18.08429118602669,
+            77.6999999997206, 55.60000000055879, -28.442728441751964
+          ],
+          [
+            78.25, 77.59999999962747, 109.1499999994412, 0.7169033440256583, 0.7109482363721918, -0.8306709269936485,
+            92.15000000037253, 82.04999999981374, -10.960390667952213
+          ],
+          [
+            92.94999999925494, 59.30000000074506, 103.40000000037253, 0.8989361702023216, 0.5735009671231278,
+            -36.20225927786941, 89.67499999934807, 72.125, -19.570671870059286
+          ],
+          [
+            115.79999999981374, 98.3500000005588, 130.79999999981374, 0.8853211009172679, 0.7519113149900524,
+            -15.069084628050955, 118.62500000046566, 95.95000000018626, -19.114857745155224
+          ],
+          [
+            223.59999999962747, 150.60000000149012, 231.70000000018626, 0.9650410012923941, 0.6499784203770783,
+            -32.64758497238773, 225.67499999981374, 150.45000000065193, -33.33333333298943
+          ]
+        ],
+        "allRowsOkAndShapeContentDurabilityParity": true
+      }
+    ],
+    "cpuSampling": {
+      "kind": "100 microsecond CPU sampling with symbol-bearing build; separate diagnostic",
+      "variants": {
+        "before": {
+          "summaryInput": {
+            "file": "summary.json",
+            "sha256": "d3f639eeaec4b21471e6f118a1e556c2e0da3ea273efc961133b562b31b2f773"
+          },
+          "analysisInput": {
+            "file": "analysis.json",
+            "sha256": "56e4ccc8de9ee57a84167feaed0084d80631f1bf435e3b37b5953aeb58fe132b"
+          },
+          "symbolMapInput": {
+            "file": "function-names.json",
+            "sha256": "a72b649862cf26e04bd37f8acb900111c67dcf9e190cd8b0acea204b765e674f"
+          },
+          "wasmSha256": "197a07f0207010eaf10262d93c2c33830a358c01bcae8a2aa11dc50be6bec9e3",
+          "samplesPerWorkload": 2,
+          "warmupsPerWorkload": 1,
+          "elapsedMs": [
+            ["large_value_64kb", -1, true, 298.80000000074506, "1000:e47bf105"],
+            ["large_value_64kb", 0, false, 347, "1000:e47bf105"],
+            ["large_value_64kb", 1, false, 343.59999999962747, "1000:e47bf105"],
+            ["large_value_1mb", -1, true, 357.40000000037253, "64:9db455c5"],
+            ["large_value_1mb", 0, false, 313.40000000037253, "64:9db455c5"],
+            ["large_value_1mb", 1, false, 355.5, "64:9db455c5"]
+          ],
+          "profiles": [
+            {
+              "input": {
+                "file": "large_value_1mb-0.cpuprofile",
+                "sha256": "5438a000ce8043e59c1b8a74437b93f359adb5c68a0c797ec53491682739a6fd"
+              },
+              "sampledMs": 320.242,
+              "crcSelfMs": 80.41,
+              "crcPercent": 25.10913621573685,
+              "checksumNamespaceSelfMs": 80.41,
+              "crcSelfByCallerMs": { "overflowEncoding": 77.563, "publication": 2.52, "other": 0.327 },
+              "topSelf": [
+                ["<crc32fast::Hasher>::update", 80.41],
+                ["write", 54.337],
+                ["(idle)", 38.846],
+                [
+                  "<moyodb_engine::engine::Engine<moyodb_engine::storage::opfs::wasm_impl::OpfsBackend>>::publish",
+                  24.64
+                ],
+                ["moyodb_engine::overflow::write_overflow_chain", 19.78],
+                [
+                  "<moyodb_engine::engine::Engine<moyodb_engine::storage::opfs::wasm_impl::OpfsBackend>>::checkpoint_inner",
+                  15.419
+                ],
+                ["wasmengine_put_many_packed externref shim multivalue shim", 13.442],
+                ["<dlmalloc::dlmalloc::Dlmalloc<dlmalloc::sys::System>>::malloc", 10.324]
+              ]
+            },
+            {
+              "input": {
+                "file": "large_value_1mb-1.cpuprofile",
+                "sha256": "2bd765f4b53c20e7b38804e7844a8e4656800db2423e0c559e73a4a70fbf4eb7"
+              },
+              "sampledMs": 362.233,
+              "crcSelfMs": 95.002,
+              "crcPercent": 26.22676564531669,
+              "checksumNamespaceSelfMs": 95.002,
+              "crcSelfByCallerMs": {
+                "overflowEncoding": 92.43199999999999,
+                "publication": 1.75,
+                "other": 0.8200000000000001
+              },
+              "topSelf": [
+                ["<crc32fast::Hasher>::update", 95.002],
+                ["write", 66.477],
+                ["(idle)", 43.494],
+                ["moyodb_engine::overflow::write_overflow_chain", 28.349],
+                [
+                  "<moyodb_engine::engine::Engine<moyodb_engine::storage::opfs::wasm_impl::OpfsBackend>>::publish",
+                  27.923
+                ],
+                ["<dlmalloc::dlmalloc::Dlmalloc<dlmalloc::sys::System>>::malloc", 13.313],
+                ["wasmengine_put_many_packed externref shim multivalue shim", 10.755],
+                ["passArray8ToWasm0", 10.357]
+              ]
+            },
+            {
+              "input": {
+                "file": "large_value_64kb-0.cpuprofile",
+                "sha256": "fb86832b9b445b529a7cafda3210010576be374423046ce1ae2a67479e7418ba"
+              },
+              "sampledMs": 352.768,
+              "crcSelfMs": 87.795,
+              "crcPercent": 24.88746144775036,
+              "checksumNamespaceSelfMs": 87.795,
+              "crcSelfByCallerMs": {
+                "overflowEncoding": 85.71900000000001,
+                "publication": 1.736,
+                "other": 0.33999999999999997
+              },
+              "topSelf": [
+                ["<crc32fast::Hasher>::update", 87.795],
+                ["write", 54.36],
+                ["(idle)", 40.557],
+                [
+                  "<moyodb_engine::engine::Engine<moyodb_engine::storage::opfs::wasm_impl::OpfsBackend>>::publish",
+                  33.556
+                ],
+                ["moyodb_engine::overflow::write_overflow_chain", 20.166],
+                ["<dlmalloc::dlmalloc::Dlmalloc<dlmalloc::sys::System>>::malloc", 14.084],
+                [
+                  "<moyodb_engine::engine::Engine<moyodb_engine::storage::opfs::wasm_impl::OpfsBackend>>::checkpoint_inner",
+                  12.948
+                ],
+                ["<moyodb_engine::value::StoredValue>::encode_for_store", 10.824]
+              ]
+            },
+            {
+              "input": {
+                "file": "large_value_64kb-1.cpuprofile",
+                "sha256": "c178bd7e2fb528a0043d7fb28f74b6cbd53eb6c833d0c448cb57b7fd54a3078d"
+              },
+              "sampledMs": 348.553,
+              "crcSelfMs": 88.235,
+              "crcPercent": 25.314658029051536,
+              "checksumNamespaceSelfMs": 88.235,
+              "crcSelfByCallerMs": { "overflowEncoding": 86.70299999999999, "publication": 1.532 },
+              "topSelf": [
+                ["<crc32fast::Hasher>::update", 88.235],
+                ["write", 55.824],
+                ["(idle)", 40.299],
+                [
+                  "<moyodb_engine::engine::Engine<moyodb_engine::storage::opfs::wasm_impl::OpfsBackend>>::publish",
+                  29.182
+                ],
+                ["moyodb_engine::overflow::write_overflow_chain", 23.425],
+                [
+                  "<moyodb_engine::engine::Engine<moyodb_engine::storage::opfs::wasm_impl::OpfsBackend>>::checkpoint_inner",
+                  14.848
+                ],
+                ["<dlmalloc::dlmalloc::Dlmalloc<dlmalloc::sys::System>>::malloc", 11.493],
+                ["wasmengine_put_many_packed externref shim multivalue shim", 9.493]
+              ]
+            }
+          ],
+          "mappingValidation": {
+            "input": {
+              "file": "mapping-validation.json",
+              "sha256": "606f21cc9e855b4444acc1085fc5d99f4cd4e9a88fa4c65586d53c587baf06cd"
+            },
+            "sampledWasmSha256": "197a07f0207010eaf10262d93c2c33830a358c01bcae8a2aa11dc50be6bec9e3",
+            "namedWasmSha256": "5951d8271c921375a9f19ef03063208a1f274143a5936661450febecda6700c0",
+            "identicalNonCustomSections": true,
+            "nonCustomSectionsSha256": "3022feae9315bb85f19932def9f509fc375c4d833531b9f8dad32153bb4238c9",
+            "namedFunctions": 703
+          }
+        },
+        "after": {
+          "summaryInput": {
+            "file": "summary.json",
+            "sha256": "b62015accee66e27fda0dc77f26a5a3167ad9c5726b28a7d8ff83bca2221b54c"
+          },
+          "analysisInput": {
+            "file": "analysis.json",
+            "sha256": "bfd60994071095f9df10aaff709ebfcaf3c13319f0d50052c85f70d8245fa9bd"
+          },
+          "symbolMapInput": {
+            "file": "function-names.json",
+            "sha256": "778ca32ac7465bfa2f6e70a523216553dde5ac7561f893e48dd71f5308a12175"
+          },
+          "wasmSha256": "c9f1e76a8c7c6384cab820c8503af7b02ffbdbe55be8babf2b1fe8ad40b48c50",
+          "samplesPerWorkload": 2,
+          "warmupsPerWorkload": 1,
+          "elapsedMs": [
+            ["large_value_64kb", -1, true, 248.19999999925494, "1000:e47bf105"],
+            ["large_value_64kb", 0, false, 257.19999999925494, "1000:e47bf105"],
+            ["large_value_64kb", 1, false, 236.69999999925494, "1000:e47bf105"],
+            ["large_value_1mb", -1, true, 240.30000000074506, "64:9db455c5"],
+            ["large_value_1mb", 0, false, 247.7000000011176, "64:9db455c5"],
+            ["large_value_1mb", 1, false, 245.80000000074506, "64:9db455c5"]
+          ],
+          "profiles": [
+            {
+              "input": {
+                "file": "large_value_1mb-0.cpuprofile",
+                "sha256": "218353d77379a5f9d09f999586efc2d5f3c76a3679be43c9e9e32800b6e46089"
+              },
+              "sampledMs": 258.529,
+              "crcSelfMs": 45.82,
+              "crcPercent": 17.723350185085618,
+              "checksumNamespaceSelfMs": 46.017,
+              "crcSelfByCallerMs": {
+                "sharedPayloadPreparation": 38.857,
+                "publication": 4.934,
+                "overflowEncoding": 2.029
+              },
+              "topSelf": [
+                ["(idle)", 47.837],
+                ["<crc32fast::Hasher>::update", 45.82],
+                ["write", 41.499],
+                [
+                  "<moyodb_engine::engine::Engine<moyodb_engine::storage::opfs::wasm_impl::OpfsBackend>>::publish",
+                  27.387
+                ],
+                [
+                  "<moyodb_engine::engine::Engine<moyodb_engine::storage::opfs::wasm_impl::OpfsBackend>>::checkpoint_inner",
+                  14.041
+                ],
+                ["moyodb_engine::page::encode_overflow_parts", 13.494],
+                ["passArray8ToWasm0", 11.361],
+                ["wasmengine_put_many_packed externref shim multivalue shim", 9.36]
+              ]
+            },
+            {
+              "input": {
+                "file": "large_value_1mb-1.cpuprofile",
+                "sha256": "8bd8135df5676d604668d4108d1ea30e4e623c6d1f12395e7c4b603efd826ac5"
+              },
+              "sampledMs": 254.874,
+              "crcSelfMs": 43.759,
+              "crcPercent": 17.168875601277495,
+              "checksumNamespaceSelfMs": 44.236,
+              "crcSelfByCallerMs": {
+                "sharedPayloadPreparation": 38.221,
+                "overflowEncoding": 2.806,
+                "publication": 2.732
+              },
+              "topSelf": [
+                ["<crc32fast::Hasher>::update", 43.759],
+                ["write", 43.095],
+                ["(idle)", 41.572],
+                [
+                  "<moyodb_engine::engine::Engine<moyodb_engine::storage::opfs::wasm_impl::OpfsBackend>>::publish",
+                  32.712
+                ],
+                [
+                  "<moyodb_engine::engine::Engine<moyodb_engine::storage::opfs::wasm_impl::OpfsBackend>>::checkpoint_inner",
+                  13.809
+                ],
+                ["moyodb_engine::page::encode_overflow_parts", 13.447],
+                ["passArray8ToWasm0", 10.088],
+                ["wasmengine_put_many_packed externref shim multivalue shim", 9.231]
+              ]
+            },
+            {
+              "input": {
+                "file": "large_value_64kb-0.cpuprofile",
+                "sha256": "08d4b07aae71160bfdddc57671a5189b60ca29c23e36e4a3d130727645b9fe34"
+              },
+              "sampledMs": 270.405,
+              "crcSelfMs": 49.088,
+              "crcPercent": 18.1535104750282,
+              "checksumNamespaceSelfMs": 50.786,
+              "crcSelfByCallerMs": {
+                "sharedPayloadPreparation": 41.916,
+                "publication": 3.628,
+                "overflowEncoding": 3.21,
+                "other": 0.334
+              },
+              "topSelf": [
+                ["<crc32fast::Hasher>::update", 49.088],
+                ["write", 47.363],
+                ["(idle)", 45.063],
+                [
+                  "<moyodb_engine::engine::Engine<moyodb_engine::storage::opfs::wasm_impl::OpfsBackend>>::publish",
+                  26.188
+                ],
+                ["moyodb_engine::page::encode_overflow_parts", 14.344],
+                [
+                  "<moyodb_engine::engine::Engine<moyodb_engine::storage::opfs::wasm_impl::OpfsBackend>>::checkpoint_inner",
+                  9.651
+                ],
+                ["<dlmalloc::dlmalloc::Dlmalloc<dlmalloc::sys::System>>::malloc", 8.865],
+                ["wasmengine_put_many_packed externref shim multivalue shim", 8.588]
+              ]
+            },
+            {
+              "input": {
+                "file": "large_value_64kb-1.cpuprofile",
+                "sha256": "18542bb11a66eac8dac6283567dc32dc35df1bcc4cd394a6ca9ae5b7648b680e"
+              },
+              "sampledMs": 242.485,
+              "crcSelfMs": 42.363,
+              "crcPercent": 17.47035899127781,
+              "checksumNamespaceSelfMs": 42.987,
+              "crcSelfByCallerMs": {
+                "sharedPayloadPreparation": 38.118,
+                "publication": 2.588,
+                "overflowEncoding": 1.322,
+                "other": 0.335
+              },
+              "topSelf": [
+                ["write", 42.88],
+                ["<crc32fast::Hasher>::update", 42.363],
+                ["(idle)", 33.752],
+                [
+                  "<moyodb_engine::engine::Engine<moyodb_engine::storage::opfs::wasm_impl::OpfsBackend>>::publish",
+                  26.139
+                ],
+                ["moyodb_engine::page::encode_overflow_parts", 16.029],
+                [
+                  "<moyodb_engine::engine::Engine<moyodb_engine::storage::opfs::wasm_impl::OpfsBackend>>::checkpoint_inner",
+                  9.785
+                ],
+                ["wasmengine_put_many_packed externref shim multivalue shim", 8.673],
+                ["passArray8ToWasm0", 7.232]
+              ]
+            }
+          ],
+          "mappingValidation": {
+            "input": {
+              "file": "mapping-validation.json",
+              "sha256": "c3e80000c585df811b8221fe539cc818de7576cdd6f4bedce86e2ba3231bac7e"
+            },
+            "sampledWasmSha256": "c9f1e76a8c7c6384cab820c8503af7b02ffbdbe55be8babf2b1fe8ad40b48c50",
+            "namedWasmSha256": "2dd5c2ad4cae6dce812e945743dafb29392d71cb8a04165de546b0ad6f3b6fa9",
+            "identicalNonCustomSections": true,
+            "nonCustomSectionsSha256": "208aa721d87a7c58dda2a956285e14f668b98ede6f59e4e8878a31205715b52a",
+            "namedFunctions": 722
+          }
+        }
+      },
+      "qualification": "Sampled self time is approximate; sampling overhead, symbol builds and sequential diagnostics prevent treating these times as the uninstrumented MoyoDB-vs-IndexedDB comparison. Baseline CPU runs were contended. Caller groups classify reported CRC caller stacks by preparation/overflow/publication substring, in that priority. Profiling and headline WASM artifacts are distinct."
+    },
+    "supersededSmallCommitCheck": {
+      "input": {
+        "file": "focused-small-commits.json",
+        "sha256": "b300cda86ab7069eff58653cdda6fdb78b1c5aba015ca29fb3779536815d4c2b"
+      },
+      "profileCount": 4,
+      "samplesPerMoyoVariant": 24,
+      "pooledSummary": [
+        176.90000000037253, 186.79999999981374, 236.80000000074506, 0.7470439189181416, 0.7888513513480827,
+        5.596382136472777, 183.8666666666201, 191.03750000009313, 3.900018129156013
+      ],
+      "profileMedianChangesPercent": [-7.809523809321073, -3.1925590751869737, 13.661046013950063, 10.450819671924428],
+      "qualification": "Historical 23ad plus then-unmerged checkpoint change. Summary preserves the prior mixed/slower observation; it is superseded by the final c90 comparison."
+    },
+    "treeMetadataAllocationRequests": {
+      "kind": "native allocator requests during public B-tree build, excluding PAGE_SIZE allocations",
+      "columns": ["fullOverflowChunksPlus17ByteTail", "before", "after"],
+      "rows": [
+        [8, 12, 13],
+        [512, 95, 13]
+      ],
+      "test": "crates/engine/tests/page_planning_work.rs::overflow_metadata_allocations_do_not_grow_per_page",
+      "qualification": "Isolated tree-planning change. Baseline fails the scaling assertion; candidate passes. No native timing claim."
+    },
+    "persistenceQualification": {
+      "input": {
+        "file": "browser-persistence-qualification.json",
+        "sha256": "161c27db6c93e7f0b357f171b8b702043642004c97a958fe377244781cfa5e3b"
+      },
+      "completeBrowserLaunches": 2,
+      "verifiedAcrossRestart": true,
+      "qualification": "Separate persistent-profile shutdown/restart check, not a power-loss simulation or a benchmark sample."
+    },
+    "qualification": "Historical CPU profiles use separate symbol-bearing WASM artifacts. The c90 upstream commit did not change checksum, overflow or B-tree planning code, but old sampled timings are not subtracted from new headline results. Historical persistence verified clean restart, not hardware power-loss durability."
+  }
+}

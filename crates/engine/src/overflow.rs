@@ -2,10 +2,11 @@ use crate::btree::PageAllocator;
 use crate::bytes::MAX_STORED_VALUE_BYTES;
 use crate::error::{EngineError, Result};
 use crate::page::{
-    decode_overflow_body_ref, decode_page_header_verified, encode_overflow_page,
+    decode_overflow_body_ref, decode_page_header_verified, encode_overflow_value_chunk,
     max_overflow_chunk_len,
 };
 use crate::pager::Pager;
+use crate::prepared_value::ValueSource;
 use crate::storage::backend::FileBackend;
 use crate::value::{
     decode_envelope_expiry, store_uses_system_raw_values, store_uses_value_envelope, StoredValue,
@@ -19,7 +20,15 @@ pub struct OverflowChain {
 }
 
 pub fn write_overflow_chain(value: &[u8], alloc: &mut PageAllocator) -> Result<OverflowChain> {
-    if value.is_empty() {
+    write_overflow_value(value, alloc)
+}
+
+pub(crate) fn write_overflow_value<V: ValueSource + ?Sized>(
+    value: &V,
+    alloc: &mut PageAllocator,
+) -> Result<OverflowChain> {
+    let value = value.parts();
+    if value.len() == 0 {
         return Err(EngineError::Serialization(
             "overflow chain requires a non-empty value".into(),
         ));
@@ -28,10 +37,13 @@ pub fn write_overflow_chain(value: &[u8], alloc: &mut PageAllocator) -> Result<O
     let chunk_count = value.len().div_ceil(chunk_len);
     let ids: Vec<u64> = (0..chunk_count).map(|_| alloc.allocate()).collect();
     let mut pages = Vec::with_capacity(chunk_count);
-    for (idx, chunk) in value.chunks(chunk_len).enumerate() {
+    for idx in 0..chunk_count {
         let page_id = ids[idx];
         let next = ids.get(idx + 1).copied().unwrap_or(0);
-        pages.push((page_id, encode_overflow_page(page_id, next, chunk)?));
+        pages.push((
+            page_id,
+            encode_overflow_value_chunk(page_id, next, &value, idx)?,
+        ));
     }
     Ok(OverflowChain {
         head_page_id: ids[0],

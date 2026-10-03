@@ -1,12 +1,13 @@
 use crate::bytes::{
     read_u16_le, read_u32_le, read_u64_le, write_u16_le, write_u32_le, write_u64_le,
 };
-use crate::checksum::checksum_with_zeroed_region;
+use crate::checksum::{checksum_with_zeroed_region, crc32_with_generated_overflow};
 use crate::error::{EngineError, Result};
 use crate::layout::{
     unsafe_read_struct, PageHeader, PageKind, ValueKind, INLINE_VALUE_LIMIT,
     PAGE_HEADER_CHECKSUM_OFFSET, PAGE_HEADER_SIZE, PAGE_MAGIC, PAGE_SIZE,
 };
+use crate::prepared_value::ValueParts;
 use serde::{Deserialize, Serialize};
 use zerocopy::IntoBytes;
 
@@ -381,32 +382,59 @@ pub fn encode_overflow_page(
     next_overflow_page_id: u64,
     chunk: &[u8],
 ) -> Result<Vec<u8>> {
-    let max = PAGE_SIZE - PAGE_HEADER_SIZE - 12;
-    if chunk.len() > max {
+    encode_overflow_parts(page_id, next_overflow_page_id, chunk, &[], None)
+}
+
+pub(crate) fn encode_overflow_value_chunk(
+    page_id: u64,
+    next_overflow_page_id: u64,
+    value: &ValueParts<'_>,
+    index: usize,
+) -> Result<Vec<u8>> {
+    let (prefix, payload, checksum) = value.chunk(index);
+    encode_overflow_parts(page_id, next_overflow_page_id, prefix, payload, checksum)
+}
+
+fn encode_overflow_parts(
+    page_id: u64,
+    next_overflow_page_id: u64,
+    prefix: &[u8],
+    payload: &[u8],
+    chunk_checksum: Option<u32>,
+) -> Result<Vec<u8>> {
+    let max = max_overflow_chunk_len();
+    let chunk_len = prefix.len() + payload.len();
+    if chunk_len > max {
         return Err(EngineError::Serialization(format!(
             "overflow chunk too large: {} > {max}",
-            chunk.len()
+            chunk_len
         )));
     }
-    let mut buf = vec![0u8; PAGE_SIZE];
     let chunk_start = PAGE_HEADER_SIZE + 12;
-    buf[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + 8]
-        .copy_from_slice(&next_overflow_page_id.to_le_bytes());
-    buf[PAGE_HEADER_SIZE + 8..PAGE_HEADER_SIZE + 12]
-        .copy_from_slice(&(chunk.len() as u32).to_le_bytes());
-    buf[chunk_start..chunk_start + chunk.len()].copy_from_slice(chunk);
-    write_page_header(
-        &mut buf,
-        PageHeaderInfo {
-            page_id,
-            page_kind: PageKind::Overflow,
-            level: 0,
-            cell_count: 0,
-            lower: chunk_start as u16,
-            upper: (chunk_start + chunk.len()) as u16,
-            right_sibling_page_id: 0,
-        },
-    )?;
+    let header = page_header(PageHeaderInfo {
+        page_id,
+        page_kind: PageKind::Overflow,
+        level: 0,
+        cell_count: 0,
+        lower: chunk_start as u16,
+        upper: (chunk_start + chunk_len) as u16,
+        right_sibling_page_id: 0,
+    });
+    // Initialize each byte once: page metadata, both immutable fragments, then
+    // only the unused tail. Do not zero a full page just to overwrite its body.
+    let mut buf = Vec::with_capacity(PAGE_SIZE);
+    buf.extend_from_slice(header.as_bytes());
+    buf.extend_from_slice(&next_overflow_page_id.to_le_bytes());
+    buf.extend_from_slice(&(chunk_len as u32).to_le_bytes());
+    buf.extend_from_slice(prefix);
+    buf.extend_from_slice(payload);
+    buf.resize(PAGE_SIZE, 0);
+    let checksum = match chunk_checksum {
+        Some(checksum) => crc32_with_generated_overflow(&buf[..chunk_start], checksum, chunk_len),
+        None => checksum_with_zeroed_region(&buf, PAGE_HEADER_CHECKSUM_OFFSET, 4),
+    };
+    buf[PAGE_HEADER_CHECKSUM_OFFSET..PAGE_HEADER_CHECKSUM_OFFSET + 4]
+        .copy_from_slice(&checksum.to_le_bytes());
     Ok(buf)
 }
 
@@ -616,8 +644,8 @@ fn validate_cell_slot(slot: usize, header: &PageHeaderInfo) -> Result<()> {
     Ok(())
 }
 
-fn write_page_header(buf: &mut [u8], info: PageHeaderInfo) -> Result<()> {
-    let header = PageHeader {
+fn page_header(info: PageHeaderInfo) -> PageHeader {
+    PageHeader {
         magic: PAGE_MAGIC,
         checksum: 0,
         page_id: info.page_id.to_le(),
@@ -628,7 +656,11 @@ fn write_page_header(buf: &mut [u8], info: PageHeaderInfo) -> Result<()> {
         upper: info.upper.to_le(),
         reserved: 0,
         right_sibling_page_id: info.right_sibling_page_id.to_le(),
-    };
+    }
+}
+
+fn write_page_header(buf: &mut [u8], info: PageHeaderInfo) -> Result<()> {
+    let header = page_header(info);
     buf[..PAGE_HEADER_SIZE].copy_from_slice(header.as_bytes());
     let checksum = checksum_with_zeroed_region(buf, PAGE_HEADER_CHECKSUM_OFFSET, 4);
     buf[PAGE_HEADER_CHECKSUM_OFFSET..PAGE_HEADER_CHECKSUM_OFFSET + 4]
