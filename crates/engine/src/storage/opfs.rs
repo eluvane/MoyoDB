@@ -65,6 +65,8 @@ mod wasm_impl {
         #[wasm_bindgen(catch)]
         fn opfsLen(session_id: u32, file_kind: u32) -> std::result::Result<u64, JsValue>;
         #[wasm_bindgen(catch)]
+        fn opfsAppendOffset(session_id: u32, file_kind: u32) -> std::result::Result<u64, JsValue>;
+        #[wasm_bindgen(catch)]
         fn opfsTruncate(
             session_id: u32,
             file_kind: u32,
@@ -222,6 +224,10 @@ mod wasm_impl {
 
         fn len(&self) -> Result<u64> {
             opfsLen(self.session_id, self.file_kind).map_err(js_err)
+        }
+
+        fn append_offset(&self) -> Result<u64> {
+            opfsAppendOffset(self.session_id, self.file_kind).map_err(js_err)
         }
 
         fn truncate(&mut self, size: u64) -> Result<()> {

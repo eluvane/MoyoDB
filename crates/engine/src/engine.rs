@@ -1633,7 +1633,7 @@ impl<B: FileBackend> Engine<B> {
             changed_page_count,
         };
 
-        let mut wal_offset = self.wal.len()?;
+        let mut wal_offset = self.wal.append_offset()?;
         // From the first WAL byte on, a failure leaves the log tail and the
         // outcome of this commit unknown. Only recovery can say which it was.
         let appended = append_generated_transaction(

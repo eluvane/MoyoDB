@@ -179,7 +179,7 @@ async function openReadSession(bytes) {
     const file = (await dir.getFileHandle('main.bin', { create: true })).file;
     file.bytes = bytes;
     const { sessionId } = await opfsOpenGenerationDb(name, generation, false);
-    return { sessionId, file };
+    return { sessionId, file, name };
 }
 
 // Views do not own a new backing buffer. Count payload allocations and slice
@@ -1125,5 +1125,290 @@ describe('prebatched OPFS write work', () => {
             opfsCloseSession(sessionId);
         }
         assert.throws(() => opfs.opfsWriteAt(sessionId, 2, 0n, new Uint8Array()), /no OPFS session/);
+    });
+});
+
+describe('private OPFS append offsets', () => {
+    test('shares append state across backend aliases without repeated size queries or deferred flushes', async (t) => {
+        const sizes = t.mock.method(MemoryAccessHandle.prototype, 'getSize');
+        const flushes = t.mock.method(MemoryAccessHandle.prototype, 'flush');
+        for (const commits of [1, 10, 1000]) {
+            const { sessionId, file } = await openReadSession(new Uint8Array());
+            // Rust OpfsBackend clones carry the same session/file-kind pair.
+            const aliases = [0, 1].map(() => ({
+                append: () => opfs.opfsAppendOffset(sessionId, 1),
+                write: (at, bytes) => opfs.opfsWriteAt(sessionId, 1, at, bytes)
+            }));
+            const sizeCalls = sizes.mock.callCount();
+            const flushCalls = flushes.mock.callCount();
+            try {
+                assert.equal(opfs.opfsLen(sessionId, 1), 0n);
+                for (let index = 0; index < commits; index += 1) {
+                    const alias = aliases[index % aliases.length];
+                    assert.equal(alias.append(), BigInt(index * 3));
+                    assert.equal(alias.write(alias.append(), new Uint8Array([index % 251, 7, 9])), 3);
+                    opfs.opfsFlush(sessionId, 1);
+                    assert.equal(flushes.mock.callCount() - flushCalls, index + 1);
+                }
+                assert.equal(aliases[0].append(), BigInt(commits * 3));
+                assert.equal(sizes.mock.callCount() - sizeCalls, 1, 'only the authoritative startup read');
+                assert.equal(file.bytes.length, commits * 3);
+                for (let index = 0; index < commits; index += 1) {
+                    assert.deepEqual([...file.bytes.subarray(index * 3, index * 3 + 3)], [index % 251, 7, 9]);
+                }
+                assert.equal(opfs.opfsAppendOffset(sessionId, 0), 0n, 'another file has its own state');
+                assert.equal(sizes.mock.callCount() - sizeCalls, 2);
+            } finally {
+                opfsCloseSession(sessionId);
+            }
+            assert.throws(() => aliases[0].append(), /no OPFS session/);
+        }
+    });
+
+    test('length and directory statistics still read actual sizes and refresh the append offset', async (t) => {
+        const { sessionId, file, name } = await openReadSession(new Uint8Array(8));
+        const sizes = t.mock.method(MemoryAccessHandle.prototype, 'getSize');
+        try {
+            assert.equal(opfs.opfsAppendOffset(sessionId, 1), 8n);
+            assert.equal(opfs.opfsAppendOffset(sessionId, 1), 8n);
+            assert.equal(sizes.mock.callCount(), 1);
+            assert.equal(opfs.opfsLen(sessionId, 1), 8n);
+            file.bytes = new Uint8Array(13);
+            assert.equal(opfs.opfsLen(sessionId, 1), 13n);
+            assert.equal(sizes.mock.callCount(), 3);
+            assert.equal(opfs.opfsAppendOffset(sessionId, 1), 13n);
+            file.bytes = new Uint8Array(17);
+            assert.equal(await opfs.opfsDbDirectorySize(name), 17);
+            assert.equal(sizes.mock.callCount(), 6, 'directory stats read all three open files');
+            assert.equal(opfs.opfsAppendOffset(sessionId, 1), 17n);
+            assert.throws(() => opfs.opfsAppendOffset(sessionId, 99), /no OPFS access handle/);
+        } finally {
+            opfsCloseSession(sessionId);
+        }
+        file.bytes = new Uint8Array(19);
+        const reopened = await opfsOpenGenerationDb(name, 'gen-read-1', false);
+        try {
+            assert.equal(opfs.opfsAppendOffset(reopened.sessionId, 1), 19n);
+            assert.equal(sizes.mock.callCount(), 7, 'a reopened handle must observe the file');
+        } finally {
+            opfsCloseSession(reopened.sessionId);
+        }
+    });
+
+    test('unknown overwrites stay unknown; empty writes never extend EOF; short writes update the complete end', async (t) => {
+        const { sessionId, file } = await openReadSession(new Uint8Array(8));
+        const sizes = t.mock.method(MemoryAccessHandle.prototype, 'getSize');
+        const writes = t.mock.method(MemoryAccessHandle.prototype, 'write');
+        try {
+            assert.equal(opfs.opfsWriteAt(sessionId, 1, 500n, new Uint8Array()), 0);
+            assert.equal(writes.mock.callCount(), 0);
+            assert.equal(opfs.opfsWriteAt(sessionId, 1, 1n, new Uint8Array([2, 3])), 2);
+            assert.equal(sizes.mock.callCount(), 0, 'writes do not add size queries');
+            assert.equal(opfs.opfsAppendOffset(sessionId, 1), 8n, 'an overwrite does not reveal the old EOF');
+            file.writeHook = (src, at, current) => storeBytes(current, src.subarray(0, 2), at);
+            assert.equal(opfs.opfsWriteAt(sessionId, 1, 2n, new Uint8Array([4, 5, 6])), 3);
+            assert.equal(opfs.opfsAppendOffset(sessionId, 1), 8n, 'an overwrite preserves a longer file');
+            assert.equal(opfs.opfsWriteAt(sessionId, 1, 11n, new Uint8Array([7, 8, 9, 10, 11])), 5);
+            assert.equal(opfs.opfsAppendOffset(sessionId, 1), 16n);
+            const writeCalls = writes.mock.callCount();
+            assert.equal(opfs.opfsWriteAt(sessionId, 1, 1000n, new Uint8Array()), 0);
+            assert.equal(writes.mock.callCount(), writeCalls);
+            assert.equal(opfs.opfsAppendOffset(sessionId, 1), 16n);
+            assert.equal(sizes.mock.callCount(), 1);
+            assert.deepEqual([...file.bytes], [0, 2, 4, 5, 6, 0, 0, 0, 0, 0, 0, 7, 8, 9, 10, 11]);
+        } finally {
+            opfsCloseSession(sessionId);
+        }
+    });
+
+    test('successful truncate establishes EOF without a query, including growth and an unprimed handle', async (t) => {
+        const { sessionId, file } = await openReadSession(new Uint8Array(8).fill(7));
+        const sizes = t.mock.method(MemoryAccessHandle.prototype, 'getSize');
+        t.mock.method(MemoryAccessHandle.prototype, 'truncate', function (length) {
+            const next = new Uint8Array(length);
+            next.set(this.file.bytes.subarray(0, length));
+            this.file.bytes = next;
+        });
+        try {
+            for (const length of [3, 12, 0]) {
+                opfs.opfsTruncate(sessionId, 1, BigInt(length));
+                assert.equal(opfs.opfsAppendOffset(sessionId, 1), BigInt(length));
+                assert.equal(file.bytes.length, length);
+            }
+            assert.equal(sizes.mock.callCount(), 0);
+        } finally {
+            opfsCloseSession(sessionId);
+        }
+    });
+
+    test('failed partial writes invalidate the offset and preserve even non-Error thrown values', async (t) => {
+        const sizes = t.mock.method(MemoryAccessHandle.prototype, 'getSize');
+        for (const failure of [new Error('write failed'), undefined, null, 0, false]) {
+            const { sessionId, file } = await openReadSession(new Uint8Array(4));
+            let writes = 0;
+            file.writeHook = (src, at, current) => {
+                if (++writes === 2) throw failure;
+                return storeBytes(current, src.subarray(0, 2), at);
+            };
+            try {
+                assert.equal(opfs.opfsAppendOffset(sessionId, 1), 4n);
+                const sizeCalls = sizes.mock.callCount();
+                assert.throws(
+                    () => opfs.opfsWriteAt(sessionId, 1, 4n, new Uint8Array([8, 9, 10, 11])),
+                    (error) => error === failure
+                );
+                assert.equal(opfs.opfsAppendOffset(sessionId, 1), 6n);
+                assert.equal(sizes.mock.callCount(), sizeCalls + 1);
+                assert.deepEqual([...file.bytes], [0, 0, 0, 0, 8, 9]);
+            } finally {
+                opfsCloseSession(sessionId);
+            }
+        }
+    });
+
+    test('invalid native write counts invalidate a previously observed offset', async (t) => {
+        const sizes = t.mock.method(MemoryAccessHandle.prototype, 'getSize');
+        for (const invalid of [0, -1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, 5]) {
+            const { sessionId, file } = await openReadSession(new Uint8Array(4));
+            file.writeHook = (src, at, current) => {
+                storeBytes(current, src.subarray(0, 1), at);
+                return invalid;
+            };
+            try {
+                assert.equal(opfs.opfsAppendOffset(sessionId, 1), 4n);
+                const sizeCalls = sizes.mock.callCount();
+                assert.throws(() => opfs.opfsWriteAt(sessionId, 1, 4n, new Uint8Array(4)), { name: 'StorageError' });
+                assert.equal(opfs.opfsAppendOffset(sessionId, 1), 5n);
+                assert.equal(sizes.mock.callCount(), sizeCalls + 1);
+            } finally {
+                opfsCloseSession(sessionId);
+            }
+        }
+    });
+
+    for (const operation of ['truncate', 'flush', 'getSize']) {
+        test(`a failed ${operation} invalidates the offset before recovery and preserves the error`, async (t) => {
+            const { sessionId, file } = await openReadSession(new Uint8Array(4));
+            const failure = new Error(`${operation} failed`);
+            try {
+                assert.equal(opfs.opfsAppendOffset(sessionId, 1), 4n);
+                const failing = t.mock.method(MemoryAccessHandle.prototype, operation, function () {
+                    // A failed operation may have changed the file, or the
+                    // browser may report an uncertain state requiring recovery.
+                    this.file.bytes = new Uint8Array(7);
+                    throw failure;
+                });
+                assert.throws(
+                    () => {
+                        if (operation === 'truncate') opfs.opfsTruncate(sessionId, 1, 7n);
+                        else if (operation === 'flush') opfs.opfsFlush(sessionId, 1);
+                        else opfs.opfsLen(sessionId, 1);
+                    },
+                    (error) => error === failure
+                );
+                failing.mock.restore();
+                const sizes = t.mock.method(MemoryAccessHandle.prototype, 'getSize');
+                assert.equal(opfs.opfsAppendOffset(sessionId, 1), 7n);
+                assert.equal(sizes.mock.callCount(), 1);
+                assert.equal(file.bytes.length, 7);
+            } finally {
+                opfsCloseSession(sessionId);
+            }
+        });
+    }
+
+    test('directory-size failures invalidate the same private handle state', async (t) => {
+        const { sessionId, file, name } = await openReadSession(new Uint8Array(4));
+        const failure = new Error('directory size failed');
+        try {
+            assert.equal(opfs.opfsAppendOffset(sessionId, 1), 4n);
+            const sizes = t.mock.method(MemoryAccessHandle.prototype, 'getSize', function () {
+                if (this.file === file) throw failure;
+                return this.file.bytes.length;
+            });
+            await assert.rejects(opfs.opfsDbDirectorySize(name), (error) => error === failure);
+            sizes.mock.restore();
+            file.bytes = new Uint8Array(9);
+            assert.equal(opfs.opfsAppendOffset(sessionId, 1), 9n);
+        } finally {
+            opfsCloseSession(sessionId);
+        }
+    });
+
+    test('unsafe or coerced size observations preserve BigInt semantics without becoming cached offsets', async (t) => {
+        const { sessionId } = await openReadSession(new Uint8Array(4));
+        let rawSize = 4;
+        const sizes = t.mock.method(MemoryAccessHandle.prototype, 'getSize', () => rawSize);
+        try {
+            for (const value of [Number.MAX_SAFE_INTEGER + 1, -1, 2n, '7', NaN, 0.5, Infinity]) {
+                rawSize = 4;
+                assert.equal(opfs.opfsLen(sessionId, 1), 4n);
+                rawSize = value;
+                const sizeCalls = sizes.mock.callCount();
+                for (const query of [opfs.opfsLen, opfs.opfsAppendOffset, opfs.opfsAppendOffset]) {
+                    if (typeof value === 'number' && !Number.isInteger(value)) {
+                        assert.throws(() => query(sessionId, 1), RangeError);
+                    } else {
+                        assert.equal(query(sessionId, 1), BigInt(value));
+                    }
+                }
+                assert.equal(sizes.mock.callCount(), sizeCalls + 3);
+            }
+        } finally {
+            opfsCloseSession(sessionId);
+        }
+    });
+
+    test('unsafe write and truncate arguments keep the original call semantics and force a fresh EOF', async (t) => {
+        const { sessionId, file } = await openReadSession(new Uint8Array(4));
+        const sizes = t.mock.method(MemoryAccessHandle.prototype, 'getSize');
+        let expectedArgument;
+        t.mock.method(MemoryAccessHandle.prototype, 'write', function (bytes, { at }) {
+            assert.equal(at, expectedArgument);
+            this.file.bytes = new Uint8Array(9);
+            return bytes.length;
+        });
+        t.mock.method(MemoryAccessHandle.prototype, 'truncate', function (length) {
+            assert.equal(length, expectedArgument);
+            this.file.bytes = new Uint8Array(9);
+        });
+        try {
+            for (const argument of [-1n, 0.5, NaN, Infinity, BigInt(Number.MAX_SAFE_INTEGER) + 2n]) {
+                expectedArgument = Number(argument);
+                for (const operation of ['write', 'truncate']) {
+                    file.bytes = new Uint8Array(4);
+                    assert.equal(opfs.opfsLen(sessionId, 1), 4n);
+                    const sizeCalls = sizes.mock.callCount();
+                    if (operation === 'write') opfs.opfsWriteAt(sessionId, 1, argument, new Uint8Array(1));
+                    else opfs.opfsTruncate(sessionId, 1, argument);
+                    assert.equal(opfs.opfsAppendOffset(sessionId, 1), 9n);
+                    assert.equal(sizes.mock.callCount(), sizeCalls + 1);
+                }
+            }
+            expectedArgument = Number.MAX_SAFE_INTEGER;
+            assert.equal(opfs.opfsLen(sessionId, 1), 9n);
+            const sizeCalls = sizes.mock.callCount();
+            opfs.opfsWriteAt(sessionId, 1, BigInt(Number.MAX_SAFE_INTEGER), new Uint8Array(1));
+            assert.equal(opfs.opfsAppendOffset(sessionId, 1), 9n, 'the written end must also be exactly representable');
+            assert.equal(sizes.mock.callCount(), sizeCalls + 1);
+            const failure = new Error('numeric conversion failed');
+            const invalid = {
+                valueOf() {
+                    file.bytes = new Uint8Array(11);
+                    throw failure;
+                }
+            };
+            for (const operation of [opfs.opfsWriteAt, opfs.opfsTruncate]) {
+                file.bytes = new Uint8Array(4);
+                assert.equal(opfs.opfsLen(sessionId, 1), 4n);
+                assert.throws(
+                    () => operation(sessionId, 1, invalid, new Uint8Array(1)),
+                    (error) => error === failure
+                );
+                assert.equal(opfs.opfsAppendOffset(sessionId, 1), 11n);
+            }
+        } finally {
+            opfsCloseSession(sessionId);
+        }
     });
 });

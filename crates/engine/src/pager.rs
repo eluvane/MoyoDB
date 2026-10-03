@@ -7,6 +7,11 @@ use std::collections::{HashMap, VecDeque};
 // Bound the extra copy buffer while amortizing native/OPFS backend crossings.
 pub(crate) const PAGE_WRITE_BATCH_PAGES: usize = 64;
 
+// Checkpoint images are already pinned in memory. A larger bounded write buffer
+// avoids fragmenting those contiguous runs into hundreds of backend calls.
+// Recovery keeps its smaller bound because it also retains source/read buffers.
+const DIRTY_PAGE_WRITE_BATCH_PAGES: usize = 1024;
+
 #[derive(Debug)]
 struct CacheEntry {
     bytes: Vec<u8>,
@@ -193,7 +198,7 @@ impl<B: FileBackend> Pager<B> {
         while start < page_ids.len() {
             let mut end = start + 1;
             while end < page_ids.len()
-                && end - start < PAGE_WRITE_BATCH_PAGES
+                && end - start < DIRTY_PAGE_WRITE_BATCH_PAGES
                 && page_ids[end - 1].checked_add(1) == Some(page_ids[end])
             {
                 end += 1;
@@ -430,8 +435,7 @@ mod tests {
         assert_eq!(
             pager.main.writes,
             [
-                (page_offset(1), 64 * PAGE_SIZE),
-                (page_offset(65), PAGE_SIZE),
+                (page_offset(1), 65 * PAGE_SIZE),
                 (page_offset(67), PAGE_SIZE),
                 (page_offset(69), 4 * PAGE_SIZE),
             ]
@@ -454,7 +458,8 @@ mod tests {
     fn failed_page_batch_preserves_pins_and_can_be_rewritten() -> Result<()> {
         let mut pager = Pager::new(RecordingBackend::default(), 8);
         let mut oracle = MemoryBackend::new();
-        for page_id in 1..=130 {
+        let page_count = (2 * DIRTY_PAGE_WRITE_BATCH_PAGES + 2) as u64;
+        for page_id in 1..=page_count {
             let image = encode_leaf_page(page_id, 0, 0, &[])?;
             oracle.write_at(page_offset(page_id), &image)?;
             pager.stage_page_image(page_id, image)?;
@@ -464,7 +469,7 @@ mod tests {
             pager.write_back_dirty(),
             Err(EngineError::Storage(_))
         ));
-        assert_eq!(pager.dirty_page_count(), 130);
+        assert_eq!(pager.dirty_page_count(), page_count as usize);
         assert!(pager.cache.values().all(|entry| entry.dirty));
         assert_eq!(pager.main.writes.len(), 2);
         pager.main.fail_write = None;
@@ -481,6 +486,38 @@ mod tests {
         );
         pager.mark_dirty_clean();
         assert_eq!(pager.dirty_page_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_bounds_large_runs_without_changing_page_bytes() -> Result<()> {
+        let mut pager = Pager::new(RecordingBackend::default(), 8);
+        let mut oracle = MemoryBackend::new();
+        // Stage out of order, including a page beyond the four-MiB boundary.
+        for page_id in (1..=1025).rev() {
+            let image = encode_leaf_page(page_id, 0, page_id + 1, &[])?;
+            oracle.write_at(page_offset(page_id), &image)?;
+            pager.stage_page_image(page_id, image)?;
+        }
+        pager.write_back_dirty()?;
+        assert_eq!(
+            pager.main.writes,
+            [
+                (page_offset(1), 4 * 1024 * 1024),
+                (page_offset(1025), PAGE_SIZE)
+            ]
+        );
+        assert_eq!(pager.dirty_page_count(), 1025);
+        let len = oracle.len()? as usize;
+        assert_eq!(pager.main.read_at(0, len)?, oracle.read_at(0, len)?);
+        pager.flush()?;
+        oracle.flush()?;
+        assert_eq!(
+            pager.main.inner.durable_snapshot(),
+            oracle.durable_snapshot()
+        );
+        pager.mark_dirty_clean();
+        assert!(!pager.has_dirty());
         Ok(())
     }
 

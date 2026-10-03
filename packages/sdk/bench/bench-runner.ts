@@ -19,9 +19,7 @@ const RUNNERS: Record<BenchEngine, WorkloadRunner> = {
     indexeddb: indexedDbBaseline
 };
 
-type ViteImportMeta = Omit<ImportMeta, 'env'> & {
-    env?: { MODE?: string; DEV?: boolean; PROD?: boolean };
-};
+type ViteEnvironment = { MODE?: string; DEV?: boolean; PROD?: boolean };
 type IndexedDbFactoryWithDatabases = IDBFactory & {
     databases?: () => Promise<Array<{ name?: string | null }>>;
 };
@@ -97,11 +95,14 @@ export async function runBenchmarkSuite(options: Partial<BenchOptions> = {}): Pr
         notes: [
             'Raw samples are wall-clock milliseconds measured with performance.now() inside the browser page.',
             'Warmup samples are recorded separately and excluded from percentiles.',
+            'Compare before/after results within the same browser context mode: persistent profiles and incognito contexts can use different storage implementations; changing the mode is not an engine optimization.',
+            'A fresh database and Worker do not imply a cold browser runtime or cold device cache; suite probes, warmups, and earlier samples can warm module/WASM and storage caches.',
             'Setup/preload/data generation/open/delete are outside the timed region unless the workload name explicitly says open/init or the notes say otherwise.',
             'MoyoDB browser measurements include SDK, Worker, WASM, and OPFS overhead unless a diagnostic workload isolates a lower layer.',
             'Native Rust microbenchmarks measure the engine core only. Browser benchmarks measure SDK/WASM/Worker/OPFS overhead. Do not compare them as if they measure the same path.',
             'IndexedDB is measured with the same record counts, binary keys, values, random access order, batch sizes, and transaction boundaries for comparable workloads.',
-            `Durability: IndexedDB readwrite transactions use durability "${indexedDbDurability}"; MoyoDB commits are ${MOYODB_DURABILITY}.`,
+            `Durability: IndexedDB explicit readwrite transactions use durability "${indexedDbDurability}"; MoyoDB commits are ${MOYODB_DURABILITY}.`,
+            'Startup/open rows compare API latency: indexedDB.open() has no durability parameter for its implicit versionchange transaction, so indexedDbDurability does not establish strict persistence parity for that transaction.',
             'Random reads are reported per request mode: sequential rows keep one request outstanding, pipelined rows issue every request before awaiting, bulk rows use one getMany call (MoyoDB only).',
             'After each timed sample, the data read or written is checked against the deterministic dataset outside the timed region; matching content checksums are recorded per sample.'
         ]
@@ -245,11 +246,11 @@ async function detectBenchEnvironment(timestamp: string, options: BenchOptions):
         locks?: unknown;
         storage?: StorageManager & { getDirectory?: unknown };
     };
-    const importMeta = import.meta as ViteImportMeta;
+    // Vite substitutes direct import.meta.env access, not aliases of import.meta.
+    const importEnv = import.meta.env as ViteEnvironment | undefined;
     const opfsSupported = typeof nav.storage?.getDirectory === 'function';
     const syncAccessHandleSupported = opfsSupported ? await hasSyncAccessHandle() : false;
-    const sdkMode =
-        importMeta.env?.MODE ?? (importMeta.env?.PROD ? 'production' : importMeta.env?.DEV ? 'development' : 'unknown');
+    const sdkMode = importEnv?.MODE ?? (importEnv?.PROD ? 'production' : importEnv?.DEV ? 'development' : 'unknown');
     return {
         browser,
         timestamp,

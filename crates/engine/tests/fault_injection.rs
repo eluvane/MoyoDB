@@ -568,7 +568,7 @@ fn large_checkpoint_case(config: &OpenConfig, fault: Fault, target: u64) -> bool
     engine.commit_tx(tx).expect("commit empty store");
     engine.checkpoint().expect("checkpoint empty store");
     let values: Rows = (0..8)
-        .map(|index| (key(index), vec![index as u8; 64 * 1024]))
+        .map(|index| (key(index), vec![index as u8; 512 * 1024]))
         .collect();
     let tx = engine
         .begin_tx(TxMode::Readwrite)
@@ -577,7 +577,7 @@ fn large_checkpoint_case(config: &OpenConfig, fault: Fault, target: u64) -> bool
         engine.put(tx, STORE, key, value).expect("put large value");
     }
     let committed_txid = engine.commit_tx(tx).expect("acknowledge large values");
-    assert!(engine.stats().expect("dirty fixture stats").dirty_pages > 128);
+    assert!(engine.stats().expect("dirty fixture stats").dirty_pages > 2048);
     bundle.arm(fault, target);
     let checkpoint = engine.checkpoint();
     let Some(trip) = bundle.tripped() else {

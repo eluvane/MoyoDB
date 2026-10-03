@@ -13,6 +13,7 @@ const LARGE_VALUE_LEN: usize = 64 * 1024;
 
 thread_local! {
     static VALUE_ALLOCATIONS: Cell<Option<usize>> = const { Cell::new(None) };
+    static APPEND_OFFSET_CALLS: Cell<usize> = const { Cell::new(0) };
 }
 
 struct ValueAllocator;
@@ -79,6 +80,11 @@ impl FileBackend for CountingBackend {
     fn len(&self) -> Result<u64> {
         self.length_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.len()
+    }
+
+    fn append_offset(&self) -> Result<u64> {
+        APPEND_OFFSET_CALLS.with(|calls| calls.set(calls.get() + 1));
+        self.len()
     }
 
     fn truncate(&mut self, size: u64) -> Result<()> {
@@ -160,6 +166,30 @@ fn deferred_commit_and_explicit_checkpoint_each_read_wal_length_once() -> Result
     length_calls.store(0, Ordering::Relaxed);
     engine.checkpoint()?;
     assert_eq!(length_calls.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+fn commits_use_backend_append_offsets_but_stats_and_recovery_read_length() -> Result<()> {
+    let (mut engine, length_calls) = open_engine(deferred_config(), false)?;
+    APPEND_OFFSET_CALLS.with(|calls| calls.set(0));
+    for key in 0u8..3 {
+        let tx = engine.begin_tx(TxMode::Readwrite)?;
+        engine.put(tx, "source", &[key], b"value")?;
+        engine.commit_tx(tx)?;
+    }
+    assert_eq!(APPEND_OFFSET_CALLS.with(Cell::get), 3);
+
+    APPEND_OFFSET_CALLS.with(|calls| calls.set(0));
+    length_calls.store(0, Ordering::Relaxed);
+    assert!(engine.stats()?.wal_len > 0);
+    assert_eq!(APPEND_OFFSET_CALLS.with(Cell::get), 0);
+    assert_eq!(length_calls.load(Ordering::Relaxed), 1);
+
+    length_calls.store(0, Ordering::Relaxed);
+    engine.recover()?;
+    assert_eq!(APPEND_OFFSET_CALLS.with(Cell::get), 0);
+    assert!(length_calls.load(Ordering::Relaxed) > 0);
     Ok(())
 }
 

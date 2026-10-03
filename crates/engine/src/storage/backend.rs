@@ -5,6 +5,15 @@ pub trait FileBackend: Send {
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()>;
     fn flush(&mut self) -> Result<()>;
     fn len(&self) -> Result<u64>;
+    /// Returns the exact current end of file for the next append.
+    ///
+    /// Shared backends retain `len` semantics by default. A backend with exclusive
+    /// file access may track successful size changes, but must refresh the size
+    /// after an operation leaves it uncertain. This does not reserve an offset
+    /// or synchronize concurrent writers.
+    fn append_offset(&self) -> Result<u64> {
+        self.len()
+    }
     fn is_empty(&self) -> Result<bool> {
         Ok(self.len()? == 0)
     }

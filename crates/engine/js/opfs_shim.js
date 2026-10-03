@@ -14,6 +14,10 @@ const TEXT_DECODER = new TextDecoder();
 let rootDir = null;
 let nextSessionId = 1;
 const sessions = new Map();
+// Session data handles are private and exclusively owned. Rust backend aliases
+// share a handle, so successful writes/truncates keep one append offset coherent.
+// Authoritative length reads still reach OPFS for validation and statistics.
+const appendOffsets = new WeakMap();
 function namedError(name, message) {
     const error = new Error(message);
     error.name = name;
@@ -341,6 +345,7 @@ function closeSession(sessionId) {
         return;
     }
     for (const handle of session.handles.values()) {
+        appendOffsets.delete(handle);
         try {
             handle.close();
         } catch {}
@@ -409,11 +414,29 @@ function getAccessHandle(sessionId, fileKind) {
     }
     return handle;
 }
+function rememberFileSize(handle, size) {
+    if (typeof size === 'number' && Number.isSafeInteger(size) && size >= 0) {
+        appendOffsets.set(handle, size);
+    } else {
+        appendOffsets.delete(handle);
+    }
+}
+function readFileSize(handle) {
+    try {
+        const size = handle.getSize();
+        rememberFileSize(handle, size);
+        return size;
+    } catch (error) {
+        appendOffsets.delete(handle);
+        throw error;
+    }
+}
 function lookupOpenFileSize(path) {
     for (const session of sessions.values()) {
         for (let fileKind = 0; fileKind < FILE_NAMES.length; fileKind += 1) {
             if (`${session.path}/${FILE_NAMES[fileKind]}` === path) {
-                return Number(session.handles.get(fileKind)?.getSize() ?? 0);
+                const handle = session.handles.get(fileKind);
+                return Number((handle ? readFileSize(handle) : 0) ?? 0);
             }
         }
     }
@@ -469,16 +492,56 @@ export function opfsReadAt(sessionId, fileKind, offset, len) {
     return buffer;
 }
 export function opfsWriteAt(sessionId, fileKind, offset, bytes) {
-    return writeAll(getAccessHandle(sessionId, fileKind), bytes, Number(offset));
+    const handle = getAccessHandle(sessionId, fileKind);
+    try {
+        const at = Number(offset);
+        const written = writeAll(handle, bytes, at);
+        // An empty write never calls OPFS and cannot extend the file. An
+        // unobserved EOF cannot be inferred from a successful overwrite.
+        if (written > 0) {
+            const previous = appendOffsets.get(handle);
+            const end = at + written;
+            if (previous !== undefined && Number.isSafeInteger(at) && at >= 0 && Number.isSafeInteger(end)) {
+                appendOffsets.set(handle, Math.max(previous, end));
+            } else {
+                appendOffsets.delete(handle);
+            }
+        }
+        return written;
+    } catch (error) {
+        // A failed call can still have written a prefix. Recovery must observe
+        // the actual file, including when the browser throws a non-Error value.
+        appendOffsets.delete(handle);
+        throw error;
+    }
 }
 export function opfsFlush(sessionId, fileKind) {
-    getAccessHandle(sessionId, fileKind).flush();
+    const handle = getAccessHandle(sessionId, fileKind);
+    try {
+        handle.flush();
+    } catch (error) {
+        appendOffsets.delete(handle);
+        throw error;
+    }
 }
 export function opfsLen(sessionId, fileKind) {
-    return BigInt(getAccessHandle(sessionId, fileKind).getSize());
+    return BigInt(readFileSize(getAccessHandle(sessionId, fileKind)));
+}
+export function opfsAppendOffset(sessionId, fileKind) {
+    const handle = getAccessHandle(sessionId, fileKind);
+    const size = appendOffsets.get(handle);
+    return size === undefined ? opfsLen(sessionId, fileKind) : BigInt(size);
 }
 export function opfsTruncate(sessionId, fileKind, size) {
-    getAccessHandle(sessionId, fileKind).truncate(Number(size));
+    const handle = getAccessHandle(sessionId, fileKind);
+    try {
+        const length = Number(size);
+        handle.truncate(length);
+        rememberFileSize(handle, length);
+    } catch (error) {
+        appendOffsets.delete(handle);
+        throw error;
+    }
 }
 export function opfsCloseSession(sessionId) {
     closeSession(sessionId);

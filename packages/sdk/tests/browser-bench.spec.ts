@@ -1,4 +1,7 @@
-import { test, expect } from '@playwright/test';
+import { test as base, expect, type BrowserContext } from '@playwright/test';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 type ProcessLike = { env?: Record<string, string | undefined> };
 type BenchProfile = 'smoke' | 'standard' | 'full';
@@ -20,6 +23,35 @@ const testTimeoutMs = normalizeOptionalCount(proc?.env?.MOYODB_BENCH_TEST_TIMEOU
 const effectiveWorkloadTimeoutMs = workloadTimeoutMs ?? (profile === 'smoke' ? 30_000 : undefined);
 const gitSha = proc?.env?.MOYODB_BENCH_GIT_SHA ?? proc?.env?.GITHUB_SHA ?? 'unknown';
 const indexedDbDurability = normalizeDurability(proc?.env?.MOYODB_BENCH_IDB_DURABILITY);
+const persistentContext = proc?.env?.MOYODB_BENCH_PERSISTENT_CONTEXT === '1';
+
+// Keep the ordinary incognito fixture as the default. The persistent variant
+// launches its own browser, without also requesting the default browser fixture.
+const test = persistentContext
+    ? base.extend({
+          context: async ({ playwright, browserName, launchOptions, headless, channel, baseURL }, use) => {
+              const userDataDir = await mkdtemp(join(tmpdir(), 'moyodb-bench-profile-'));
+              let context: BrowserContext | undefined;
+              try {
+                  // Playwright applies the project's context options to contexts
+                  // created through its playwright fixture, including this one.
+                  context = await playwright[browserName].launchPersistentContext(userDataDir, {
+                      ...launchOptions,
+                      headless,
+                      channel,
+                      baseURL
+                  });
+                  await use(context);
+              } finally {
+                  try {
+                      await context?.close();
+                  } finally {
+                      await rm(userDataDir, { recursive: true, force: true });
+                  }
+              }
+          }
+      })
+    : base;
 
 test.describe('browser benchmark smoke', () => {
     test.skip(!shouldRunBench, 'benchmark smoke is opt-in; use npm run bench:browser, bench:indexeddb, or bench:opfs');
@@ -73,14 +105,15 @@ test.describe('browser benchmark smoke', () => {
                 sampleCountOverride,
                 warmupCountOverride,
                 workloadTimeoutMs: effectiveWorkloadTimeoutMs,
-                persistentContext: false,
+                persistentContext,
                 gitSha,
                 indexedDbDurability
             }
         );
 
         const workloadFileSegment = workloadNames ? `-${safeFileSegment(workloadNames.join('-'))}` : '';
-        const resultFileName = `browser-bench-${safeFileSegment(testInfo.project.name)}-${safeFileSegment(engineFromLifecycle)}-${profile}${workloadFileSegment}.json`;
+        const contextFileSegment = persistentContext ? '-persistent' : '';
+        const resultFileName = `browser-bench-${safeFileSegment(testInfo.project.name)}-${safeFileSegment(engineFromLifecycle)}-${profile}${contextFileSegment}${workloadFileSegment}.json`;
         const downloadPromise = page.waitForEvent('download');
         await page.evaluate(
             ({ report, resultFileName }) => {
@@ -104,6 +137,7 @@ test.describe('browser benchmark smoke', () => {
         });
 
         expect(report.results.length).toBeGreaterThan(0);
+        expect(report.environment.persistentContext).toBe(persistentContext);
         expect(
             report.results
                 .filter((result) => result.status === 'error')

@@ -23,6 +23,7 @@ Optional environment variables:
 
 - `MOYODB_BENCH_PROFILE=smoke|standard|full` (`full` is the practical suite, not the million-row rows)
 - `MOYODB_BENCH_ENGINE=all|moyodb|indexeddb`
+- `MOYODB_BENCH_PERSISTENT_CONTEXT=1` uses a fresh, temporary persistent browser profile for the suite (default `0`: Playwright's incognito context)
 - `MOYODB_BENCH_WORKLOADS=bulk_insert_1m_batched_10000,random_get_10k_from_1m_bulk`
 - `MOYODB_BENCH_SAMPLE_COUNT=1`
 - `MOYODB_BENCH_WARMUP_COUNT=0`
@@ -31,6 +32,17 @@ Optional environment variables:
 - `MOYODB_BENCH_GIT_SHA=<sha>` overrides the revision the launcher reads from `git` (or `GITHUB_SHA` in CI)
 - `MOYODB_CHROMIUM_EXECUTABLE_PATH=/path/to/chromium` for local systems without Playwright-managed browsers
 - `MOYODB_DISABLE_VIDEO=1` for environments that do not have Playwright's bundled ffmpeg
+
+To compare the same workloads in both storage modes:
+
+```bash
+MOYODB_BENCH_PERSISTENT_CONTEXT=0 MOYODB_BENCH_PROFILE=full npm run bench:browser
+MOYODB_BENCH_PERSISTENT_CONTEXT=1 MOYODB_BENCH_PROFILE=full npm run bench:browser
+```
+
+The persistent profile is created once per test, shared by both engines, and removed after its browser closes. It never uses your normal browser profile. Reports record the actual `persistentContext` setting; persistent results have a `-persistent` filename suffix so they do not overwrite the default results. The launcher retains the configured executable, headless setting, and context options.
+
+Browser context mode can substantially change OPFS's storage implementation and call costs. Keep the mode fixed for before/after comparisons and report both modes separately; switching modes is not a MoyoDB optimization. Strict API settings also do not establish durable-device performance: record the host filesystem/device, especially for memory-backed filesystems or environments where flush/fsync has no durable device behind it.
 
 ## Manual browser run
 
@@ -41,6 +53,8 @@ npm run dev
 ```
 
 Use the page controls to run `smoke`, `standard`, or `full` profiles and export raw JSON.
+
+For a regular persistent browser profile, set `window.moyodbBench.defaultBenchOptions.persistentContext = true` in the console before using the controls. The page cannot detect incognito mode; this setting labels the report and does not change browser storage mode.
 
 ## Timing rules
 
@@ -59,6 +73,8 @@ The measured region uses `performance.now()` inside the browser page and exclude
 For million-row read/scan workloads, preload uses one setup transaction so the read benchmark is not blocked by the separate batched-write stress path. Compare those rows as read latency only; use the insert rows for write-path numbers.
 
 Warmup samples are recorded separately and excluded from percentiles. Raw measured samples are preserved in `bench/results/*.json`.
+
+`open_empty_db` opens a fresh database in a fresh Worker, while `cold_open_after_100k` reopens an existing database in a fresh Worker. Neither proves first-runtime or device-cache coldness: suite capability/build-profile probes, setup/cleanup Workers, warmups, and earlier samples can warm the JavaScript module graph, compiled WASM, and storage caches. Setting warmups to zero does not disable those probes. Report a separate first-runtime experiment if that is the startup cost being investigated. The normal launcher serves SDK modules through Vite's development server with release WASM; compare production bundle startup separately and retain the reported build modes.
 
 ## Diagnostic layer workloads
 
@@ -115,6 +131,8 @@ For comparable workloads, both engines use:
 - the same record count, value size, batch size, warmup count, measured sample count, and transaction boundaries;
 - explicit durability: IndexedDB readwrite transactions pass `{ durability }` (default `strict`); MoyoDB flushes WAL before a commit resolves and uses bounded checkpoints to install pages and flush the main file and manifest.
 
+`MOYODB_BENCH_IDB_DURABILITY` controls explicit readwrite transactions. `indexedDB.open()` has no durability parameter for its implicit `versionchange` transaction. Startup/open rows therefore compare API latency; selecting `strict` does not establish strict persistence parity for that implicit transaction.
+
 Random reads are split by request mode, because issuing requests one at a time and queueing them all measure different things:
 
 | Mode       | MoyoDB                                 | IndexedDB                                           |
@@ -146,6 +164,47 @@ Each report records:
 - workload name, record count, key size, value size, batch size, transaction boundary;
 - warmup samples, measured samples, p50/p95/p99/min/max/mean;
 - notes, skip reasons, and errors.
+
+## Paired engine-artifact comparison
+
+`crossover-bench.mjs` compares two separately built release engine directories through the same SDK source, browser, context, and origin, with a fresh page for every artifact suite. Use Node 24+ and the repository's existing npm dependencies. For example, with the unchanged baseline in `../MoyoDB-before` and the patch in this checkout, run from this repository's root:
+
+```bash
+npm --prefix ../MoyoDB-before ci
+npm --prefix ../MoyoDB-before/packages/sdk run build:wasm:release
+npm ci
+npm run build:wasm:release --workspace @moyodb/sdk
+npx playwright install chromium
+export BASELINE_ENGINE_DIR=../MoyoDB-before/packages/sdk/public/engine
+export AFTER_ENGINE_DIR=./packages/sdk/public/engine
+export BENCH_GIT_SHA=23ad23b4854b59c5c2edfd1ef9f5cf1f697ec694
+export OUTPUT_DIR=./bench-results/crossover
+MODE=persistent node packages/sdk/bench/crossover-bench.mjs
+MODE=incognito node packages/sdk/bench/crossover-bench.mjs
+node packages/sdk/bench/crossover-report.mjs
+```
+
+`BASELINE_ENGINE_DIR` is required; `AFTER_ENGINE_DIR` defaults to this checkout's generated engine. Both directories must remain unchanged during the run. `BENCH_SOURCE_DIR` optionally selects one shared source checkout; the default is this repository. `CHROMIUM_EXECUTABLE` optionally selects a browser executable. The crossover script defaults to `MODE=persistent`, creates its own temporary profile, and removes it after closing the browser. The ordinary Playwright launcher above retains its incognito default.
+
+Each artifact receives six measured samples per workload and one initial warmup, in six balanced AB/BA rounds. The stock workloads, timed regions, strict explicit write transactions, and content verification are unchanged. The previous page closes after the suite completes its cleanup and before the selected artifact changes. The next fresh page runs the unchanged environment probe and keeps that artifact's main-page WASM instance alive only for its own suite. This gives both artifacts the same page and module lifetime.
+
+Every served WASM, glue, and snippet file is checked against a SHA-256/byte-length manifest loaded before measurement. Exact request counts require one main-page probe plus one engine load per DB Worker; the cached main-page engine must still report a release build after the suite without fetching another asset. Both artifacts receive identical `no-store` headers. Empty-open is excluded because this fetch control changes startup cache behavior. Measure startup separately with the normal launcher.
+
+An earlier one-page crossover retained only the first artifact in `detectWasmBuildProfile()`'s cached module import. Its Worker asset hashes were correct, but main-page WASM lifetime was asymmetric. Keep those measurements as separate diagnostics. The reporter requires fresh-page design version 2 and rejects the earlier reports; use a new output directory when changing measurement methods.
+
+The report uses all six Moyo samples per artifact and one shared median of the twelve contemporary IndexedDB controls. It verifies distinct page instances, exact main-page/Worker asset counts, sample counts, artifact checks, and content parity, and retains raw samples and AB/BA results. To summarize only one completed mode, pass `persistent` or `incognito` to `crossover-report.mjs`; the default reads both. Keep the modes and any host storage limitations explicit when presenting the results.
+
+## OPFS structural diagnostics
+
+`opfs-diagnostic.mjs` uses the same opt-in Worker/WASM/OPFS hooks as the profiling pass. Method counts are not RPC counts; nested inclusive times cannot be added or used as stock/cold-start latency. Run with Node 24+ after separate release builds:
+
+```bash
+MEASUREMENT_KIND=structural-inclusive BENCH_GIT_SHA=23ad23b4854b59c5c2edfd1ef9f5cf1f697ec694 \
+PERSISTENT=0 ENGINE_DIR=../MoyoDB-before/packages/sdk/public/engine OUTPUT=./bench-results/before-opfs.json \
+SPECS='["large_value_64kb","large_value_1mb","small_tx_1000_commits"]' node packages/sdk/bench/opfs-diagnostic.mjs
+```
+
+Repeat with the changed `ENGINE_DIR` and a different `OUTPUT`; keep `REPO_DIR` (shared SDK source, default this checkout), browser, and `PERSISTENT=0|1` fixed. `CHROMIUM_EXECUTABLE` optionally selects Chromium. The report retains preparation and measured counters, byte counts, checksums, source/artifact fingerprints, and inclusive times. Engine assets are verified against their initial manifest before instrumentation; supplied directories must stay unchanged. Persistent runs create and remove their own profile under the output directory.
 
 ## Performance-gap pass (2026-10-03)
 
