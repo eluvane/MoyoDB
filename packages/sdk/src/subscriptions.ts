@@ -72,11 +72,13 @@ function normalizeSubscriptionSpec(
 }
 export class SubscriptionHub {
     #dbName: string;
+    #channelName: string;
     #channel: BroadcastChannel | null = null;
     #entries = new Set<SubscriptionEntry>();
     #closed = false;
-    constructor(dbName: string) {
+    constructor(dbName: string, channelName = dbName) {
         this.#dbName = dbName;
+        this.#channelName = channelName;
     }
     subscribe(callback: DbSubscriptionCallback): Unsubscribe;
     subscribe(storeName: string, callback: DbSubscriptionCallback): Unsubscribe;
@@ -124,7 +126,7 @@ export class SubscriptionHub {
         if (this.#channel !== null || this.#closed) {
             return;
         }
-        const channel = new BroadcastChannel(`db:${this.#dbName}:events`);
+        const channel = new BroadcastChannel(`db:${this.#channelName}:events`);
         channel.onmessage = (event) => {
             this.#handleMessage(event.data);
         };

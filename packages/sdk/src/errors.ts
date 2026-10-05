@@ -51,6 +51,11 @@ export class WriteTransactionAlreadyOpenError extends MoyoDbError {
         super('WriteTransactionAlreadyOpenError', message);
     }
 }
+export class TransactionConflictError extends MoyoDbError {
+    constructor(message = 'transaction snapshot is stale; start a new transaction') {
+        super('TransactionConflictError', message);
+    }
+}
 export class ReadonlyTransactionError extends MoyoDbError {
     constructor(message = 'readonly transaction cannot perform this operation') {
         super('ReadonlyTransactionError', message);
@@ -152,6 +157,7 @@ const ERROR_CONSTRUCTORS = {
     ConstraintError,
     UniqueIndexConstraintError,
     WriteTransactionAlreadyOpenError,
+    TransactionConflictError,
     ReadonlyTransactionError,
     TransactionClosedError,
     DatabaseClosedError,

@@ -1,6 +1,13 @@
-import { WorkerProtocolClient } from './worker-client';
+import { WorkerProtocolClient, type WorkerClient, type WorkerTransport } from './worker-client';
+import { SharedWorkerProtocolClient } from './shared-worker-client';
 import type { ChangeFeedSettings, DebugFailpoint, OpenOptions } from './types';
-import { DatabaseBusyError, DatabaseClosedError, InvalidOpenOptionsError, normalizeError } from './errors';
+import {
+    DatabaseBusyError,
+    DatabaseClosedError,
+    InvalidOpenOptionsError,
+    UnsupportedPlatformError,
+    normalizeError
+} from './errors';
 import { isRecord, withTimeout } from './internal';
 const VALID_FAILPOINTS = new Set<Exclude<DebugFailpoint, null>>([
     'after_wal_flush',
@@ -33,6 +40,7 @@ interface MainThreadPersistenceBridge {
     close(): void;
 }
 export interface NormalizedOpenOptions {
+    workerMode: 'dedicated' | 'shared';
     createIfMissing: boolean;
     ownerWaitMs: number;
     requestPersistence: boolean;
@@ -44,14 +52,17 @@ const DEFAULT_CHANGE_FEED_RETAIN_TXIDS = 100_000;
 export interface RegistryEntry {
     dbName: string;
     refs: number;
-    worker: Worker;
-    proxy: WorkerProtocolClient;
+    worker: { terminate(): void | Promise<number> };
+    proxy: WorkerClient;
     persistenceBridge: MainThreadPersistenceBridge;
     options: NormalizedOpenOptions;
     invalidated: boolean;
     schemaMigrationInProgress: boolean;
     txInvalidationListeners: Set<() => void>;
     handleInvalidationListeners: Set<() => void>;
+    release?: () => Promise<void>;
+    destroy?: () => Promise<void>;
+    channelName?: string;
 }
 const registry = new Map<string, RegistryEntry>();
 const lifecycleOperations = new Map<string, Promise<void>>();
@@ -125,9 +136,17 @@ function normalizeChangeFeed(value: unknown): Required<ChangeFeedSettings> | nul
     }
     return { enabled, retainTxids };
 }
-function normalizeOptions(options: OpenOptions = {}): NormalizedOpenOptions {
+function normalizeWorkerMode(value: unknown): NormalizedOpenOptions['workerMode'] {
+    if (value === undefined) return 'dedicated';
+    if (value !== 'dedicated' && value !== 'shared') {
+        throw new InvalidOpenOptionsError('workerMode must be dedicated or shared');
+    }
+    return value;
+}
+export function normalizeOptions(options: OpenOptions = {}): NormalizedOpenOptions {
     requirePlainOptionsObject(options);
     return {
+        workerMode: normalizeWorkerMode(options.workerMode),
         createIfMissing: normalizeBoolean(options.createIfMissing, 'createIfMissing', true),
         ownerWaitMs: normalizeNonNegativeInteger(options.ownerWaitMs, 'ownerWaitMs', 0),
         requestPersistence: normalizeBoolean(options.requestPersistence, 'requestPersistence', true),
@@ -139,7 +158,10 @@ function normalizeOptions(options: OpenOptions = {}): NormalizedOpenOptions {
 function sameChangeFeed(left: NormalizedOpenOptions['changeFeed'], right: NormalizedOpenOptions['changeFeed']) {
     return left?.enabled === right?.enabled && left?.retainTxids === right?.retainTxids;
 }
-function assertCompatibleOptions(dbName: string, current: NormalizedOpenOptions, next: NormalizedOpenOptions) {
+export function assertCompatibleOptions(dbName: string, current: NormalizedOpenOptions, next: NormalizedOpenOptions) {
+    if (current.workerMode !== next.workerMode) {
+        throw new InvalidOpenOptionsError(`database ${dbName} is already open with workerMode=${current.workerMode}`);
+    }
     if (current.cachePages !== next.cachePages) {
         throw new InvalidOpenOptionsError(
             `database ${dbName} is already open in this tab with cachePages=${current.cachePages}; requested cachePages=${next.cachePages}`
@@ -175,7 +197,7 @@ async function handlePersistenceBridgeRequest(port: MessagePort, request: Persis
     };
     port.postMessage(response);
 }
-function createMainThreadPersistenceBridge(worker: Worker): MainThreadPersistenceBridge {
+function createMainThreadPersistenceBridge(worker: WorkerTransport): MainThreadPersistenceBridge {
     const channel = new MessageChannel();
     const port = channel.port1;
     port.addEventListener('message', (event: MessageEvent<unknown>) => {
@@ -193,20 +215,35 @@ function createMainThreadPersistenceBridge(worker: Worker): MainThreadPersistenc
         }
     };
 }
-function createWorker(): {
-    worker: Worker;
-    proxy: WorkerProtocolClient;
+function createWorker(
+    dbName: string,
+    mode: NormalizedOpenOptions['workerMode'] = 'dedicated'
+): {
+    worker: RegistryEntry['worker'];
+    proxy: WorkerClient;
     persistenceBridge: MainThreadPersistenceBridge;
 } {
-    const worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
+    if (mode === 'shared') {
+        if (typeof globalThis.SharedWorker !== 'function') {
+            throw new UnsupportedPlatformError('SharedWorker is unavailable; workerMode=shared cannot be opened');
+        }
+        const sharedWorker = new SharedWorker(new URL('./shared-worker.ts', import.meta.url), {
+            type: 'module',
+            name: `moyodb:${dbName}`
+        });
+        const proxy = new SharedWorkerProtocolClient(sharedWorker);
+        const persistenceBridge = { close() {} };
+        return { worker: { terminate: () => sharedWorker.port.close() }, proxy, persistenceBridge };
+    }
+    const worker = new Worker(new URL('./browser-worker.ts', import.meta.url), { type: 'module' });
     const proxy = new WorkerProtocolClient(worker);
     const persistenceBridge = createMainThreadPersistenceBridge(worker);
     return { worker, proxy, persistenceBridge };
 }
 function createEntry(
     dbName: string,
-    worker: Worker,
-    proxy: WorkerProtocolClient,
+    worker: RegistryEntry['worker'],
+    proxy: WorkerClient,
     persistenceBridge: MainThreadPersistenceBridge,
     options: NormalizedOpenOptions
 ): RegistryEntry {
@@ -222,6 +259,7 @@ function createEntry(
         txInvalidationListeners: new Set(),
         handleInvalidationListeners: new Set()
     };
+    proxy.setTransactionsInvalidatedHandler?.(() => invalidateTransactions(entry));
     proxy.setFatalHandler(() => {
         const current = registry.get(dbName);
         if (current !== entry || entry.invalidated) {
@@ -231,7 +269,7 @@ function createEntry(
         entry.refs = 0;
         invalidateEntry(entry);
         entry.persistenceBridge.close();
-        entry.worker.terminate();
+        void entry.worker.terminate();
     });
     return entry;
 }
@@ -272,8 +310,9 @@ export function unsafeDebugCrashWorker(dbName: string): boolean {
     invalidateEntry(current);
     current.refs = 0;
     current.persistenceBridge.close();
+    current.proxy.crash?.();
     current.proxy.dispose(new Error('worker was terminated by unsafeDebugCrashWorker'));
-    current.worker.terminate();
+    void current.worker.terminate();
     return true;
 }
 export async function acquireDbWorker(dbName: string, options: OpenOptions = {}): Promise<RegistryEntry> {
@@ -299,7 +338,7 @@ export async function acquireDbWorker(dbName: string, options: OpenOptions = {})
                 return existing;
             }
         }
-        const { worker, proxy, persistenceBridge } = createWorker();
+        const { worker, proxy, persistenceBridge } = createWorker(dbName, normalized.workerMode);
         const entry = createEntry(dbName, worker, proxy, persistenceBridge, normalized);
         try {
             await proxy.open({
@@ -311,12 +350,13 @@ export async function acquireDbWorker(dbName: string, options: OpenOptions = {})
         } catch (error) {
             persistenceBridge.close();
             proxy.dispose(new Error('worker open failed'));
-            worker.terminate();
+            await worker.terminate();
             throw normalizeError(error);
         }
     });
 }
 export async function releaseDbWorker(entry: RegistryEntry): Promise<void> {
+    if (entry.release) return entry.release();
     return queueLifecycleOperation(entry.dbName, async () => {
         if (entry.invalidated || registry.get(entry.dbName) !== entry) {
             return;
@@ -331,16 +371,31 @@ export async function releaseDbWorker(entry: RegistryEntry): Promise<void> {
         } finally {
             entry.persistenceBridge.close();
             entry.proxy.dispose(new Error('worker was released'));
-            entry.worker.terminate();
+            await entry.worker.terminate();
         }
     });
 }
 export async function destroyDbWorker(entry: RegistryEntry): Promise<void> {
+    if (entry.destroy) return entry.destroy();
     return queueLifecycleOperation(entry.dbName, () => destroyEntry(entry));
 }
 async function destroyEntry(entry: RegistryEntry): Promise<void> {
     if (entry.invalidated || registry.get(entry.dbName) !== entry) {
         throw new DatabaseClosedError();
+    }
+    if (entry.options.workerMode === 'shared') {
+        try {
+            await entry.proxy.destroy();
+        } catch (error) {
+            throw normalizeError(error);
+        }
+        registry.delete(entry.dbName);
+        invalidateEntry(entry);
+        entry.refs = 0;
+        entry.persistenceBridge.close();
+        entry.proxy.dispose(new Error('worker was released'));
+        await entry.worker.terminate();
+        return;
     }
     registry.delete(entry.dbName);
     invalidateEntry(entry);
@@ -352,7 +407,7 @@ async function destroyEntry(entry: RegistryEntry): Promise<void> {
     } finally {
         entry.persistenceBridge.close();
         entry.proxy.dispose(new Error('worker was released'));
-        entry.worker.terminate();
+        await entry.worker.terminate();
     }
 }
 export async function deleteDbByName(dbName: string): Promise<void> {
@@ -362,7 +417,7 @@ export async function deleteDbByName(dbName: string): Promise<void> {
             await destroyEntry(current);
             return;
         }
-        const { worker, proxy, persistenceBridge } = createWorker();
+        const { worker, proxy, persistenceBridge } = createWorker(dbName);
         try {
             await proxy.deleteDB(dbName);
         } catch (error) {
@@ -370,7 +425,7 @@ export async function deleteDbByName(dbName: string): Promise<void> {
         } finally {
             persistenceBridge.close();
             proxy.dispose(new Error('temporary worker was terminated'));
-            worker.terminate();
+            await worker.terminate();
         }
     });
 }

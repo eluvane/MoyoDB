@@ -27,6 +27,7 @@ import {
     deserializeWorkerError,
     decodeWorkerResponsePayload,
     isWorkerProtocolReadyMessage,
+    isWorkerProtocolReadyEnvelope,
     isWorkerProtocolResponseBatchMessage,
     isWorkerProtocolResponseMessage,
     prepareWorkerCommandPayload,
@@ -62,6 +63,29 @@ function clearPendingTimeout(pending: PendingRequest): void {
 
 export interface WorkerProtocolClientOptions {
     requestTimeoutMs?: number;
+    readyTimeoutMs?: number;
+}
+
+export interface WorkerTransport {
+    postMessage(message: unknown, transfer?: Transferable[]): void;
+    addEventListener(type: string, listener: EventListenerOrEventListenerObject): void;
+    removeEventListener(type: string, listener: EventListenerOrEventListenerObject): void;
+}
+
+export interface WorkerClient extends WorkerApi {
+    autocommit<M extends AutocommitCommand>(
+        mode: TxMode,
+        command: M,
+        args: AutocommitArgs<M>
+    ): Promise<WorkerCommandResult<M>>;
+    request<M extends WorkerCommand>(command: M, args: WorkerCommandArgs<M>): Promise<WorkerCommandResult<M>>;
+    setFatalHandler(handler: ((error: Error) => void) | null): void;
+    whenReady(): Promise<void>;
+    dispose(reason?: Error): void;
+    acquireMigration?(): Promise<void>;
+    releaseMigration?(): Promise<void>;
+    setTransactionsInvalidatedHandler?(handler: (() => void) | null): void;
+    crash?(): void;
 }
 
 export class WorkerProtocolClient implements WorkerApi {
@@ -80,9 +104,10 @@ export class WorkerProtocolClient implements WorkerApi {
     private queuedBytes = 0;
     private flushScheduled = false;
     private awaitingReady = 0;
+    private readyTimeout: ReturnType<typeof setTimeout> | null = null;
 
     constructor(
-        private readonly worker: Worker,
+        private readonly worker: WorkerTransport,
         options: WorkerProtocolClientOptions = {}
     ) {
         this.requestTimeoutMs = options.requestTimeoutMs ?? 0;
@@ -90,9 +115,15 @@ export class WorkerProtocolClient implements WorkerApi {
             this.readyResolve = resolve;
             this.readyReject = reject;
         });
-        this.worker.addEventListener('message', this.handleMessage);
+        if ((options.readyTimeoutMs ?? 0) > 0) {
+            this.readyTimeout = setTimeout(() => {
+                this.fail(workerProtocolError('WorkerReadyTimeoutError', 'worker did not become ready'));
+            }, options.readyTimeoutMs);
+        }
+        void this.ready.catch(() => undefined);
+        this.worker.addEventListener('message', this.handleMessage as EventListener);
         this.worker.addEventListener('messageerror', this.handleMessageError);
-        this.worker.addEventListener('error', this.handleError);
+        this.worker.addEventListener('error', this.handleError as EventListener);
     }
 
     setFatalHandler(handler: ((error: Error) => void) | null): void {
@@ -105,6 +136,10 @@ export class WorkerProtocolClient implements WorkerApi {
 
     dispose(reason: Error = workerProtocolError('WorkerTerminatedError', 'worker transport was closed')): void {
         this.disposeInternal(reason, false);
+    }
+
+    protected fail(reason: Error): void {
+        this.disposeInternal(reason, true);
     }
 
     open(request: WorkerOpenRequest): Promise<void> {
@@ -215,8 +250,8 @@ export class WorkerProtocolClient implements WorkerApi {
         return this.request('scanByIndexPage', [txId, store, indexName, range, cursor, limit]);
     }
 
-    getIndexes(): Promise<IndexDef[]> {
-        return this.request('getIndexes', []);
+    getIndexes(txId?: number): Promise<IndexDef[]> {
+        return this.request('getIndexes', txId === undefined ? [] : [txId]);
     }
 
     reconcileIndexes(txId: number, indexes: IndexDef[]): Promise<void> {
@@ -404,9 +439,15 @@ export class WorkerProtocolClient implements WorkerApi {
             if (this.readyResolved) return;
             this.batching = data.batching === 1;
             this.readyResolved = true;
+            if (this.readyTimeout) clearTimeout(this.readyTimeout);
+            this.readyTimeout = null;
             this.readyResolve?.();
             this.readyResolve = null;
             this.readyReject = null;
+            return;
+        }
+        if (isWorkerProtocolReadyEnvelope(data)) {
+            this.fail(workerProtocolError('WorkerProtocolError', 'incompatible worker protocol ready message'));
             return;
         }
         if (isWorkerProtocolResponseBatchMessage(data)) {
@@ -418,7 +459,7 @@ export class WorkerProtocolClient implements WorkerApi {
             data.type === WORKER_PROTOCOL_RESPONSE_BATCH &&
             data.version === WORKER_PROTOCOL_VERSION
         ) {
-            this.disposeInternal(workerProtocolError('WorkerProtocolError', 'invalid worker response batch'), true);
+            this.fail(workerProtocolError('WorkerProtocolError', 'invalid worker response batch'));
             return;
         }
         this.handleResponse(data);
@@ -459,10 +500,7 @@ export class WorkerProtocolClient implements WorkerApi {
     }
 
     private handleMessageError = (): void => {
-        this.disposeInternal(
-            workerProtocolError('WorkerMessageError', 'worker message could not be deserialized'),
-            true
-        );
+        this.fail(workerProtocolError('WorkerMessageError', 'worker message could not be deserialized'));
     };
 
     private handleError = (event: ErrorEvent): void => {
@@ -470,7 +508,7 @@ export class WorkerProtocolClient implements WorkerApi {
             event.error instanceof Error
                 ? event.error
                 : workerProtocolError('WorkerError', event.message || 'worker runtime failed');
-        this.disposeInternal(error, true);
+        this.fail(error);
     };
 
     private rejectPending(id: number, error: Error): void {
@@ -489,9 +527,11 @@ export class WorkerProtocolClient implements WorkerApi {
         }
         this.closed = true;
         this.closeReason = reason;
-        this.worker.removeEventListener('message', this.handleMessage);
+        this.worker.removeEventListener('message', this.handleMessage as EventListener);
         this.worker.removeEventListener('messageerror', this.handleMessageError);
-        this.worker.removeEventListener('error', this.handleError);
+        this.worker.removeEventListener('error', this.handleError as EventListener);
+        if (this.readyTimeout) clearTimeout(this.readyTimeout);
+        this.readyTimeout = null;
         if (!this.readyResolved) {
             this.readyReject?.(reason);
         }

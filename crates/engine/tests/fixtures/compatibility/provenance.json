@@ -1,0 +1,55 @@
+{
+  "baselineRelease": "1.0.1",
+  "baselineCommit": "33ddfbfbf72f74443ce698010f083c78aa9931ea",
+  "baselineRustPackageVersion": "1.0.0",
+  "storageFormat": 1,
+  "snapshotWriteVersion": 3,
+  "snapshotReadVersions": [1, 2, 3],
+  "dbName": "compatibility-release-1.0.1",
+  "binaryFiles": {
+    "checkpoint-main.bin": {
+      "bytes": 73728,
+      "sha256": "bfd92cb0b47fe588c8ac8d934bc90464a4571082ce60214715d1306a5eb7378c"
+    },
+    "checkpoint-manifest.bin": {
+      "bytes": 8192,
+      "sha256": "1ec401c958e9edc9f847a6af7947265f708384217245793df29e26032350d3f2"
+    },
+    "checkpoint-wal.bin": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "recovery-main.bin": {
+      "bytes": 4096,
+      "sha256": "37ec86309693beb04c5aa52cc92c79b96794ad08f6b78fd51c3019c446ec65f0"
+    },
+    "recovery-manifest.bin": {
+      "bytes": 8192,
+      "sha256": "6bb62eb0a4f692ab4124c721cc176777b5d72e1d6b0d3fc7eaa7e3a96b10a8d2"
+    },
+    "recovery-wal.bin": {
+      "bytes": 70408,
+      "sha256": "8f134f689866b14686c94e4425d5c55a8feb31b4d542752a2cb228fa6f9f9c00"
+    },
+    "snapshot-v1.bin": {
+      "bytes": 108,
+      "sha256": "0f6bf810ee8dd6da2eabf7b53741183b3f5ad789fe8f0cb67cb9a7b7395544c8"
+    },
+    "snapshot-v2.bin": {
+      "bytes": 116,
+      "sha256": "9704edbae6264e19aa8aa19d10affae607aad01f974fd713553b17b2389e2648"
+    },
+    "snapshot-v3.bin": {
+      "bytes": 14236,
+      "sha256": "a9c01b8cd4562ffbb35e48e5003c1027490e240d32781de42fe1953387d72a40"
+    }
+  },
+  "sdkGolden": {
+    "path": "packages/sdk/tests/compatibility-golden.json",
+    "sha256": "b4be3021f8aed347da4cd3c47e96cea7786c9e28a39363493490e6bf4880b7d3"
+  },
+  "sdkPublicTypes": {
+    "path": "packages/sdk/tests/compatibility-v1-types.ts",
+    "sha256": "79027a74abc62968e77ce960a1d71462dd4383dc89012937083630ff1126a01d"
+  }
+}

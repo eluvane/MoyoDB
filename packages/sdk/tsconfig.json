@@ -13,7 +13,7 @@
     "strict": true,
     "noUnusedLocals": false,
     "noUnusedParameters": false,
-    "types": ["vite/client", "@playwright/test"]
+    "types": ["vite/client", "@playwright/test", "node"]
   },
-  "include": ["src", "tests", "bench", "vite.config.ts", "playwright.config.ts"]
+  "include": ["src", "tests", "bench", "vite.config.ts", "vite.node.config.ts", "playwright.config.ts"]
 }

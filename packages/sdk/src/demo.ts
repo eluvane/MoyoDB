@@ -1,5 +1,6 @@
 import {
     compoundKey,
+    createSqlClient,
     compoundKeyRange,
     deleteDB,
     indexKey,
@@ -19,6 +20,7 @@ declare global {
     interface Window {
         moyodb: {
             openDB: typeof openDB;
+            createSqlClient: typeof createSqlClient;
             deleteDB: typeof deleteDB;
             utf8Encode: typeof utf8Encode;
             utf8Decode: typeof utf8Decode;
@@ -37,6 +39,7 @@ declare global {
 
 window.moyodb = {
     openDB,
+    createSqlClient,
     deleteDB,
     utf8Encode,
     utf8Decode,

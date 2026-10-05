@@ -87,7 +87,7 @@ export interface WorkerApi {
         cursor: Uint8Array | null,
         limit: number
     ) => Promise<IndexScanPage>;
-    getIndexes: () => Promise<IndexDef[]>;
+    getIndexes: (txId?: number) => Promise<IndexDef[]>;
     reconcileIndexes: (txId: number, indexes: IndexDef[]) => Promise<void>;
     listStores: () => Promise<string[]>;
     getVersion: () => Promise<number>;

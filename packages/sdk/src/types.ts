@@ -38,6 +38,7 @@ export interface IndexDef {
     unique?: boolean;
 }
 export interface OpenOptions {
+    workerMode?: 'dedicated' | 'shared';
     createIfMissing?: boolean;
     ownerWaitMs?: number;
     requestPersistence?: boolean;
@@ -125,6 +126,7 @@ export interface ScanItem {
 }
 export interface Transaction {
     readonly mode: TxMode;
+    listIndexes?(): Promise<IndexDef[]>;
     get(store: string, key: Uint8Array): Promise<Uint8Array | null>;
     getMany(store: string, keys: Array<Uint8Array>): Promise<Array<Uint8Array | null>>;
     has(store: string, key: Uint8Array): Promise<boolean>;
@@ -154,6 +156,7 @@ export interface DB {
     dropStore(name: string): Promise<void>;
     clearStore(name: string): Promise<void>;
     listStores(): Promise<string[]>;
+    listIndexes?(): Promise<IndexDef[]>;
     getVersion(): Promise<number>;
     changesSince(txid: TxId, options?: ChangeFeedOptions): Promise<ChangeFeed>;
     get(store: string, key: Uint8Array): Promise<Uint8Array | null>;

@@ -208,22 +208,15 @@ try {
         join(output, 'worker-server.mjs'),
         'export let runtime; export function exposeWorkerApi(api) { runtime = api; }\n'
     );
-    // Close the runtime created at import to release its persistence bridge.
     const importEnvironment = createEnvironment();
-    await import(pathToFileURL(join(output, 'worker.mjs')).href);
-    const { runtime: initial } = await import(pathToFileURL(join(output, 'worker-server.mjs')).href);
-    const WorkerRuntime = initial.constructor;
-    await initial.close();
+    const { DbWorker: WorkerRuntime } = await import(pathToFileURL(join(output, 'worker.mjs')).href);
     importEnvironment.assertClean();
 
     async function fixture(options, body) {
         const env = createEnvironment(options);
         const runtimes = [];
         const makeRuntime = () => {
-            const runtime = new WorkerRuntime();
-            // TypeScript emits this private field as a normal property.
-            // Replace WASM loading while retaining DbWorker.open control flow.
-            runtime.wasmReady = Promise.resolve(env.wasm);
+            const runtime = new WorkerRuntime({ loadWasm: async () => env.wasm });
             runtimes.push(runtime);
             return runtime;
         };

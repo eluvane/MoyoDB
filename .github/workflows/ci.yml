@@ -261,8 +261,10 @@ jobs:
         run: npm run test:rust
       - name: Run OPFS shim tests
         run: npm run test:shim
-      - name: Run SDK browser tests
+      - name: Run SDK Node and browser tests
         run: npm run test:sdk
+      - name: Verify Node and native storage interoperability
+        run: cargo test --locked -p moyodb-engine --test file_backend node_native_file_format_roundtrip_through_active_generation -- --ignored
       - name: Run opt-in soak tests
         if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.full_quality || inputs.run_soak))
         run: npm run test:browser:soak --workspace @moyodb/sdk

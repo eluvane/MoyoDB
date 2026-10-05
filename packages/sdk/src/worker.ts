@@ -1,4 +1,4 @@
-import { exposeWorkerApi } from './worker-server';
+export { exposeWorkerApi } from './worker-server';
 import {
     packedOptionalValues,
     unpackPackedBatchOpKeys,
@@ -167,9 +167,18 @@ type WasmEngine = {
     stats(): unknown;
     set_failpoint(failpoint: string | null): void;
 };
-type WasmModule = {
+export type WasmModule = {
     default: (
-        options?: string | URL | Request | { module_or_path?: string | URL | Request | Promise<Response> | Response }
+        options?:
+            | string
+            | URL
+            | Request
+            | BufferSource
+            | WebAssembly.Module
+            | {
+                  module_or_path?:
+                      string | URL | Request | BufferSource | WebAssembly.Module | Promise<Response> | Response;
+              }
     ) => Promise<unknown>;
     deleteDB(name: string): Promise<void>;
     prepareRebuildTarget(name: string): Promise<{
@@ -188,6 +197,15 @@ type WasmModule = {
     WasmEngine: new () => WasmEngine;
 };
 type WasmU64 = bigint;
+export interface WorkerPersistenceBridge {
+    persisted(): Promise<boolean>;
+    persist(): Promise<boolean>;
+    close(): void;
+}
+export interface DbWorkerOptions {
+    loadWasm?: () => Promise<WasmModule>;
+    persistence?: WorkerPersistenceBridge;
+}
 function toWasmU64(value: number | bigint): WasmU64 {
     return BigInt(value);
 }
@@ -280,7 +298,7 @@ function isPersistenceBridgeResponse(value: unknown): value is PersistenceBridge
         typeof value.granted === 'boolean'
     );
 }
-class MainThreadPersistenceBridge {
+class MainThreadPersistenceBridge implements WorkerPersistenceBridge {
     private port: MessagePort | null = null;
     private nextRequestId = 1;
     private pending = new Map<
@@ -565,13 +583,13 @@ class OwnershipLease {
         }
     }
 }
-class DbWorker implements WorkerApi {
+export class DbWorker implements WorkerApi {
     private dbName: string | null = null;
     private engine: WasmEngine | null = null;
     private events: BroadcastChannel | null = null;
     private lease: OwnershipLease | null = null;
     private wasmReady: Promise<WasmModule> | null = null;
-    private persistenceBridge = new MainThreadPersistenceBridge();
+    private persistenceBridge: WorkerPersistenceBridge;
     private txChanges = new Map<number, TrackedTxnChanges>();
     private txModes = new Map<number, TxMode>();
     /**
@@ -587,6 +605,9 @@ class DbWorker implements WorkerApi {
     private committedStoreCompression: ReadonlyMap<string, CompressionOption> | null = null;
     private openOptions: WorkerOpenRequest['options'] | null = null;
     private maintenanceOperation: MaintenanceOperation | null = null;
+    constructor(private readonly options: DbWorkerOptions = {}) {
+        this.persistenceBridge = options.persistence ?? new MainThreadPersistenceBridge();
+    }
     async open(request: WorkerOpenRequest): Promise<void> {
         if (this.engine) {
             return;
@@ -1198,8 +1219,10 @@ class DbWorker implements WorkerApi {
         const def = this.resolveIndexDefinition(txId, store, indexName);
         return this.loadVisibleIndexPage(txId, def, range, cursor, limit);
     }
-    getIndexes(): Promise<IndexDef[]> {
-        return Promise.resolve(toPublicIndexDefinitions(this.loadCommittedIndexSchema()));
+    getIndexes(txId?: number): Promise<IndexDef[]> {
+        return Promise.resolve(
+            toPublicIndexDefinitions(txId === undefined ? this.loadCommittedIndexSchema() : this.indexSchemaForTx(txId))
+        );
     }
     async reconcileIndexes(txId: number, indexes: IndexDef[]): Promise<void> {
         const target = normalizeIndexDefinitions(indexes);
@@ -2305,17 +2328,19 @@ class DbWorker implements WorkerApi {
     }
     private async loadWasm(): Promise<WasmModule> {
         if (!this.wasmReady) {
-            this.wasmReady = (async () => {
-                // Absolute URLs stay outside Vite's ?import transform, which rejects JS in /public.
-                const moduleUrl = new URL('/engine/moyodb_engine.js', import.meta.url).href;
-                const wasmUrl = new URL('/engine/moyodb_engine_bg.wasm', import.meta.url).href;
-                const wasmModule = (await import(
-                    /* @vite-ignore */
-                    moduleUrl
-                )) as WasmModule;
-                await wasmModule.default({ module_or_path: wasmUrl });
-                return wasmModule;
-            })();
+            this.wasmReady = this.options.loadWasm
+                ? this.options.loadWasm()
+                : (async () => {
+                      // Absolute URLs stay outside Vite's ?import transform, which rejects JS in /public.
+                      const moduleUrl = new URL('/engine/moyodb_engine.js', import.meta.url).href;
+                      const wasmUrl = new URL('/engine/moyodb_engine_bg.wasm', import.meta.url).href;
+                      const wasmModule = (await import(
+                          /* @vite-ignore */
+                          moduleUrl
+                      )) as WasmModule;
+                      await wasmModule.default({ module_or_path: wasmUrl });
+                      return wasmModule;
+                  })();
         }
         return this.wasmReady;
     }
@@ -2488,4 +2513,3 @@ function remapError(err: unknown): Error {
     }
     return remoteError('Error', String(err));
 }
-exposeWorkerApi(new DbWorker());

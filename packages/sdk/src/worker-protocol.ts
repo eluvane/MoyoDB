@@ -200,7 +200,17 @@ export function isWorkerCommand(value: unknown): value is WorkerCommand {
 }
 
 export function isWorkerProtocolReadyMessage(value: unknown): value is WorkerProtocolReadyMessage {
-    return isRecord(value) && value.type === WORKER_PROTOCOL_READY && value.version === WORKER_PROTOCOL_VERSION;
+    return (
+        isWorkerProtocolReadyEnvelope(value) &&
+        value.version === WORKER_PROTOCOL_VERSION &&
+        (value.batching === undefined || value.batching === 1)
+    );
+}
+
+export function isWorkerProtocolReadyEnvelope(
+    value: unknown
+): value is { type: typeof WORKER_PROTOCOL_READY; version?: unknown; batching?: unknown } {
+    return isRecord(value) && value.type === WORKER_PROTOCOL_READY;
 }
 
 export function isWorkerProtocolResponseMessage(value: unknown): value is WorkerProtocolResponseMessage {
@@ -279,7 +289,7 @@ export function serializeWorkerError(error: unknown): SerializedWorkerError {
     };
 }
 
-export function deserializeWorkerError(error: SerializedWorkerError): Error {
+export function deserializeWorkerError(error: unknown): Error {
     if (
         !isRecord(error) ||
         typeof error.name !== 'string' ||

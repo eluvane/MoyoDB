@@ -6,6 +6,7 @@ const ignoredDirs = new Set([
     '.git',
     '.lake',
     '.npm',
+    '.tmp',
     'coverage',
     'dist',
     'node_modules',
