@@ -37,7 +37,7 @@ export type RecordBatchOp<K, V> = { kind: 'put'; key: K; value: V } | { kind: 'd
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
 const fatalDecoder = new TextDecoder('utf-8', { fatal: true });
-const NUMBER_MASK = 0xffffffffffffffffn;
+const NUMBER_MASK = (1n << 64n) - 1n;
 const NUMBER_SIGN = 1n << 63n;
 
 function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
