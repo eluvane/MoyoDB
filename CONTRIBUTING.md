@@ -13,3 +13,36 @@ Each submission must include the following acknowledgment, using the pull reques
 Identify any third-party material in the submission. Material you cannot license under these terms requires a separate arrangement with the licensor before incorporation. Contributions without the acknowledgment must not be merged.
 
 For licensing questions or a separate agreement, contact [keiko1337@proton.me](mailto:keiko1337@proton.me).
+
+## Opening a pull request
+
+Keep each pull request focused on one concrete change. Use the [pull request template](.github/PULL_REQUEST_TEMPLATE.md), and keep unrelated cleanup and local build output out of the diff. The title and description should describe the final change for a reviewer who has not seen the development conversation.
+
+### Title
+
+Write a short, descriptive title in English, starting with an action and naming the affected behavior. For example, `Fix OPFS recovery after an interrupted checkpoint` or `Document SDK transaction boundaries`. Describe the concrete result; avoid generic titles and broad completion claims.
+
+### Description
+
+Use the prose style of [ouro pull request #118](https://github.com/eluvane/ouro/pull/118): compact English paragraphs that describe the final behavior, its implementation and material limits. Start directly with the concrete change and its effect. Use one or two connected paragraphs for most changes, grouping related behavior in the same paragraph. Add another paragraph only when a distinct part of the change needs it. Include a concrete trigger or before/after example when it makes the result clearer.
+
+Mention material compatibility, durability, security, performance, or release impact and limitations only when they apply. Breaking changes need migration guidance. Describe the final implementation and keep the title and description aligned with its scope; omit conversational history and abandoned approaches unless they explain a relevant tradeoff.
+
+Do not add description headings such as `Summary`, `Changes`, `Testing` or `Contribution terms`, bullet inventories, technical checklists or a list of validation commands. Omit empty template scaffolding and unsupported claims such as “fully safe” or “production-ready.” Keep detailed commands and execution evidence in CI output or the accompanying task report. If a missing or failed check materially limits confidence in the change, state that limitation briefly in the prose.
+
+Append the required contribution acknowledgment as a native task-list checkbox after the prose, without a separate heading. This checkbox is the only required checklist item; it remains mandatory regardless of the size or type of change. Identify third-party material and its license terms in the prose, or state that there is none. When updating an existing pull request, preserve the contributor's acknowledgment and checkbox state.
+
+### Coding agents
+
+Follow the same title and description rules, including the ouro #118 prose format. Describe the final diff for a reviewer who has not read the conversation; do not replace the requested prose with a sectioned report. Create branches and pull requests only when requested, preserve any supplied branch, title, and base, and do not merge without an explicit maintainer instruction. Local documentation or code edits do not by themselves authorize publishing a pull request.
+
+## Markdown style
+
+Use visible dashes for unordered prose items in Markdown files and pull request descriptions. Escape the marker with a backslash (`\-`), and use a trailing backslash between adjacent items so GitHub keeps each item on its own line:
+
+```markdown
+\- First item\
+\- Second item
+```
+
+Preserve task-list checkboxes, numbered steps, tables, and code examples in their native syntax. Report generators must follow the same dash convention in their Markdown output.
