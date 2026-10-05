@@ -189,18 +189,20 @@ if (childCommand) {
         await new Promise((resolve, reject) => {
             const timeout = setTimeout(() => reject(new Error('Node subscription did not receive commit')), 3000);
             const finish = () => {
-                if (events.length === 0) return;
+                if (events.length < 2) return;
+                stop();
                 clearTimeout(timeout);
                 resolve();
             };
-            const stop = other.subscribe('data', () => {
-                stop();
-                finish();
-            });
+            const stop = other.subscribe('data', finish);
             void other.put('data', utf8Encode('event'), utf8Encode('seen')).catch(reject);
         });
         unsubscribe();
         assert.equal(events.length, 2);
+        assert.deepEqual(
+            events.map((changes) => changes.map((change) => text(change.key))),
+            [['key'], ['event']]
+        );
         assert.equal(text(await other.get('data', key)), 'independent');
         await other.close();
 
