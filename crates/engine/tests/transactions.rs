@@ -116,12 +116,15 @@ fn absent_delete_preserves_staged_ttl_cleanup_and_later_puts() -> Result<(), Eng
 }
 
 #[test]
-fn second_write_tx_is_rejected() {
+fn second_write_tx_can_open_and_rollback_independently() {
     let (_bundle, mut engine) = common::open_memory_engine("txn-c");
     let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
-    let err = engine.begin_tx(TxMode::Readwrite).unwrap_err();
-    assert!(matches!(err, EngineError::WriteTransactionAlreadyOpen));
+    let second = engine.begin_tx(TxMode::Readwrite).unwrap();
+    assert_eq!(engine.stats().unwrap().active_txns, 2);
     engine.rollback_tx(tx).unwrap();
+    assert!(engine.stats().unwrap().write_tx_open);
+    engine.rollback_tx(second).unwrap();
+    assert!(!engine.stats().unwrap().write_tx_open);
 }
 
 #[test]

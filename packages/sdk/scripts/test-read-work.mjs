@@ -47,10 +47,10 @@ try {
     await cp(join(here, '../tests/read-work-suite.mjs'), join(output, 'read-suite.mjs'));
     await writeFile(
         join(output, 'read-suite-loader.mjs'),
-        `import './worker.mjs';
-import { runtime } from './worker-server.mjs';
+        `import { DbWorker } from './worker.mjs';
 import * as compression from './compression.mjs';
 import { createReadSuite } from './read-suite.mjs';
+const runtime = new DbWorker();
 export const suite = createReadSuite({ runtime, compression });
 `
     );
@@ -58,8 +58,8 @@ export const suite = createReadSuite({ runtime, compression });
         console.log(`Portable read fixture emitted to ${output}`);
     } else {
         globalThis.self = { addEventListener() {}, removeEventListener() {} };
-        await import(pathToFileURL(join(output, 'worker.mjs')).href);
-        runtime = (await import(pathToFileURL(join(output, 'worker-server.mjs')).href)).runtime;
+        const { DbWorker } = await import(pathToFileURL(join(output, 'worker.mjs')).href);
+        runtime = new DbWorker();
         const compression = await import(pathToFileURL(join(output, 'compression.mjs')).href);
         const result = await createReadSuite({ runtime, compression }).runTests(!args.includes('--semantics-only'));
         console.log(JSON.stringify({ source, node: process.version, ...result }, null, 2));

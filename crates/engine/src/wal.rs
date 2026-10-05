@@ -203,11 +203,23 @@ pub(crate) fn visit_wal_transactions<B: FileBackend>(
     while len.saturating_sub(offset) >= WAL_RECORD_HEADER_SIZE as u64 {
         let header: WalRecordHeader = {
             let bytes = reader.read(offset, WAL_RECORD_HEADER_SIZE)?;
-            if bytes[..4] != WAL_MAGIC {
+            if bytes[..4] != WAL_MAGIC
+                && !(bytes[..3] == WAL_MAGIC[..3] && bytes[3].is_ascii_digit())
+            {
                 break;
             }
             unsafe_read_struct(&bytes)?
         };
+        if header.magic != WAL_MAGIC {
+            // A complete foreign-version record must not be discarded as a torn tail.
+            if foreign_wal_checksum_matches(&mut reader, offset, len, &header)? {
+                return Err(wal_corruption(
+                    offset,
+                    &format!("unsupported WAL format version {}", header.magic[3] as char),
+                ));
+            }
+            break;
+        }
         let payload_len = u32::from_le(header.payload_len) as usize;
         let Ok(tag) = WalTag::from_u8(header.tag) else {
             break;
@@ -308,6 +320,29 @@ pub(crate) fn visit_wal_transactions<B: FileBackend>(
         offset += total_len;
     }
     Ok(())
+}
+
+fn foreign_wal_checksum_matches<B: FileBackend>(
+    reader: &mut WalReadBuffer<'_, B>,
+    offset: u64,
+    file_len: u64,
+    header: &WalRecordHeader,
+) -> Result<bool> {
+    let total_len = WAL_RECORD_HEADER_SIZE as u64 + u32::from_le(header.payload_len) as u64;
+    if total_len > file_len - offset {
+        return Ok(false);
+    }
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&header.as_bytes()[..WAL_RECORD_CHECKSUM_OFFSET]);
+    hasher.update(&[0; 4]);
+    let mut position = offset + WAL_RECORD_HEADER_SIZE as u64;
+    let end = offset + total_len;
+    while position < end {
+        let count = (end - position).min(PAGE_SIZE as u64) as usize;
+        hasher.update(&reader.read(position, count)?);
+        position += count as u64;
+    }
+    Ok(hasher.finalize() == u32::from_le(header.checksum))
 }
 
 fn wal_corruption(offset: u64, message: &str) -> EngineError {

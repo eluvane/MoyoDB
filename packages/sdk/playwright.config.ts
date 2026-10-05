@@ -36,6 +36,7 @@ const outputProfile =
     ).process?.env?.MOYODB_PLAYWRIGHT_PROFILE ?? 'sdk';
 export default defineConfig({
     testDir: './tests',
+    testIgnore: '**/*.test.mjs',
     timeout: 60000,
     workers: isCi ? 1 : undefined,
     outputDir: `./test-results/${outputProfile}`,

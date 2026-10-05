@@ -289,7 +289,6 @@ pub struct Engine<B: FileBackend> {
     next_tx_id: u64,
     next_commit_txid: u64,
     txns: HashMap<u64, TransactionState>,
-    write_tx_open: Option<u64>,
     next_failpoint: Option<Failpoint>,
     cache_pages: usize,
     checkpoint_wal_bytes: u64,
@@ -312,7 +311,6 @@ impl<B: FileBackend> std::fmt::Debug for Engine<B> {
             .field("next_tx_id", &self.next_tx_id)
             .field("next_commit_txid", &self.next_commit_txid)
             .field("txns", &self.txns)
-            .field("write_tx_open", &self.write_tx_open)
             .field("next_failpoint", &self.next_failpoint)
             .field("cache_pages", &self.cache_pages)
             .field("health", &self.health)
@@ -368,7 +366,6 @@ impl<B: FileBackend> Engine<B> {
             next_tx_id: 1,
             next_commit_txid: 1,
             txns: HashMap::new(),
-            write_tx_open: None,
             next_failpoint: None,
             cache_pages,
             checkpoint_wal_bytes: config.checkpoint_wal_bytes.max(1),
@@ -442,7 +439,6 @@ impl<B: FileBackend> Engine<B> {
             EngineHealth::RecoveryRequired { pending_txid, .. } => *pending_txid,
         };
         self.txns.clear();
-        self.write_tx_open = None;
         self.next_failpoint = None;
         self.free_pages.clear();
         self.pager.discard_cache();
@@ -485,7 +481,6 @@ impl<B: FileBackend> Engine<B> {
             return Ok(());
         }
         self.txns.clear();
-        self.write_tx_open = None;
         let checkpoint = if self.health == EngineHealth::Healthy {
             self.checkpoint_inner(None)
         } else {
@@ -503,7 +498,6 @@ impl<B: FileBackend> Engine<B> {
             return Ok(());
         }
         self.txns.clear();
-        self.write_tx_open = None;
         let closed = self.close_files();
         self.health = EngineHealth::Closed;
         closed
@@ -584,9 +578,6 @@ impl<B: FileBackend> Engine<B> {
 
     pub fn begin_tx(&mut self, mode: TxMode) -> Result<u64> {
         self.ensure_healthy()?;
-        if mode == TxMode::Readwrite && self.write_tx_open.is_some() {
-            return Err(EngineError::WriteTransactionAlreadyOpen);
-        }
         let snapshot = Snapshot::new_shared(
             self.schema_version,
             self.superblock.catalog_root_page_id,
@@ -600,10 +591,7 @@ impl<B: FileBackend> Engine<B> {
             .ok_or_else(|| EngineError::Internal("transaction id overflow".into()))?;
         let tx = match mode {
             TxMode::Readonly => TransactionState::new_readonly(tx_id, snapshot),
-            TxMode::Readwrite => {
-                self.write_tx_open = Some(tx_id);
-                TransactionState::new_readwrite(tx_id, snapshot)
-            }
+            TxMode::Readwrite => TransactionState::new_readwrite(tx_id, snapshot),
         };
         self.txns.insert(tx_id, tx);
         Ok(tx_id)
@@ -617,12 +605,11 @@ impl<B: FileBackend> Engine<B> {
             .ok_or(EngineError::TransactionClosed)?;
         tx.ensure_open()?;
         tx.closed = true;
-        if self.write_tx_open == Some(tx_id) {
-            self.write_tx_open = None;
-        }
         Ok(())
     }
 
+    /// Rejects the commit if any commit advanced this transaction's snapshot.
+    /// A conflict closes the transaction before WAL writes. Retry with a new transaction.
     pub fn commit_tx(&mut self, tx_id: u64) -> Result<u64> {
         let tx = self.take_tx(tx_id)?;
         tx.ensure_open()?;
@@ -640,14 +627,16 @@ impl<B: FileBackend> Engine<B> {
             staged_schema_version,
             staged_change_feed_policy,
         } = write_tx;
+        if snapshot.last_committed_txid != self.superblock.last_committed_txid {
+            return Err(EngineError::TransactionConflict {
+                snapshot_txid: snapshot.last_committed_txid,
+                current_txid: self.superblock.last_committed_txid,
+            });
+        }
         // Release the writer's snapshot before publication. Keeping it would
         // force a catalog copy even with no readers of the current version.
         drop(snapshot);
-        let result = self.commit_staged(stores, staged_schema_version, staged_change_feed_policy);
-        if self.write_tx_open == Some(tx_id) {
-            self.write_tx_open = None;
-        }
-        result
+        self.commit_staged(stores, staged_schema_version, staged_change_feed_policy)
     }
 
     pub fn schema_version(&self) -> u64 {
@@ -1216,7 +1205,7 @@ impl<B: FileBackend> Engine<B> {
             main_len: self.pager.len()?,
             wal_len: self.wal.len()?,
             active_txns: self.txns.len(),
-            write_tx_open: self.write_tx_open.is_some(),
+            write_tx_open: self.txns.values().any(|tx| tx.mode == TxMode::Readwrite),
             cache_pages: self.cache_pages,
             dirty_pages: self.pager.dirty_page_count(),
             reusable_pages: self.free_pages.ready.len(),

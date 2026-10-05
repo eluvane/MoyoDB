@@ -36,6 +36,8 @@ pub use engine::RecoveryReport;
 pub use engine::ScanRange;
 pub use error::EngineError;
 pub use error::Result;
+#[cfg(not(target_arch = "wasm32"))]
+pub use storage::file::NativeFileBackend;
 pub use storage::memory::MemoryBackend;
 pub use storage::memory::MemoryBundle;
 pub use txn::BatchOp;

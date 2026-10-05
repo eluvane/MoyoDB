@@ -74,6 +74,10 @@ class TransactionImpl implements Transaction {
         this.mode = mode;
         this.#onClose = onClose;
     }
+    async listIndexes(): Promise<IndexDef[]> {
+        this.#ensureOpen();
+        return callProxy(() => this.#entry.proxy.getIndexes(this.#txId));
+    }
     async get(store: string, key: Uint8Array): Promise<Uint8Array | null> {
         this.#ensureOpen();
         assertPublicStoreName(store);
@@ -227,7 +231,7 @@ class DBImpl implements DB {
     #unsubscribeHandleInvalidated: (() => void) | null = null;
     constructor(entry: RegistryEntry) {
         this.#entry = entry;
-        this.#subscriptions = new SubscriptionHub(entry.dbName);
+        this.#subscriptions = new SubscriptionHub(entry.dbName, entry.channelName);
         this.#unsubscribeTxInvalidated = subscribeTransactionsInvalidated(entry, () => {
             this.#forceCloseTransactions();
         });
@@ -269,6 +273,10 @@ class DBImpl implements DB {
     async listStores(): Promise<string[]> {
         this.#ensureOpen();
         return callProxy(() => this.#entry.proxy.listStores());
+    }
+    async listIndexes(): Promise<IndexDef[]> {
+        this.#ensureOpen();
+        return callProxy(() => this.#entry.proxy.getIndexes());
     }
     async getVersion(): Promise<number> {
         this.#ensureOpen();
@@ -397,7 +405,7 @@ class DBImpl implements DB {
     }
     async destroy(): Promise<void> {
         this.#ensureOpen();
-        return callProxy(() => destroyDbWorker(this.#entry));
+        return callProxy(() => this.#entry.destroy?.() ?? destroyDbWorker(this.#entry));
     }
     async setFailpoint(failpoint: DebugFailpoint): Promise<void> {
         this.#ensureOpen();
@@ -472,7 +480,7 @@ class DBImpl implements DB {
             }
         }
         try {
-            await releaseDbWorker(this.#entry);
+            await (this.#entry.release?.() ?? releaseDbWorker(this.#entry));
         } catch (error) {
             throw normalizeError(error);
         }
@@ -540,6 +548,9 @@ class MigrationTransactionImpl implements Transaction {
     }
     get mode(): TxMode {
         return this.#inner.mode;
+    }
+    async listIndexes(): Promise<IndexDef[]> {
+        return this.#inner.listIndexes();
     }
     async get(store: string, key: Uint8Array): Promise<Uint8Array | null> {
         return this.#inner.get(store, key);
@@ -615,6 +626,9 @@ class MigrationDbImpl implements DB {
     }
     async listStores(): Promise<string[]> {
         return this.#tracker.apply(await this.#db.listStores());
+    }
+    async listIndexes(): Promise<IndexDef[]> {
+        return this.#transaction.listIndexes();
     }
     async getVersion(): Promise<number> {
         return this.#db.getVersion();
@@ -834,7 +848,7 @@ function assertMainThreadCapabilities() {
         throw new UnsupportedPlatformError('moyodb requires a secure context (HTTPS)');
     }
     const nav = globalThis.navigator;
-    if (typeof nav.storage.getDirectory !== 'function') {
+    if (typeof nav?.storage?.getDirectory !== 'function') {
         throw new UnsupportedPlatformError('navigator.storage.getDirectory is unavailable');
     }
     if (typeof globalThis.Worker !== 'function') {
@@ -851,6 +865,17 @@ async function requestPersistentStorageOnOpen(options: OpenOptions): Promise<voi
     }
 }
 export async function openDB(name: string, options: OpenOptions = {}): Promise<DB> {
+    return openDBWithWorker(name, options, async (dbName, normalizedOptions) => {
+        assertMainThreadCapabilities();
+        await requestPersistentStorageOnOpen(normalizedOptions);
+        return acquireDbWorker(dbName, normalizedOptions);
+    });
+}
+export async function openDBWithWorker(
+    name: string,
+    options: OpenOptions,
+    acquire: (name: string, options: OpenOptions) => Promise<RegistryEntry>
+): Promise<DB> {
     const dbName = normalizeDatabaseName(name, 'openDB');
     const normalizedOptions = normalizeOpenOptionsInput(options);
     const requestedVersion = normalizeSchemaVersion(normalizedOptions.version);
@@ -862,51 +887,54 @@ export async function openDB(name: string, options: OpenOptions = {}): Promise<D
     if (requestedVersion === undefined && requestedIndexes !== undefined) {
         throw new InvalidOpenOptionsError('indexes requires version');
     }
-    assertMainThreadCapabilities();
-    await requestPersistentStorageOnOpen(normalizedOptions);
-    const entry = await acquireDbWorker(dbName, normalizedOptions);
+    const entry = await acquire(dbName, normalizedOptions);
     const db = new DBImpl(entry);
     try {
-        if (requestedVersion === undefined) {
-            return db;
-        }
-        const [currentVersion, currentIndexes] = await Promise.all([db.getVersion(), loadNormalizedIndexes(entry)]);
-        if (requestedVersion < currentVersion) {
-            throw new VersionError(
-                `cannot open database ${dbName} at schema version ${requestedVersion}; current schema version is ${currentVersion}`
-            );
-        }
-        if (requestedVersion === currentVersion) {
-            if (requestedIndexes !== undefined && !indexDefinitionsMatch(requestedIndexes, currentIndexes)) {
+        await entry.proxy.acquireMigration?.();
+        try {
+            if (requestedVersion === undefined) {
+                return db;
+            }
+            const [currentVersion, currentIndexes] = await Promise.all([db.getVersion(), loadNormalizedIndexes(entry)]);
+            if (requestedVersion < currentVersion) {
                 throw new VersionError(
-                    `database ${dbName} is already at schema version ${currentVersion}, but the requested index catalog does not match the committed schema`
+                    `cannot open database ${dbName} at schema version ${requestedVersion}; current schema version is ${currentVersion}`
                 );
             }
+            if (requestedVersion === currentVersion) {
+                if (requestedIndexes !== undefined && !indexDefinitionsMatch(requestedIndexes, currentIndexes)) {
+                    throw new VersionError(
+                        `database ${dbName} is already at schema version ${currentVersion}, but the requested index catalog does not match the committed schema`
+                    );
+                }
+                return db;
+            }
+            if (entry.refs > 1) {
+                throw new DatabaseBusyError(
+                    `database ${dbName} is already open in this tab; close existing handles before migrating from version ${currentVersion} to ${requestedVersion}`
+                );
+            }
+            if (!migrate) {
+                throw new VersionError(
+                    `database ${dbName} requires migration from version ${currentVersion} to ${requestedVersion}, but no migrate hook was provided`
+                );
+            }
+            const targetIndexes = requestedIndexes ?? currentIndexes;
+            entry.schemaMigrationInProgress = true;
+            try {
+                await db.runSchemaMigration(
+                    currentVersion,
+                    requestedVersion,
+                    migrate,
+                    toPublicIndexDefinitions(targetIndexes)
+                );
+            } finally {
+                entry.schemaMigrationInProgress = false;
+            }
             return db;
-        }
-        if (entry.refs > 1) {
-            throw new DatabaseBusyError(
-                `database ${dbName} is already open in this tab; close existing handles before migrating from version ${currentVersion} to ${requestedVersion}`
-            );
-        }
-        if (!migrate) {
-            throw new VersionError(
-                `database ${dbName} requires migration from version ${currentVersion} to ${requestedVersion}, but no migrate hook was provided`
-            );
-        }
-        const targetIndexes = requestedIndexes ?? currentIndexes;
-        entry.schemaMigrationInProgress = true;
-        try {
-            await db.runSchemaMigration(
-                currentVersion,
-                requestedVersion,
-                migrate,
-                toPublicIndexDefinitions(targetIndexes)
-            );
         } finally {
-            entry.schemaMigrationInProgress = false;
+            await entry.proxy.releaseMigration?.();
         }
-        return db;
     } catch (error) {
         try {
             await db.close();
@@ -926,4 +954,8 @@ export function unsafeDebugCrashWorker(name: string): boolean {
 export * from './codec';
 export * from './errors';
 export * from './indexing';
+export * from './records';
+export * from './sql';
+export { SqlSyntaxError } from './sql-parser';
+export type * from './sql-types';
 export type * from './types';

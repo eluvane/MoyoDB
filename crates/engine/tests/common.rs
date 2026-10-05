@@ -27,7 +27,7 @@ pub fn hex(bytes: &[u8]) -> String {
 
 pub fn from_hex(hex: &str) -> Vec<u8> {
     assert!(
-        hex.len() % 2 == 0,
+        hex.len().is_multiple_of(2),
         "hex string must have even length in proof artifact: {hex}"
     );
     (0..hex.len())

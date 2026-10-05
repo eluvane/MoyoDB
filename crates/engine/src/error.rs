@@ -16,6 +16,11 @@ pub enum EngineError {
     StoreNotFound(String),
     #[error("write transaction already open")]
     WriteTransactionAlreadyOpen,
+    #[error("transaction conflict: snapshot txid {snapshot_txid}, current txid {current_txid}")]
+    TransactionConflict {
+        snapshot_txid: u64,
+        current_txid: u64,
+    },
     #[error("readonly transaction cannot commit")]
     ReadonlyTransaction,
     #[error("transaction is already closed")]
@@ -55,6 +60,7 @@ impl EngineError {
             EngineError::StoreExists(_) => "StoreExistsError",
             EngineError::StoreNotFound(_) => "StoreNotFoundError",
             EngineError::WriteTransactionAlreadyOpen => "WriteTransactionAlreadyOpenError",
+            EngineError::TransactionConflict { .. } => "TransactionConflictError",
             EngineError::ReadonlyTransaction => "ReadonlyTransactionError",
             EngineError::TransactionClosed => "TransactionClosedError",
             EngineError::ValueTooLarge(_) => "ValueTooLargeError",

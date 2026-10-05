@@ -81,11 +81,11 @@ export function unwrapSnapshotCompression() { throw new Error('snapshot codec is
     await writeFile(
         join(output, 'suite-loader.mjs'),
         `
-import './worker.mjs';
-import { runtime } from './worker-server.mjs';
+import { DbWorker } from './worker.mjs';
 import * as indexing from './indexing.mjs';
 import * as codec from './codec.mjs';
 import { createSuite } from './suite.mjs';
+const runtime = new DbWorker();
 export const suite = createSuite({ runtime, indexing, codec });
 `
     );
@@ -93,12 +93,10 @@ export const suite = createSuite({ runtime, indexing, codec });
         console.log(`Portable fixture emitted to ${output}`);
     } else {
         globalThis.self = { addEventListener() {}, removeEventListener() {} };
-        await import(pathToFileURL(join(output, 'worker.mjs')).href);
-        const [{ runtime }, indexing, codec] = await Promise.all(
-            ['worker-server', 'indexing', 'codec'].map(
-                (name) => import(pathToFileURL(join(output, `${name}.mjs`)).href)
-            )
+        const [{ DbWorker }, indexing, codec] = await Promise.all(
+            ['worker', 'indexing', 'codec'].map((name) => import(pathToFileURL(join(output, `${name}.mjs`)).href))
         );
+        const runtime = new DbWorker();
         const suite = createSuite({ runtime, indexing, codec });
         const mode = args.includes('--measure-only')
             ? 'measure'

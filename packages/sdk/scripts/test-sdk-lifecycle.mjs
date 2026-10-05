@@ -234,10 +234,16 @@ try {
         'subscriptions',
         'change-events',
         'worker-client',
+        'shared-worker-client',
+        'shared-worker-protocol',
         'worker-server',
         'worker-protocol',
         'codec',
         'indexing',
+        'records',
+        'sql',
+        'sql-parser',
+        'sql-types',
         'errors',
         'internal'
     ]) {

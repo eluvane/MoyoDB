@@ -3,7 +3,7 @@ name = "moyodb-engine"
 version = "1.0.0"
 edition = "2021"
 license-file = "../../LICENSE"
-description = "Experimental Rust/WASM transactional key-value storage engine for browser apps."
+description = "Rust/WASM transactional storage engine for browser and native file runtimes."
 repository = "https://github.com/eluvane/MoyoDB"
 readme = "../../README.md"
 

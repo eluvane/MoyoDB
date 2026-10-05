@@ -36,6 +36,13 @@ export interface WorkerServerHandle {
     close(): void;
 }
 
+export interface WorkerServerScope {
+    postMessage(message: unknown, transfer?: Transferable[]): void;
+    addEventListener(type: 'message', listener: (event: MessageEvent<unknown>) => void): void;
+    removeEventListener(type: 'message', listener: (event: MessageEvent<unknown>) => void): void;
+    readonly location: { readonly origin: string };
+}
+
 /** The first argument identifies the transaction lane. */
 const TRANSACTION_COMMANDS = new Set<WorkerCommand>([
     'commit',
@@ -55,6 +62,7 @@ const TRANSACTION_COMMANDS = new Set<WorkerCommand>([
     'getByIndex',
     'scanByIndex',
     'scanByIndexPage',
+    'getIndexes',
     'reconcileIndexes',
     'setSchemaVersion'
 ]);
@@ -156,7 +164,7 @@ class ResponseQueue {
     private flushChannel: MessageChannel | null = null;
     private closed = false;
 
-    constructor(private readonly scope: DedicatedWorkerGlobalScope) {}
+    constructor(private readonly scope: WorkerServerScope) {}
 
     enqueue: SendResponse = (response, transfer = []) => {
         if (this.closed) return;
@@ -224,10 +232,7 @@ class ResponseQueue {
     }
 }
 
-export function exposeWorkerApi(
-    api: WorkerApi,
-    scope: DedicatedWorkerGlobalScope = self as DedicatedWorkerGlobalScope
-): WorkerServerHandle {
+export function exposeWorkerApi(api: WorkerApi, scope: WorkerServerScope = self): WorkerServerHandle {
     const scheduler = new RequestScheduler();
     const responses = new ResponseQueue(scope);
     const handleMessage = (event: MessageEvent<unknown>) => {
@@ -264,7 +269,7 @@ export function exposeWorkerApi(
 }
 
 async function dispatchWorkerRequest(
-    scope: DedicatedWorkerGlobalScope,
+    scope: WorkerServerScope,
     api: WorkerApi,
     scheduler: RequestScheduler,
     data: unknown,
@@ -419,7 +424,7 @@ function errorResponse(id: number, error: unknown): WorkerProtocolErrorMessage {
 }
 
 function postWorkerResponse(
-    scope: DedicatedWorkerGlobalScope,
+    scope: WorkerServerScope,
     response: WorkerProtocolResponseMessage | WorkerProtocolResponseBatchMessage,
     transfer: Transferable[] = []
 ): void {

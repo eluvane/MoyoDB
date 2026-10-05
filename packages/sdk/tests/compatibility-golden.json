@@ -1,0 +1,216 @@
+{
+  "release": "1.0.1",
+  "commit": "33ddfbfbf72f74443ce698010f083c78aa9931ea",
+  "exports": [
+    "ChangeFeedCompactedError",
+    "ConstraintError",
+    "CorruptionError",
+    "DatabaseBusyError",
+    "DatabaseClosedError",
+    "INDEX_METADATA_STORE",
+    "IndexNotFoundError",
+    "InjectedFailureError",
+    "InternalError",
+    "InvalidOpenOptionsError",
+    "InvalidRangeError",
+    "KeyTooLargeError",
+    "MoyoDbError",
+    "ReadonlyTransactionError",
+    "RecoveryRequiredError",
+    "ReservedStoreNameError",
+    "SerializationError",
+    "StorageError",
+    "StoreExistsError",
+    "StoreNameTooLongError",
+    "StoreNotFoundError",
+    "TransactionClosedError",
+    "UniqueIndexConstraintError",
+    "UnsupportedPlatformError",
+    "ValueTooLargeError",
+    "VersionError",
+    "WriteTransactionAlreadyOpenError",
+    "assertPublicStoreName",
+    "cloneNormalizedIndexDefinitions",
+    "compareNormalizedIndexDefinitions",
+    "compoundKey",
+    "compoundKeyRange",
+    "createIndexKeyExtractor",
+    "decodeIndexEntryKey",
+    "decodeIndexMetadataValue",
+    "decodeIndexedDocument",
+    "deleteDB",
+    "encodeCompoundKeyParts",
+    "encodeIndexEntryKey",
+    "encodeIndexMetadataKey",
+    "encodeIndexMetadataValue",
+    "encodeIndexScalar",
+    "extractLogicalIndexKey",
+    "extractLogicalIndexKeyFromDocument",
+    "findIndexDefinition",
+    "indexDefinitionIdentity",
+    "indexKey",
+    "indexKeyExactRange",
+    "indexRangeToPhysicalRange",
+    "indexesForStore",
+    "isInternalStoreName",
+    "jsonDecode",
+    "jsonEncode",
+    "normalizeError",
+    "normalizeIndexDefinitions",
+    "openDB",
+    "prefixRange",
+    "prefixSuccessor",
+    "serializeNormalizedIndexDefinitions",
+    "splitCompoundKey",
+    "toPublicIndexDefinitions",
+    "u64Key",
+    "unsafeDebugCrashWorker",
+    "utf8Decode",
+    "utf8Encode"
+  ],
+  "errors": [
+    {
+      "export": "ChangeFeedCompactedError",
+      "name": "ChangeFeedCompactedError"
+    },
+    {
+      "export": "ConstraintError",
+      "name": "ConstraintError"
+    },
+    {
+      "export": "CorruptionError",
+      "name": "CorruptionError"
+    },
+    {
+      "export": "DatabaseBusyError",
+      "name": "DatabaseBusyError"
+    },
+    {
+      "export": "DatabaseClosedError",
+      "name": "DatabaseClosedError"
+    },
+    {
+      "export": "IndexNotFoundError",
+      "name": "IndexNotFoundError"
+    },
+    {
+      "export": "InjectedFailureError",
+      "name": "InjectedFailureError"
+    },
+    {
+      "export": "InternalError",
+      "name": "InternalError"
+    },
+    {
+      "export": "InvalidOpenOptionsError",
+      "name": "InvalidOpenOptionsError"
+    },
+    {
+      "export": "InvalidRangeError",
+      "name": "InvalidRangeError"
+    },
+    {
+      "export": "KeyTooLargeError",
+      "name": "KeyTooLargeError"
+    },
+    {
+      "export": "ReadonlyTransactionError",
+      "name": "ReadonlyTransactionError"
+    },
+    {
+      "export": "RecoveryRequiredError",
+      "name": "RecoveryRequiredError"
+    },
+    {
+      "export": "ReservedStoreNameError",
+      "name": "ReservedStoreNameError"
+    },
+    {
+      "export": "SerializationError",
+      "name": "SerializationError"
+    },
+    {
+      "export": "StorageError",
+      "name": "StorageError"
+    },
+    {
+      "export": "StoreExistsError",
+      "name": "StoreExistsError"
+    },
+    {
+      "export": "StoreNameTooLongError",
+      "name": "StoreNameTooLongError"
+    },
+    {
+      "export": "StoreNotFoundError",
+      "name": "StoreNotFoundError"
+    },
+    {
+      "export": "TransactionClosedError",
+      "name": "TransactionClosedError"
+    },
+    {
+      "export": "UniqueIndexConstraintError",
+      "name": "UniqueIndexConstraintError"
+    },
+    {
+      "export": "UnsupportedPlatformError",
+      "name": "UnsupportedPlatformError"
+    },
+    {
+      "export": "ValueTooLargeError",
+      "name": "ValueTooLargeError"
+    },
+    {
+      "export": "VersionError",
+      "name": "VersionError"
+    },
+    {
+      "export": "WriteTransactionAlreadyOpenError",
+      "name": "WriteTransactionAlreadyOpenError"
+    }
+  ],
+  "scalarKeys": [
+    "10",
+    "20",
+    "21",
+    "303fdbffffffffffff",
+    "308000000000000000",
+    "30bff8000000000000",
+    "40",
+    "406100d18f",
+    "5000ff"
+  ],
+  "compoundKey": "100000200000210000303fdbffffffffffff0000308000ff00ff00ff00ff00ff00ff00ff000030bff800ff00ff00ff00ff00ff00ff0000400000406100ffd18f00005000ffff0000",
+  "rawCompound": "00ffff00000000",
+  "u64Keys": ["0000000000000000", "0000000000000001", "0000000100000000", "ffffffffffffffff"],
+  "json": "7b226c6162656c223a22d18f5c7530303030222c226e6573746564223a5b6e756c6c2c747275652c375d7d",
+  "metadataStore": "__browserdb:indexes",
+  "indexMetadata": [
+    {
+      "public": {
+        "store": "people",
+        "name": "by-city-age",
+        "keyPath": ["address.city", "age"],
+        "unique": false
+      },
+      "internalStore": "__browserdb:index:cGVvcGxl:YnktY2l0eS1hZ2U",
+      "key": "70656f706c65000062792d636974792d6167650000",
+      "value": "7b2273746f7265223a2270656f706c65222c226e616d65223a2262792d636974792d616765222c226b657950617468223a5b22616464726573732e63697479222c22616765225d2c22756e69717565223a66616c73657d",
+      "logicalKey": "40d09cd0bed181d0bad0b2d0b0000030c04500ff00ff00ff00ff00ff00ff0000"
+    },
+    {
+      "public": {
+        "store": "people",
+        "name": "by-email",
+        "keyPath": "email",
+        "unique": true
+      },
+      "internalStore": "__browserdb:index:cGVvcGxl:YnktZW1haWw",
+      "key": "70656f706c65000062792d656d61696c0000",
+      "value": "7b2273746f7265223a2270656f706c65222c226e616d65223a2262792d656d61696c222c226b657950617468223a22656d61696c222c22756e69717565223a747275657d",
+      "logicalKey": "4061406578616d706c652e74657374"
+    }
+  ],
+  "indexEntry": "406100ffd18f000000ff01ff0000"
+}
