@@ -6,11 +6,9 @@ Submit changes to the official [eluvane/MoyoDB repository](https://github.com/el
 
 Contributors retain ownership of their original work. Section 9 grants the licensor, Eluvane, broad, irrevocable, royalty-free copyright permissions, including commercial use, sublicensing, transfer, and relicensing. Section 10 governs patent permissions. These grants do not entitle contributors to payment or revenue sharing unless separately agreed in writing or required by applicable law.
 
-Each submission must include the following acknowledgment, using the pull request checkbox or the accompanying submission message:
+By knowingly submitting a Contribution with notice of Section 9, you accept its contribution terms. Contribution and patent grants remain governed by Sections 9 and 10. The default workflow does not require a separate acceptance statement or checkbox in the pull request or an accompanying message.
 
-> I have read and accept Sections 9 and 10 of the Mother of Licenses 1.0 for this contribution. I own the submitted material or am authorized to grant the required rights. I have identified any third-party material and its license terms.
-
-Identify any third-party material in the submission. Material you cannot license under these terms requires a separate arrangement with the licensor before incorporation. Contributions without the acknowledgment must not be merged.
+Submit only material you own or are authorized to contribute. Identify known third-party material and its license terms in the submission. Material you cannot license under these terms requires a separate arrangement with the licensor before incorporation.
 
 For licensing questions or a separate agreement, contact [keiko1337@proton.me](mailto:keiko1337@proton.me).
 
@@ -30,7 +28,7 @@ Mention material compatibility, durability, security, performance, or release im
 
 Do not add description headings such as `Summary`, `Changes`, `Testing` or `Contribution terms`, bullet inventories, technical checklists or a list of validation commands. Omit empty template scaffolding and unsupported claims such as “fully safe” or “production-ready.” Keep detailed commands and execution evidence in CI output or the accompanying task report. If a missing or failed check materially limits confidence in the change, state that limitation briefly in the prose.
 
-Append the required contribution acknowledgment as a native task-list checkbox after the prose, without a separate heading. This checkbox is the only required checklist item; it remains mandatory regardless of the size or type of change. Identify third-party material and its license terms in the prose, or state that there is none. When updating an existing pull request, preserve the contributor's acknowledgment and checkbox state.
+Keep the pull request description as prose only, matching ouro #118. Do not append license-acceptance statements, contribution checkboxes or other boilerplate footers. Identify third-party material and its license terms in the prose when applicable; do not add a declaration when no such material is included.
 
 ### Coding agents
 

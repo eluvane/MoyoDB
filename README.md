@@ -66,4 +66,4 @@ MoL permits royalty-free use, including commercial use of unmodified code or Aut
 
 ## Contributing
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) and the license before submitting changes. Contributions must include explicit acceptance of the contribution and patent terms in Sections 9 and 10.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) and Sections 9 and 10 of the license before submitting changes. The contribution and patent terms apply upon submission; no separate acceptance statement or PR checkbox is required by default.

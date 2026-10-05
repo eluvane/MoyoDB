@@ -57,6 +57,109 @@ function run(directory, script, args = []) {
 }
 
 const workflowScript = '.config/moyo/quality/check-workflows.mjs';
+const packageLintScript = '.config/moyo/quality/check-package-json.mjs';
+const markdownLintScript = '.config/moyo/quality/check-markdown.mjs';
+const lintCollector = '.config/moyo/quality/collect-lint-files.mjs';
+
+function packageLintFixture(t) {
+    const directory = fixture(t, [packageLintScript, lintCollector]);
+    copyFileSync(join(root, '.config/moyo/lints/npm-package-json-lint.json'), join(directory, 'rules.json'));
+    write(
+        directory,
+        '.config/moyo/lints/npm-package-json-lint.json',
+        readFileSync(join(directory, 'rules.json'), 'utf8')
+    );
+    write(directory, '.config/moyo/formatters/prettierignore', 'node_modules/\n.tmp/\n');
+    write(directory, 'package.json', {
+        name: 'lint-fixture',
+        version: '1.0.0',
+        description: 'Package lint fixture',
+        license: 'SEE LICENSE IN LICENSE',
+        scripts: {},
+        repository: {},
+        keywords: [],
+        engines: {}
+    });
+    return directory;
+}
+
+test('package lint checks nested manifests while excluding dependency and temporary files', (t) => {
+    const directory = packageLintFixture(t);
+    write(directory, 'packages/child/package.json', readFileSync(join(directory, 'package.json'), 'utf8'));
+    write(directory, 'node_modules/bad/package.json', 'invalid');
+    write(directory, '.tmp/bad/package.json', 'invalid');
+    const result = run(directory, packageLintScript);
+    assert.equal(result.status, 0, result.output);
+    assert.match(result.output, /2 files checked/u);
+});
+
+test('package lint preserves required-field errors and nonblocking warnings', (t) => {
+    const directory = packageLintFixture(t);
+    const manifest = JSON.parse(readFileSync(join(directory, 'package.json'), 'utf8'));
+    delete manifest.repository;
+    write(directory, 'package.json', manifest);
+    const warning = run(directory, packageLintScript);
+    assert.equal(warning.status, 0, warning.output);
+    assert.match(warning.output, /warning require-repository/u);
+    delete manifest.name;
+    write(directory, 'package.json', manifest);
+    const missing = run(directory, packageLintScript);
+    assert.equal(missing.status, 1, missing.output);
+    assert.match(missing.output, /error require-name/u);
+});
+
+test('package lint rejects duplicate JSON properties before parsing can hide them', (t) => {
+    const directory = packageLintFixture(t);
+    const original = readFileSync(join(directory, 'package.json'), 'utf8');
+    write(directory, 'package.json', original.replace('"scripts":{}', '"scripts":{"a":1,"a":2}'));
+    const result = run(directory, packageLintScript);
+    assert.equal(result.status, 1, result.output);
+    assert.match(result.output, /no-duplicate-properties.*a/u);
+});
+
+test('package lint rejects incompatible licenses, unsorted dependencies and invalid JSON', (t) => {
+    const directory = packageLintFixture(t);
+    const manifest = JSON.parse(readFileSync(join(directory, 'package.json'), 'utf8'));
+    manifest.license = 'UNLICENSED';
+    manifest.dependencies = { z: '1.0.0', a: '1.0.0' };
+    manifest.devDependencies = { z: '1.0.0', a: '1.0.0' };
+    write(directory, 'package.json', manifest);
+    const policy = run(directory, packageLintScript);
+    assert.equal(policy.status, 1, policy.output);
+    assert.match(policy.output, /valid-values-license/u);
+    assert.match(policy.output, /prefer-alphabetical-dependencies/u);
+    assert.match(policy.output, /prefer-alphabetical-devDependencies/u);
+    write(directory, 'packages/invalid/package.json', '{');
+    const malformed = run(directory, packageLintScript);
+    assert.equal(malformed.status, 1, malformed.output);
+    assert.match(malformed.output, /valid-json/u);
+});
+
+test('package lint fails on unsupported policy rules instead of skipping them', (t) => {
+    const directory = packageLintFixture(t);
+    write(directory, '.config/moyo/lints/npm-package-json-lint.json', { rules: { 'unknown-policy': 'error' } });
+    const result = run(directory, packageLintScript);
+    assert.notEqual(result.status, 0, result.output);
+    assert.match(result.output, /Unsupported package lint rule/u);
+});
+
+test('Markdown lint checks hidden documentation and preserves configured exclusions', (t) => {
+    const directory = fixture(t, [markdownLintScript, lintCollector]);
+    write(directory, '.config/moyo/lints/markdownlint-cli2.jsonc', {
+        config: { default: false, MD018: true },
+        globs: ['**/*.md', '!.tmp/**', '!node_modules/**']
+    });
+    write(directory, 'README.md', '# Heading\n');
+    write(directory, '.tmp/bad.md', '#Bad heading\n');
+    write(directory, 'node_modules/bad/README.md', '#Bad heading\n');
+    const valid = run(directory, markdownLintScript);
+    assert.equal(valid.status, 0, valid.output);
+    write(directory, '.config/README.md', '#Bad heading\n');
+    const hidden = run(directory, markdownLintScript);
+    assert.equal(hidden.status, 1, hidden.output);
+    assert.match(hidden.output, /MD018/u);
+});
+
 function workflow(action) {
     return `permissions: {}\njobs:\n  check:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: ${action}\n`;
 }
