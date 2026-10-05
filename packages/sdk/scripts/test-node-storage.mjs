@@ -484,4 +484,27 @@ if (!isMainThread) {
         await run('invalid-path', path);
         assert.deepEqual([...fs.readFileSync(path)], [47]);
     });
+
+    test('lease cleanup ignores ENOTDIR and preserves other filesystem errors', () => {
+        const path = directory('cleanup-file');
+        fs.writeFileSync(path, new Uint8Array([53]));
+        const leasePath = lockDirectory(fs.realpathSync(path));
+        const original = fs.lstatSync;
+        try {
+            for (const code of ['ENOTDIR', 'EACCES']) {
+                fs.lstatSync = (target, ...args) => {
+                    if (target === leasePath) throw Object.assign(new Error('injected lease lookup failure'), { code });
+                    return original(target, ...args);
+                };
+                if (code === 'ENOTDIR') {
+                    assert.equal(releaseNodeStorageLease(path, randomUUID()), false);
+                } else {
+                    assert.throws(() => releaseNodeStorageLease(path, randomUUID()), { name: 'StorageError', code });
+                }
+                assert.deepEqual([...fs.readFileSync(path)], [53]);
+            }
+        } finally {
+            fs.lstatSync = original;
+        }
+    });
 }

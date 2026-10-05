@@ -227,6 +227,7 @@ export function releaseNodeStorageLease(directory, lockToken) {
         canonical = fs.realpathSync(path);
         lease = readLease(canonical, lockToken);
     } catch (error) {
+        if (error?.code === 'ENOTDIR') return false;
         if (error?.code === 'ENOENT') {
             if (!canonical) return false;
             const removedPending = removePendingLease(canonical, lockToken);

@@ -65,7 +65,7 @@ function decodeScalarKey(bytes: Uint8Array): CompoundKeyPart {
             }
             const view = new DataView(bytes.buffer, bytes.byteOffset + 1, 8);
             const ordered = view.getBigUint64(0, false);
-            const bits = (ordered & NUMBER_SIGN) !== 0n ? ordered ^ NUMBER_SIGN : ~ordered & NUMBER_MASK;
+            const bits = (ordered & NUMBER_SIGN) !== 0n ? ordered ^ NUMBER_SIGN : ordered ^ NUMBER_MASK;
             const buffer = new ArrayBuffer(8);
             const decoded = new DataView(buffer);
             decoded.setBigUint64(0, bits, false);
