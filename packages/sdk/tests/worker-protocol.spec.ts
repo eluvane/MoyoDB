@@ -410,6 +410,39 @@ test('transaction_through_worker_without_comlink', async ({ page }) => {
     expect(result).toBe('tx-value');
 });
 
+test('unknown batch operation kind rejects without deleting stored data', async ({ page }) => {
+    const dbName = uniqueDbName('invalid-batch-kind');
+    await prepareMoyoDbPage(page);
+    const result = await page.evaluate(async (name) => {
+        const db = await window.moyodb.openDB(name, { requestPersistence: false });
+        const encode = window.moyodb.utf8Encode;
+        try {
+            await db.createStore('kv');
+            await db.put('kv', encode('saved'), encode('keep'));
+            const tx = await db.begin('readwrite');
+            const ops = [
+                { kind: 'put', key: encode('new'), value: encode('must not be written') },
+                { kind: 'remove', key: encode('saved') }
+            ] as unknown as Parameters<typeof tx.applyBatch>[1];
+            let errorName: string | null = null;
+            try {
+                await tx.applyBatch('kv', ops);
+            } catch (error) {
+                errorName = error instanceof Error ? error.name : String(error);
+            }
+            await tx.commit();
+            const values = await db.getMany('kv', [encode('saved'), encode('new')]);
+            return {
+                errorName,
+                values: values.map((value) => (value === null ? null : window.moyodb.utf8Decode(value)))
+            };
+        } finally {
+            await db.close();
+        }
+    }, dbName);
+    expect(result).toEqual({ errorName: 'WorkerProtocolError', values: ['keep', null] });
+});
+
 test('recovery_open_through_worker_without_comlink', async ({ page }) => {
     const dbName = uniqueDbName('no-comlink-recovery');
     await prepareMoyoDbPage(page);
@@ -422,7 +455,7 @@ test('recovery_open_through_worker_without_comlink', async ({ page }) => {
             try {
                 await db.put('kv', window.moyodb.utf8Encode('after'), window.moyodb.utf8Encode('crashy'));
             } catch {
-                // Expected failpoint.
+                // The write is expected to fail after its WAL flush.
             }
         } finally {
             await db.close().catch(() => undefined);

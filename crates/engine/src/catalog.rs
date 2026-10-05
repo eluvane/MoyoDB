@@ -11,12 +11,12 @@ const CHANGE_FEED_FLOOR_TXID_ENCODED_LEN: usize = 8;
 const CHANGE_FEED_POLICY_ENCODED_LEN: usize = 16;
 const CHANGE_FEED_POLICY_FLAG_DISABLED: u64 = 1 << 0;
 
-// Legacy on-disk namespace preserved for storage-format compatibility; do not rename without a migration.
+// Keep these on-disk keys for format compatibility. Renaming requires a migration.
 pub const CATALOG_SCHEMA_VERSION_KEY: &[u8] = b"\xffbrowserdb:schema_version";
 pub const CATALOG_CHANGE_FEED_FLOOR_TXID_KEY: &[u8] = b"\xffbrowserdb:change_feed_floor_txid";
 pub const CATALOG_CHANGE_FEED_POLICY_KEY: &[u8] = b"\xffbrowserdb:change_feed_policy";
 
-/// Transactions of history kept when a database has never configured retention.
+/// Default number of committed transactions retained in the change log.
 pub const DEFAULT_CHANGE_FEED_RETAIN_TXIDS: u64 = 100_000;
 
 pub type CatalogMap = BTreeMap<String, StoreMetadata>;

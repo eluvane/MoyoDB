@@ -92,8 +92,7 @@ function buildEnvelope(magic: Uint8Array, kindTag: number, rawLength: number, pa
     out.set(payload, ENVELOPE_HEADER_SIZE);
     return out;
 }
-// Take one ownership snapshot before suspension. Compression and its fallback
-// share it; wrapping it in a Blob would copy the same input a second time.
+// Copy before the stream can suspend so caller mutations cannot change its input.
 function copyBytes(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
     const copy = new Uint8Array(bytes.byteLength);
     copy.set(bytes);
@@ -105,7 +104,7 @@ function byteStream(bytes: Uint8Array<ArrayBuffer>): ReadableStream<Uint8Array<A
         pull(controller) {
             if (offset < bytes.byteLength) {
                 const end = Math.min(offset + 64 * 1024, bytes.byteLength);
-                // Views preserve backpressure without another ownership copy.
+                // The stream owns the input; chunk views need no further copies.
                 controller.enqueue(bytes.subarray(offset, end));
                 offset = end;
             }
@@ -115,14 +114,23 @@ function byteStream(bytes: Uint8Array<ArrayBuffer>): ReadableStream<Uint8Array<A
         }
     });
 }
-function readEnvelopeHeader(magic: Uint8Array, bytes: Uint8Array): EnvelopeHeader | null {
-    if (bytes.byteLength < ENVELOPE_HEADER_SIZE) {
+function readEnvelopeHeader(magic: Uint8Array, bytes: Uint8Array, strict = true): EnvelopeHeader | null {
+    if (bytes.byteLength < magic.byteLength) {
         return null;
     }
     for (let index = 0; index < magic.byteLength; index += 1) {
         if (bytes[index] !== magic[index]) {
             return null;
         }
+    }
+    if (bytes.byteLength < ENVELOPE_HEADER_SIZE) {
+        if (strict) {
+            throw namedError(
+                'CorruptionError',
+                `truncated compression envelope: expected at least ${ENVELOPE_HEADER_SIZE} bytes, got ${bytes.byteLength}`
+            );
+        }
+        return null;
     }
     const view = new DataView(bytes.buffer, bytes.byteOffset, ENVELOPE_HEADER_SIZE);
     return {
@@ -215,6 +223,12 @@ export async function encodeStoreValueRecord(value: Uint8Array, compression: Com
     if (compression === false) {
         return value;
     }
+    if (value.byteLength > MAX_DECOMPRESSED_STORE_VALUE_BYTES) {
+        throw namedError(
+            'ValueTooLargeError',
+            `value has ${value.byteLength} bytes, exceeding the ${MAX_DECOMPRESSED_STORE_VALUE_BYTES} byte limit`
+        );
+    }
     if (value.byteLength < STORE_VALUE_COMPRESSION_THRESHOLD) {
         return buildEnvelope(STORE_RECORD_MAGIC, COMPRESSION_TAG_NONE, value.byteLength, value);
     }
@@ -231,7 +245,7 @@ export async function decodeStoreValueRecord(
         strict: boolean;
     }
 ): Promise<Uint8Array> {
-    const header = readEnvelopeHeader(STORE_RECORD_MAGIC, value);
+    const header = readEnvelopeHeader(STORE_RECORD_MAGIC, value, options.strict);
     if (!header) {
         return value;
     }

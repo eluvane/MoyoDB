@@ -139,7 +139,7 @@ def checkScenario (scenario : Json) (requiredId : String) (requiredFrames : Nat)
       let mutations ← parseMutations frame
       let expected := applyBatch state mutations
       let checked ← checkRawTree pages root expected
-      -- This projection forces the runtime path to use the proof-carrying checker.
+      -- Use the certificate's tree so the runtime path consumes the checked object.
       require (flatten depthBudget checked.tree == expected) "certificate content"
       let nextKnown := (known ++ mutations.map Prod.fst).eraseDups
       checkLookups frame expected nextKnown

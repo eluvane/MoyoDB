@@ -103,6 +103,16 @@ fn checked_end(start: usize, len: usize, what: &str) -> Result<usize> {
     })
 }
 
+fn resize_zeroed(bytes: &mut Vec<u8>, size: usize, what: &str) -> Result<()> {
+    if size > bytes.len() {
+        bytes.try_reserve(size - bytes.len()).map_err(|err| {
+            EngineError::Storage(format!("{what} allocation failed for {size} bytes: {err}"))
+        })?;
+    }
+    bytes.resize(size, 0);
+    Ok(())
+}
+
 impl MemoryFileState {
     fn mark_dirty(&mut self, mut start: usize, mut end: usize) {
         if start >= end {
@@ -152,10 +162,11 @@ impl FileBackend for MemoryBackend {
         }
         let start = to_index(offset, "read")?;
         let end = checked_end(start, len, "read")?;
+        let mut out = Vec::new();
+        resize_zeroed(&mut out, len, "read")?;
         if start >= state.working.len() {
-            return Ok(vec![0u8; len]);
+            return Ok(out);
         }
-        let mut out = vec![0u8; len];
         let available_end = end.min(state.working.len());
         let copied = available_end.saturating_sub(start);
         out[..copied].copy_from_slice(&state.working[start..available_end]);
@@ -173,9 +184,9 @@ impl FileBackend for MemoryBackend {
         let end = checked_end(start, bytes.len(), "write")?;
         let old_len = state.working.len();
         if end > old_len {
-            state.working.resize(end, 0);
-            // A shrink followed by regrowth must overwrite bytes still present
-            // in the previous durable image, including an empty sparse write.
+            resize_zeroed(&mut state.working, end, "write")?;
+            // The zero-filled gap must replace stale durable bytes after shrink
+            // and regrowth, including an empty sparse write.
             if start > old_len {
                 state.mark_dirty(old_len, start);
             }
@@ -190,11 +201,11 @@ impl FileBackend for MemoryBackend {
         if state.closed {
             return Err(EngineError::Storage("flush closed memory backend".into()));
         }
-        // Preserve durable-snapshot semantics and copy the union of dirty
-        // extents, without copying the clean gaps between sparse writes.
+        // Clean gaps retain their durable bytes. Sparse writes only require
+        // copies of the dirty extents.
         let working_len = state.working.len();
         if state.durable.len() != working_len {
-            state.durable.resize(working_len, 0);
+            resize_zeroed(&mut state.durable, working_len, "flush")?;
         }
         #[cfg(test)]
         let mut copied_bytes = 0;
@@ -242,7 +253,7 @@ impl FileBackend for MemoryBackend {
         }
         let size = to_index(size, "truncate")?;
         let old_len = state.working.len();
-        state.working.resize(size, 0);
+        resize_zeroed(&mut state.working, size, "truncate")?;
         if size > old_len {
             state.mark_dirty(old_len, size);
         }

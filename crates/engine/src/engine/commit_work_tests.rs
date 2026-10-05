@@ -67,8 +67,8 @@ fn scans_without_expiring_staged_values_skip_ttl_sweeps() -> Result<()> {
 #[test]
 fn ttl_sweep_preserves_future_expiry_and_never_revives_expired_values() -> Result<()> {
     let stage = StagedStore::created(STORE_FLAG_VALUE_ENVELOPE_V1);
-    // Deserialize must treat the TTL state as unknown, including when the
-    // public mutation map is subsequently populated outside write helpers.
+    // Deserialized TTL state must be unknown because callers can populate
+    // the public mutation map without using write helpers.
     let encoded =
         serde_json::to_vec(&stage).map_err(|err| EngineError::Serialization(err.to_string()))?;
     let mut stage: StagedStore = serde_json::from_slice(&encoded)
@@ -223,8 +223,7 @@ impl TtlCleanupFixture {
             .ok_or_else(|| EngineError::Internal("fixture missing early base key".into()))?;
         assert_eq!(cell.value_kind, ValueKind::Inline);
         assert_eq!(&cell.value[..8], &crate::value::VALUE_ENVELOPE_MAGIC);
-        // Expire an already committed base key at a fixed timestamp. Re-encode
-        // the leaf checksum so only the later page is structurally corrupt.
+        // Keep the expired key's leaf valid so only the later leaf is corrupt.
         cell.value[8..16].copy_from_slice(&1u64.to_le_bytes());
         let image = encode_leaf_page(
             first_leaf,
@@ -248,8 +247,8 @@ impl TtlCleanupFixture {
     }
 
     fn stage_expired_put(&mut self, tx_id: u64) -> Result<()> {
-        // The put's baseline lookup needs the healthy last leaf. Corrupt it
-        // only after the staged value exists, before either observation.
+        // The put's existence check needs a valid last leaf. Corrupt it only
+        // after staging the value, before the scan or batch check.
         self.repair()?;
         let mut tx = self.engine.take_tx(tx_id)?;
         let result = tx.readwrite_mut().and_then(|rw| {

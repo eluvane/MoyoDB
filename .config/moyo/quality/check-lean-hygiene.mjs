@@ -76,8 +76,8 @@ const banned = [
     { regex: /#eval!/u, label: '#eval! proof-hole bypass' },
     { regex: /^\s*import\s+all\b/mu, label: 'import all' },
     { regex: /set_option\s+autoImplicit\s+true/u, label: 'autoImplicit true' },
-    { regex: /set_option\s+linter\.[A-Za-z0-9_.]+\s+false/u, label: 'disabled Lean linter' },
-    { regex: /⟨`linter\.[A-Za-z0-9_.]+,\s*false⟩/u, label: 'disabled Lake linter option' },
+    { regex: /set_option\s+linter\.[\w.]+\s+false/u, label: 'disabled Lean linter' },
+    { regex: /⟨`linter\.[\w.]+,\s*false⟩/u, label: 'disabled Lake linter option' },
     { regex: /set_option\s+warningAsError\s+false/u, label: 'warnings allowed instead of errors' },
     { regex: /@\[[^\]]*\bnolint\b/u, label: 'suppressed Batteries linter' },
     { regex: /set_option\s+heron\.reelaborating\s+true/u, label: 'Heron analysis bypass' }

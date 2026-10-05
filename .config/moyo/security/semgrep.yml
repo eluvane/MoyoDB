@@ -23,6 +23,9 @@ rules:
     paths:
       include:
         - '**/crates/engine/src/**'
+      exclude:
+        - '**/crates/engine/src/**/*_tests.rs'
+        - '**/crates/engine/src/**/tests.rs'
     message: 'Avoid unwrap/expect in Rust engine core; propagate typed errors instead.'
     severity: WARNING
     pattern-either:

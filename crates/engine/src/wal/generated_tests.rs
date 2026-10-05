@@ -155,8 +155,7 @@ fn engine_commit_hashes_each_generated_page_payload_once() -> Result<()> {
             },
         )?;
         let setup = engine.begin_tx(TxMode::Readwrite)?;
-        // Isolate page-to-WAL reuse here. Paired user/change-feed payload
-        // hashing has separate coverage through the actual engine commit path.
+        // Disable change-feed hashing to measure page checksum reuse.
         engine.set_change_feed_policy(
             setup,
             crate::catalog::ChangeFeedPolicy {
@@ -178,8 +177,8 @@ fn engine_commit_hashes_each_generated_page_payload_once() -> Result<()> {
         let committed = transactions.last().expect("a durable commit");
         assert_eq!(committed.txid, txid);
         let pages = committed.page_images.len();
-        // Page creation retains its complete checksum. WAL appending hashes
-        // just the record prefixes; trusted cached input pages need no rehash.
+        // Page creation hashes each output page once. WAL encoding hashes record
+        // prefixes and the commit record; cached input pages are not rehashed.
         assert_eq!(
             hashed,
             pages * (PAGE_SIZE + prefix_len) + wal_record_total_len(WAL_COMMIT_BODY_SIZE),

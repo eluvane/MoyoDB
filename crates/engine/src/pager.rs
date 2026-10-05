@@ -4,12 +4,11 @@ use crate::page::verify_page_image;
 use crate::storage::backend::FileBackend;
 use std::collections::{HashMap, VecDeque};
 
-// Bound the extra copy buffer while amortizing native/OPFS backend crossings.
+// Limit the copy buffer while reducing native and OPFS backend calls.
 pub(crate) const PAGE_WRITE_BATCH_PAGES: usize = 64;
 
-// Checkpoint images are already pinned in memory. A larger bounded write buffer
-// avoids fragmenting those contiguous runs into hundreds of backend calls.
-// Recovery keeps its smaller bound because it also retains source/read buffers.
+// Checkpoint pages are already pinned, so use a larger write buffer.
+// Recovery also holds read buffers and uses the smaller batch limit.
 const DIRTY_PAGE_WRITE_BATCH_PAGES: usize = 1024;
 
 #[derive(Debug)]
@@ -19,15 +18,14 @@ struct CacheEntry {
     dirty: bool,
 }
 
-// Cached bytes are trusted: images read from the main file are checksummed
-// and id-checked once on load, and staged images are produced by this process.
+// Main-file reads are verified once. Image-write callers must supply valid bytes,
+// because cached images bypass checksum verification.
 #[derive(Debug)]
 pub struct Pager<B: FileBackend> {
     main: B,
     cache_pages: usize,
     cache: HashMap<u64, CacheEntry>,
-    // Only clean pages participate in eviction. Dirty pins must not be
-    // rotated or compacted on every insertion while a commit grows.
+    // Track only clean pages. Growing commits must not scan dirty pins.
     lru: VecDeque<(u64, u64)>,
     next_generation: u64,
     // Exclusive upper bound for page ids reachable from committed state.
@@ -72,7 +70,6 @@ impl<B: FileBackend> Pager<B> {
         self.with_page(page_id, |bytes| Ok(bytes.to_vec()))
     }
 
-    // Lets hot readers inspect cached page bytes without cloning a full page.
     pub(crate) fn with_page<R>(
         &mut self,
         page_id: u64,
@@ -113,8 +110,8 @@ impl<B: FileBackend> Pager<B> {
         Ok(())
     }
 
-    // Recovery supplies verified, consecutive images. Cache their owned
-    // buffers only after the write succeeds; publication still follows flush.
+    // Callers supply verified or freshly encoded images and flush before publication.
+    // Transfer their buffers to the cache only after a successful write.
     pub(crate) fn write_page_images(
         &mut self,
         images: &mut Vec<(u64, Vec<u8>)>,
@@ -157,8 +154,7 @@ impl<B: FileBackend> Pager<B> {
         Ok(())
     }
 
-    // Keeps a committed page visible without touching the main file.
-    // Checkpoint writes these back; eviction must not drop them first.
+    // Pin committed images until a durable checkpoint makes them evictable.
     pub(crate) fn stage_page_image(&mut self, page_id: u64, bytes: Vec<u8>) -> Result<()> {
         if page_id == 0 {
             return Err(EngineError::Corruption("page id 0 is invalid".into()));
@@ -205,7 +201,6 @@ impl<B: FileBackend> Pager<B> {
             }
             let page_id = page_ids[start];
             if end == start + 1 {
-                // Isolated pages need neither a copy nor a batch allocation.
                 let entry = cache
                     .get(&page_id)
                     .ok_or_else(|| EngineError::Internal("dirty pager entry disappeared".into()))?;
@@ -219,8 +214,7 @@ impl<B: FileBackend> Pager<B> {
                     })?;
                     batch.extend_from_slice(&entry.bytes);
                 }
-                // Adjacent dirty images cover exactly this range. Gaps and
-                // clean pages are never included or filled with zero bytes.
+                // Batch only adjacent dirty pages; writing across gaps would replace other pages.
                 main.write_at(page_offset(page_id), &batch)?;
             }
             start = end;
@@ -241,14 +235,13 @@ impl<B: FileBackend> Pager<B> {
             }
         }
         self.dirty_count = 0;
-        // The caller has durably checkpointed these images. They are now
-        // evictable, including when no subsequent cache miss occurs.
+        // The caller has completed a durable checkpoint. Evict clean pages now,
+        // even if no later cache miss triggers eviction.
         self.evict_if_needed(0);
         self.compact_lru_if_needed();
     }
 
-    /// Forgets every cached page, dirty ones included. Used when in-memory
-    /// state can no longer be trusted and must be rebuilt from the files.
+    /// Drops dirty images as well as clean pages when recovery must rebuild state.
     pub(crate) fn discard_cache(&mut self) {
         self.cache.clear();
         self.lru.clear();
@@ -281,7 +274,7 @@ impl<B: FileBackend> Pager<B> {
             }
             entry.dirty = dirty;
             if dirty {
-                // Invalidate a clean entry's old queue records immediately.
+                // Old clean queue records must not match the new dirty entry.
                 entry.generation = 0;
             }
             self.touch(page_id);
@@ -344,8 +337,8 @@ impl<B: FileBackend> Pager<B> {
                 _ => continue,
             }
             if old_page_id == protected_page_id {
-                // The inserted page is the newest clean entry. There are no
-                // older eviction candidates left; do not walk the dirty pins.
+                // This is the newest clean entry; no older candidates remain.
+                // Keep it readable even when dirty pins exceed the budget.
                 self.lru.push_back((old_page_id, old_generation));
                 break;
             }
@@ -419,7 +412,6 @@ mod tests {
     fn checkpoint_batches_adjacent_pages_without_overwriting_gaps() -> Result<()> {
         let mut pager = Pager::new(RecordingBackend::default(), 16);
         let mut oracle = MemoryBackend::new();
-        // Distinct existing pages in both gaps must survive unchanged.
         for page_id in [66, 68] {
             let image = encode_leaf_page(page_id, 0, page_id + 100, &[])?;
             pager.write_page_image(page_id, &image)?;
@@ -493,7 +485,6 @@ mod tests {
     fn checkpoint_bounds_large_runs_without_changing_page_bytes() -> Result<()> {
         let mut pager = Pager::new(RecordingBackend::default(), 8);
         let mut oracle = MemoryBackend::new();
-        // Stage out of order, including a page beyond the four-MiB boundary.
         for page_id in (1..=1025).rev() {
             let image = encode_leaf_page(page_id, 0, page_id + 1, &[])?;
             oracle.write_at(page_offset(page_id), &image)?;
@@ -649,8 +640,7 @@ mod tests {
                 encode_leaf_page(page_id, 0, 0, &[])?
             );
         }
-        // Page 8 is clean and MRU. Its stale queue record must not evict it
-        // after it is dirtied again, even when every page is pinned.
+        // Restaging page 8 must invalidate its clean queue record while all pages are pinned.
         for page_id in 8..=16 {
             pager.stage_page_image(page_id, encode_leaf_page(page_id, 0, 0, &[])?)?;
         }

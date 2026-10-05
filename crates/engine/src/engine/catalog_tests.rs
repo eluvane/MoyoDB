@@ -44,7 +44,7 @@ fn assert_current_catalog(engine: &mut Engine<MemoryBackend>) -> Result<()> {
     let state = read_catalog(&mut engine.pager, engine.superblock.catalog_root_page_id)?;
     assert_eq!(&state.stores, engine.catalog.as_ref());
     assert_eq!(state.schema_version, engine.schema_version);
-    // load_state can synthesize a legacy floor without rewriting the catalog.
+    // Open can synthesize a legacy floor without rewriting the catalog.
     assert!(
         state.change_feed_floor_txid == engine.change_feed_floor_txid
             || (state.change_feed_floor_txid == 0
@@ -71,7 +71,7 @@ fn begin_and_uncontended_commits_keep_the_same_catalog_allocation() -> Result<()
         let tx = engine.begin_tx(TxMode::Readwrite)?;
         engine.put(tx, &store_name(0), b"key", &value.to_le_bytes())?;
         engine.commit_tx(tx)?;
-        // Also catches retaining the committing writer's own snapshot.
+        // Retaining the writer's snapshot would force a catalog copy.
         assert_eq!(Arc::as_ptr(&engine.catalog), original);
     }
     assert_current_catalog(&mut engine)
@@ -126,7 +126,7 @@ fn live_snapshots_keep_old_roots_without_forcing_every_later_commit_to_copy() ->
         ));
     }
     engine.rollback_tx(old)?;
-    // Let the normal free-page pool reuse pages after the old snapshot closes.
+    // Closing the old snapshot makes its retired pages available for reuse.
     for value in 24u64..48 {
         let tx = engine.begin_tx(TxMode::Readwrite)?;
         engine.put(tx, &store_name(0), b"key", &value.to_le_bytes())?;
@@ -268,8 +268,8 @@ fn incremental_catalog_matches_full_builder_bytes_through_mixed_changes() -> Res
         root = next_root;
         assert_eq!(read_catalog(&mut pager, root)?, expected);
 
-        // Independent full builder is the storage-format oracle, including
-        // absence of the default policy record and reserved-key ordering.
+        // The full builder independently checks the stored entries, including
+        // reserved key order and omission of the default policy record.
         let mut oracle = Pager::new(MemoryBackend::new(), 8);
         let mut oracle_alloc = PageAllocator::new(1);
         let oracle_root = install_tree(
@@ -357,7 +357,7 @@ fn synthesized_legacy_feed_floor_survives_first_logged_commit_and_reopen() -> Re
     let mut engine = Engine::open("legacy-catalog", bundle.files(), OpenConfig::default())?;
     let tx = engine.begin_tx(TxMode::Readwrite)?;
     engine.create_store(tx, "store")?;
-    let floor = engine.commit_tx(tx)?; // No mutations, hence no change-log store.
+    let floor = engine.commit_tx(tx)?; // Store creation produces no change-log record.
     engine.checkpoint()?;
     let recovered = bundle.crash_recovered_files();
     let durable = MemoryBundle {

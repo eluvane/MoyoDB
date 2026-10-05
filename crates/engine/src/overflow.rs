@@ -60,8 +60,8 @@ fn validate_declared_len(total_len: usize) -> Result<usize> {
     Ok(total_len.div_ceil(max_overflow_chunk_len()))
 }
 
-/// Walks a chain, handing each chunk to `visit` in order. The walk is bounded by
-/// the declared length, so a corrupt chain cannot loop or force a huge allocation.
+/// Bounds traversal by the declared length to stop corrupt cycles.
+/// A false visit result stops without validating the rest of the chain.
 fn walk_chain<B: FileBackend>(
     pager: &mut Pager<B>,
     head_page_id: u64,
@@ -130,8 +130,8 @@ pub fn read_overflow_value<B: FileBackend>(
     Ok(out)
 }
 
-/// Copies only the payload into its final buffer, while validating the complete
-/// chain before decoding the envelope (including for already expired values).
+/// Validates the full chain before decoding the envelope, even for expired values.
+/// Keeps the header separate to avoid an extra payload copy.
 pub(crate) fn read_overflow_stored_value<B: FileBackend>(
     pager: &mut Pager<B>,
     head_page_id: u64,
@@ -163,8 +163,7 @@ pub(crate) fn read_overflow_stored_value<B: FileBackend>(
     StoredValue::decode_envelope_parts(&prefix[..prefix_len], value)
 }
 
-/// Reads the TTL header into a fixed buffer, retaining prefix-read bounds and
-/// allowing a header to span short chunks in a checksummed input chain.
+/// Reads only the TTL header. It may span chunks, and later pages are not checked.
 pub(crate) fn read_overflow_expiry<B: FileBackend>(
     pager: &mut Pager<B>,
     head_page_id: u64,
@@ -189,8 +188,7 @@ pub(crate) fn read_overflow_expiry<B: FileBackend>(
     decode_envelope_expiry(&prefix[..prefix_len])
 }
 
-/// Reads at most `prefix_len` bytes from the start of the chain, touching only
-/// the pages that hold them.
+/// Reads at most `prefix_len` leading bytes. Pages after the prefix are not checked.
 pub fn read_overflow_prefix<B: FileBackend>(
     pager: &mut Pager<B>,
     head_page_id: u64,

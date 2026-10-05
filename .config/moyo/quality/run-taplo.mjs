@@ -44,8 +44,7 @@ const args = [cli, mode === 'lint' ? 'lint' : 'fmt', '--config', '.config/moyo/f
 if (mode === 'check') args.push('--check');
 args.push('-');
 
-// The npm Taplo glob adapter does not match Windows paths. Feed each source
-// through stdin on every platform, retaining the repository's Taplo settings.
+// Use stdin on all platforms to avoid Taplo glob matching failures on Windows.
 for (const file of files) {
     const result = runCaptured(process.execPath, args, file);
     if (result.error) throw result.error;

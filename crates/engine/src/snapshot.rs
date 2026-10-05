@@ -202,8 +202,9 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotContents> {
             let key = take_slice(bytes, &mut offset, key_len, "snapshot key")?;
             validate_key(key).map_err(corruption_from_engine_error)?;
 
-            let value = take_slice(bytes, &mut offset, value_len, "snapshot value")?.to_vec();
-            validate_value(&value).map_err(corruption_from_engine_error)?;
+            let value = take_slice(bytes, &mut offset, value_len, "snapshot value")?;
+            validate_value(value).map_err(corruption_from_engine_error)?;
+            let value = value.to_vec();
 
             if !seen_keys.insert(key) {
                 return Err(corruption(format!(

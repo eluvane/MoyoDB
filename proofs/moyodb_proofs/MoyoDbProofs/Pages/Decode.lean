@@ -78,7 +78,7 @@ structure Page where
 def require (condition : Bool) (message : String) : Except String Unit :=
   if condition then .ok () else .error message
 
-/-- Independent wire parser: no Rust-decoded fields and no checksum assumption hidden in WF. -/
+/-- Parse raw page bytes without Rust-decoded fields. Checksums are not assumed or validated. -/
 def decodePage (raw : RawPage) : Except String Page := do
   let bytes := raw.bytes
   require (bytes.length == 4096) "page size must be 4096"
@@ -147,7 +147,7 @@ def decodeTree : Nat → List RawPage → Nat → List Nat → Except String (Tr
 def interpretRawTree (pages : List RawPage) (root : Nat) : Except String Tree :=
   if root == 0 then .ok .empty else (decodeTree depthBudget pages root []).map Prod.fst
 
-/-- Runtime acceptance returns the very proof-carrying object used by the theorems. -/
+/-- Runtime acceptance returns the certificate used by the soundness theorems. -/
 def checkRawTree (pages : List RawPage) (root : Nat) (expected : ModelMap) :
     Except String (CertifiedTree expected) :=
   if (pages.map RawPage.id).Nodup then

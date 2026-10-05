@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 
 pub type TxId = u64;
 
-// Legacy internal store namespace preserved for storage-format compatibility; do not rename without a migration.
+// Keep this stored namespace for format compatibility. Renaming requires a migration.
 pub const INTERNAL_STORE_PREFIX: &str = "__browserdb:";
 pub const SYSTEM_CHANGELOG_STORE_NAME: &str = "__browserdb:changes";
 pub const CHANGELOG_STORE_FLAGS: u64 = STORE_FLAG_SYSTEM_RAW_VALUES;
@@ -22,8 +22,8 @@ pub struct ChangeFeedOptions {
     pub limit: Option<usize>,
 }
 
-/// `Clear` and `Drop` are store-level records with an empty key: one record
-/// replaces a delete per key, so clearing a large store stays O(1) in the log.
+/// `Clear` and `Drop` each use one store-level record with an empty key.
+/// Their log size does not depend on the number of keys in the store.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ChangeKind {

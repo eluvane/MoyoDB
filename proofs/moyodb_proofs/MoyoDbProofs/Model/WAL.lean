@@ -2,11 +2,11 @@ import MoyoDbProofs.Model.BTree
 
 namespace MoyoDbProofs.Model
 
-/-- Abstract WAL records retaining transaction and page identifiers. -/
+/-- Abstract WAL records with transaction and page identifiers. Page bytes and wire checks are absent. -/
 inductive WalRecord where
   /-- A page image written by a transaction, without implying commitment. -/
   | pageImage (txid pageId : Nat)
-  /-- The commit marker making a transaction recoverable. -/
+  /-- Commit marker included in the abstract recovered transaction sequence. -/
   | commit (txid : Nat)
   deriving Repr, DecidableEq
 
@@ -21,7 +21,7 @@ def committedTxs : List WalRecord → List Nat
   | .pageImage _ _ :: xs => committedTxs xs
   | .commit txid :: xs => txid :: committedTxs xs
 
-/-- The abstract committed transaction sequence recovered from a log. -/
+/-- Recover commit identifiers in log order, without replaying page contents. -/
 def replayCommittedPrefix : List WalRecord → List Nat :=
   committedTxs
 

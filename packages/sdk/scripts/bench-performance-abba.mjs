@@ -105,7 +105,7 @@ const out = resolve(
 );
 await mkdir(dirname(out), { recursive: true });
 const require = createRequire(join(resolve(values['dependency-root']), 'package.json'));
-const { chromium } = require('playwright');
+const { chromium } = require('@playwright/test');
 const { createServer } = await import(pathToFileURL(require.resolve('vite')).href);
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
 function git(root, ...args) {
@@ -226,7 +226,7 @@ const output = {
     runtime: {
         node: process.version,
         platform: `${process.platform}/${process.arch}`,
-        playwright: require('playwright/package.json').version,
+        playwright: require('@playwright/test/package.json').version,
         vite: require('vite/package.json').version
     },
     configuration: {
@@ -303,9 +303,9 @@ try {
                 await page.evaluate(
                     async ({ scalingSpecs, workloadNames }) => {
                         const [{ moyoDbBaseline }, { indexedDbBaseline }, { WORKLOADS }] = await Promise.all([
-                            import('/bench/moyodb-baseline.ts'),
-                            import('/bench/indexeddb-baseline.ts'),
-                            import('/bench/workloads.ts')
+                            import(new URL('/bench/moyodb-baseline.ts', globalThis.location.href).href),
+                            import(new URL('/bench/indexeddb-baseline.ts', globalThis.location.href).href),
+                            import(new URL('/bench/workloads.ts', globalThis.location.href).href)
                         ]);
                         for (const spec of scalingSpecs) {
                             if (WORKLOADS.some((workload) => workload.name === spec.name))

@@ -29,13 +29,12 @@ export interface WorkerOpenRequest {
 }
 export interface IndexScanPage {
     rows: ScanItem[];
-    /** Physical index key to resume after, or `null` once the range is exhausted. */
+    /** Physical index key to resume after, or `null` when exhaustion is detected. */
     cursor: Uint8Array | null;
 }
 /**
- * Transaction-scoped commands that may run as a single autocommit round trip:
- * the worker begins a transaction, runs the command, and commits (readwrite)
- * or releases (readonly) it before replying.
+ * Commands supported in one autocommit request. The worker replies after
+ * commit (readwrite) or rollback (readonly).
  */
 export type AutocommitCommand =
     | 'get'

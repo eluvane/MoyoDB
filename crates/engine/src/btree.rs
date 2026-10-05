@@ -109,11 +109,9 @@ fn sorted_page_images(mut images: PageImages) -> PageImages {
 /// A key and its new encoded value; `None` deletes the key.
 pub type Mutation<'a> = (&'a [u8], Option<&'a [u8]>);
 
-/// Hands out page ids for one commit.
-///
-/// Ids come from `reusable` first (pages no open snapshot can reach any more),
-/// then from the end of the file. Pages the commit stops referencing are
-/// recorded in `freed`; the engine decides when they become reusable.
+/// Allocates page ids for one commit.
+/// Reuse only ids that no open snapshot can reach.
+/// Retired ids stay in `freed` until the engine permits reuse.
 #[derive(Debug, Clone, Default)]
 pub struct PageAllocator {
     next_page_id: u64,
@@ -150,8 +148,7 @@ impl PageAllocator {
         self.freed.push(page_id);
     }
 
-    /// Returns an id allocated by this commit that ended up unused. It was
-    /// never published, so it can be handed out again immediately.
+    /// An unpublished id can be reused immediately.
     fn release_unpublished(&mut self, page_id: u64) {
         self.reusable.push(page_id);
     }
@@ -214,9 +211,9 @@ fn lookup_pending<B: FileBackend>(
     )
 }
 
-/// Keeps only the current internal path for one sorted batch. Overflow reads
-/// may evict these pages from the pager; retaining them avoids restarting I/O
-/// without prefetching leaves or materializing values ahead of their key.
+/// Retains the current internal path for a sorted batch.
+/// Overflow reads can evict these pages from the pager.
+/// Leaves and values are read only when their keys are requested.
 #[derive(Default)]
 pub(crate) struct PointReadBatch {
     ancestors: Vec<PointReadAncestor>,
@@ -422,7 +419,6 @@ pub fn build_tree_with(
     entries: &[(Vec<u8>, Vec<u8>)],
     alloc: &mut PageAllocator,
 ) -> Result<BuiltTree> {
-    // Sort borrowed pairs only; the leaf builder copies into cells anyway.
     let mut ordered: Vec<(&[u8], &[u8])> = entries
         .iter()
         .map(|(key, value)| (key.as_slice(), value.as_slice()))
@@ -479,8 +475,8 @@ where
     })
 }
 
-/// Incremental bulk loader: callers push sorted entries one at a time, so a
-/// whole store never has to be materialized.
+/// Accepts strictly increasing keys one at a time.
+/// Callers can drain page images between entries to limit buffered images.
 pub struct SortedTreeBuilder {
     cells: Vec<LeafCell>,
     leaf_cost: usize,
@@ -536,7 +532,7 @@ impl SortedTreeBuilder {
         Ok(())
     }
 
-    /// Hands back the page images produced so far so callers can stream them.
+    /// Returns completed page images for streaming writes.
     pub fn drain_images(&mut self) -> PageImages {
         sorted_page_images(std::mem::take(&mut self.images))
     }
@@ -644,12 +640,10 @@ pub fn read_catalog<B: FileBackend>(
     })
 }
 
-/// Applies sorted mutations by copying only the root-to-leaf paths they touch.
-///
-/// Untouched subtrees and the overflow chains of untouched cells are shared
-/// with the previous tree. Replaced pages and dropped chains are retired
-/// through `alloc`. Underfull nodes merge with a neighbour and single-child
-/// roots collapse, so the tree stays balanced under deletes.
+/// Applies mutations with strictly increasing keys by copying touched paths.
+/// Untouched subtrees and overflow chains remain shared with the previous tree.
+/// Replaced pages and chains are retired through `alloc`. Underfull nodes merge,
+/// and roots with one child collapse.
 pub fn apply_mutations<B: FileBackend>(
     pager: &mut Pager<B>,
     root_page_id: u64,
@@ -714,8 +708,7 @@ pub fn free_tree<B: FileBackend>(
                 "page {page_id} is reachable twice in one tree"
             )));
         }
-        // Validate the entire node before retiring it, without copying keys
-        // or inline values that this traversal will never return or rewrite.
+        // Retirement needs validated links, without copies of keys or inline values.
         let links = pager.with_page(page_id, |bytes| {
             let header = node_header(bytes, page_id, expected_level)?;
             let count = header.cell_count as usize;
@@ -802,7 +795,6 @@ pub fn collect_keys_below<B: FileBackend>(
     Ok(out)
 }
 
-// Leaves and internal nodes use the same usable area: page minus header.
 const NODE_CAPACITY: usize = PAGE_SIZE - PAGE_HEADER_SIZE;
 const MIN_NODE_FILL: usize = NODE_CAPACITY / 4;
 
@@ -820,8 +812,7 @@ enum Node {
     Internal { level: u8, cells: Vec<InternalCell> },
 }
 
-/// The full content a node has after a commit touched it. It is packed into
-/// pages only once its parent knows whether it must absorb a neighbour.
+/// Defers page packing until the parent can merge underfull siblings.
 enum Run {
     Leaf(Vec<LeafCell>),
     Internal { level: u8, cells: Vec<InternalCell> },
@@ -877,9 +868,8 @@ enum Child {
 struct TreeWriter<'a, B: FileBackend> {
     pager: Option<&'a mut Pager<B>>,
     alloc: &'a mut PageAllocator,
-    // Only tree nodes can be inspected or removed while collapsing the root.
-    // Overflow chains are final as soon as their sorted mutation is planned:
-    // merging/packing leaf runs moves those cells without replacing values.
+    // Root collapse may discard fresh tree nodes. Overflow images stay final:
+    // leaf merging moves their references without replacing the new values.
     fresh: BTreeMap<u64, Vec<u8>>,
     overflow_images: PageImages,
 }
@@ -907,8 +897,7 @@ impl<'a, B: FileBackend> TreeWriter<'a, B> {
 
     fn into_images(mut self) -> PageImages {
         self.overflow_images.extend(self.fresh);
-        // Reusable ids and unpublished roots can make allocation order differ
-        // from file order. Preserve the ordered output used by WAL/replay I/O.
+        // Keep page-id order for WAL and replay when allocation reuses ids.
         sorted_page_images(self.overflow_images)
     }
 
@@ -1017,8 +1006,6 @@ impl<'a, B: FileBackend> TreeWriter<'a, B> {
         }
     }
 
-    /// Drops emptied children, merges underfull ones into a neighbour and
-    /// packs every changed child into fresh pages.
     fn normalize_children(
         &mut self,
         child_level: u8,
@@ -1087,7 +1074,7 @@ impl<'a, B: FileBackend> TreeWriter<'a, B> {
         }
     }
 
-    /// Splits a run into evenly filled pages and returns their parent cells.
+    /// Returns parent cells whose separators are each page's first key.
     fn pack(&mut self, run: Run) -> Result<Vec<InternalCell>> {
         if run.is_empty() {
             return Ok(Vec::new());
@@ -1150,7 +1137,12 @@ impl<'a, B: FileBackend> TreeWriter<'a, B> {
         }
         let mut level = run.level();
         let mut cells = match run {
-            Run::Internal { cells, .. } if cells.len() == 1 => cells,
+            Run::Internal { cells, .. } if cells.len() == 1 => {
+                level = level
+                    .checked_sub(1)
+                    .ok_or_else(|| EngineError::Internal("internal root has level 0".into()))?;
+                cells
+            }
             run => self.pack(run)?,
         };
         while cells.len() > 1 {
@@ -1164,20 +1156,21 @@ impl<'a, B: FileBackend> TreeWriter<'a, B> {
             .pop()
             .ok_or_else(|| EngineError::Internal("tree root disappeared".into()))?
             .child_page_id;
-        while let Some(only_child) = self.single_child(root)? {
+        while let Some(only_child) = self.single_child(root, level)? {
             if self.fresh.remove(&root).is_some() {
                 self.alloc.release_unpublished(root);
             } else {
                 self.alloc.free(root);
             }
             root = only_child;
+            level -= 1;
         }
         Ok(root)
     }
 
-    fn single_child(&mut self, page_id: u64) -> Result<Option<u64>> {
+    fn single_child(&mut self, page_id: u64, expected_level: u8) -> Result<Option<u64>> {
         let inspect = |bytes: &[u8]| -> Result<Option<u64>> {
-            let header = node_header(bytes, page_id, None)?;
+            let header = node_header(bytes, page_id, Some(expected_level))?;
             if header.page_kind == PageKind::Internal && header.cell_count == 1 {
                 Ok(Some(child_page_id_at(bytes, &header, 0)?))
             } else {
@@ -1191,8 +1184,7 @@ impl<'a, B: FileBackend> TreeWriter<'a, B> {
     }
 }
 
-/// For each child, the index range of mutations routed to it. Keys below the
-/// first separator belong to the first child, matching lookup routing.
+/// Keys below the first separator still route to the first child, as in lookup.
 fn route_mutations<V: ?Sized>(
     children: &[InternalCell],
     mutations: &[(&[u8], Option<&V>)],
@@ -1215,8 +1207,7 @@ fn route_mutations<V: ?Sized>(
     ranges
 }
 
-/// Group sizes for packing cells into pages of `NODE_CAPACITY`, aiming for
-/// equal fill instead of leaving a nearly empty last page.
+/// Balances page fill to avoid a nearly empty final page.
 fn split_groups(costs: &[usize]) -> Vec<usize> {
     let total: usize = costs.iter().sum();
     if total <= NODE_CAPACITY {
@@ -1276,8 +1267,8 @@ fn read_node<B: FileBackend, V: ?Sized>(
                         .is_some_and(|(key, _)| *key == cell.key);
                     cells.push(LeafCell {
                         key: cell.key.to_vec(),
-                        // merge_leaf removes these old cells before packing.
-                        // Keep their validated metadata to retire overflow chains.
+                        // Replaced cells need only metadata to retire their overflow chains.
+                        // merge_leaf removes them before encoding pages.
                         value: if replaced {
                             Vec::new()
                         } else {
@@ -1316,8 +1307,8 @@ fn read_node<B: FileBackend, V: ?Sized>(
     })
 }
 
-/// Header of a tree node whose bytes the pager already verified: checks the
-/// page id, that it is a tree page, and that its level is what the parent implies.
+/// Checks tree-node identity and any parent-implied level.
+/// Bytes must be verified or freshly encoded because this skips the checksum.
 fn node_header(bytes: &[u8], page_id: u64, expected_level: Option<u8>) -> Result<PageHeaderInfo> {
     let header = decode_page_header_verified(bytes)?;
     if header.page_id != page_id {
@@ -1505,9 +1496,9 @@ struct ValidatedLeafWindow {
     hit_bound: bool,
 }
 
-/// Streams entries of one tree in key order (or reverse).
-/// Finite scans copy entries on demand after validating the entire leaf window.
-/// Unlimited scans buffer a leaf so overflow reads do not force leaf rereads.
+/// Reads one tree in key order or reverse order.
+/// A finite limit restricts copying after the full leaf window is validated.
+/// Unlimited scans buffer one leaf to avoid rereads after overflow I/O.
 pub(crate) struct TreeIter {
     cursor: Option<LeafCursor>,
     buffer: VecDeque<PendingKvPair>,
@@ -1553,8 +1544,7 @@ impl TreeIter {
             window: None,
             lower,
             upper,
-            // This is a copying hint, not an entry limit: callers may need
-            // further entries after TTL, staged deletes, or filtering.
+            // Filtering and staged deletes may require more entries than range.limit.
             max_buffered_entries: if range.limit.is_some() { 1 } else { usize::MAX },
             inline_prefix_len: usize::MAX,
             reverse: range.reverse,
@@ -1568,8 +1558,7 @@ impl TreeIter {
         range: &RangeSpec,
     ) -> Result<Self> {
         let mut iter = Self::new(pager, root_page_id, range)?;
-        // Keys-only callers discard PendingValue. A zero inline prefix keeps
-        // the same cell validation without allocating unused value bytes.
+        // Preserve cell validation without copying values that keys-only scans discard.
         iter.inline_prefix_len = 0;
         Ok(iter)
     }
@@ -1669,8 +1658,7 @@ impl TreeIter {
     }
 }
 
-/// Validates all cells in range in their original ascending order, then returns
-/// the requested first batch and indices for the remaining validated cells.
+/// Validates every cell in the window before returning a batch in scan order.
 fn collect_leaf_window(
     bytes: &[u8],
     page_id: u64,

@@ -670,8 +670,7 @@ export function createTransportSuite({ WorkerProtocolClient, exposeWorkerApi, pr
                 }
             });
             try {
-                // Only the synchronous public message dispatch is observed. API
-                // execution and response delivery happen in later microtasks.
+                // Count only synchronous message dispatch. API calls and replies run in later microtasks.
                 const before = __transportWorkCounter.thenRegistrations;
                 h.scope.emit('message', {
                     type: protocol.WORKER_PROTOCOL_REQUEST,
@@ -858,7 +857,7 @@ export function createTransportSuite({ WorkerProtocolClient, exposeWorkerApi, pr
             const later = h.client.get(7, 'kv', new Uint8Array([2]));
             const other = h.client.get(8, 'kv', new Uint8Array([3]));
             const all = Promise.allSettled([first, slow, later, other]);
-            // This is a deadlock deadline, not a latency/performance assertion.
+            // The timeout bounds deadlock detection. It is not a latency assertion.
             const ready = await Promise.race([
                 Promise.all([first, other]),
                 new Promise((_resolve, reject) => {
@@ -1041,6 +1040,150 @@ export function createTransportSuite({ WorkerProtocolClient, exposeWorkerApi, pr
                     assert.equal(h.worker.errors.length, 0, 'message handler must not throw into the host');
                 } finally {
                     gate.resolve([]);
+                    h.dispose();
+                }
+            },
+            'regressions'
+        );
+    }
+
+    for (const [command, result] of [
+        ['getMany', { __moyodbPacked: 'moyodb:packed-optional-values:v1', bytes: null }],
+        ['getMany', { __moyodbPacked: 'moyodb:packed-nullable-binary-list:v2', bytes: new Uint8Array(4) }],
+        ['scan', { __moyodbPacked: 'moyodb:packed-scan-rows:v1', bytes: [] }],
+        ['scanByIndexPage', { rows: { __moyodbPacked: 'moyodb:packed-scan-rows:v1', bytes: null }, cursor: null }],
+        ['scanByIndexPage', { rows: [], cursor: 'invalid' }]
+    ]) {
+        test(
+            `${command} rejects a malformed packed response ${JSON.stringify(result)}`,
+            async () => {
+                const gate = deferred();
+                const h = await harness({ [command]: async () => gate.promise });
+                let outcome = { status: 'pending' };
+                try {
+                    const args =
+                        command === 'getMany'
+                            ? [1, 'kv', []]
+                            : command === 'scanByIndexPage'
+                              ? [1, 'kv', 'ix', {}, null, 1]
+                              : [1, 'kv', {}];
+                    const request = h.client.request(command, args).then(
+                        (value) => (outcome = { status: 'fulfilled', value }),
+                        (error) => (outcome = { status: 'rejected', error })
+                    );
+                    await drain();
+                    assert.equal(outcome.status, 'pending');
+                    const id = requests(h.toWorker)[0].id;
+                    h.injectResponse({ type: protocol.WORKER_PROTOCOL_RESPONSE, version: 1, id, ok: true, result });
+                    await drain();
+                    assert.equal(
+                        outcome.status,
+                        'rejected',
+                        'invalid packed data must not escape as a successful result'
+                    );
+                    assert.equal(outcome.error.name, 'WorkerProtocolError');
+                    assert.equal(h.worker.errors.length, 0);
+                    await request;
+                } finally {
+                    gate.resolve(command === 'scanByIndexPage' ? { rows: [], cursor: null } : []);
+                    h.dispose();
+                }
+            },
+            'regressions'
+        );
+    }
+
+    for (const command of ['getMany', 'deleteMany', 'putMany', 'applyBatch']) {
+        test(
+            `${command} rejects malformed packed arguments before invoking its API`,
+            async () => {
+                let calls = 0;
+                const h = await harness({ [command]: async () => ++calls });
+                try {
+                    const marker =
+                        command === 'applyBatch' ? 'moyodb:packed-batch-ops:v1' : 'moyodb:packed-binary-list:v1';
+                    h.scope.emit('message', {
+                        type: protocol.WORKER_PROTOCOL_REQUEST,
+                        version: 1,
+                        id: 701,
+                        command,
+                        args: [1, 'kv', { __moyodbPacked: marker, bytes: null }]
+                    });
+                    await drain();
+                    assert.equal(calls, 0, 'invalid packed arguments must not reach an API operation');
+                    const reply = responses(h.toClient).find((message) => message.id === 701);
+                    assert.ok(reply);
+                    assert.equal(reply.ok, false);
+                    assert.equal(reply.error.name, 'WorkerProtocolError');
+                } finally {
+                    h.dispose();
+                }
+            },
+            'regressions'
+        );
+    }
+
+    test(
+        'unknown batch operation kinds reject before reaching the worker',
+        async () => {
+            const applied = [];
+            const h = await harness({ applyBatch: async (_id, _store, ops) => applied.push(...ops) });
+            try {
+                const key = new Uint8Array([7]);
+                let outcome = { status: 'pending' };
+                const request = h.client.applyBatch(1, 'kv', [{ kind: 'remove', key }]).then(
+                    (value) => (outcome = { status: 'fulfilled', value }),
+                    (error) => (outcome = { status: 'rejected', error })
+                );
+                await drain();
+                assert.equal(outcome.status, 'rejected', 'an unknown kind must not become a delete');
+                assert.equal(outcome.error.name, 'WorkerProtocolError');
+                assert.deepEqual(applied, []);
+                assert.equal(h.toWorker.length, 0);
+                assert.deepEqual(Array.from(key), [7]);
+                await request;
+            } finally {
+                h.dispose();
+            }
+        },
+        'regressions'
+    );
+
+    for (const [name, malformed] of [
+        ['null', [null]],
+        ['sparse', new Array(1)]
+    ]) {
+        test(
+            `${name} response batch members reject outstanding requests exactly once`,
+            async () => {
+                const gate = deferred();
+                const h = await harness({ stats: async () => gate.promise });
+                const outcomes = [];
+                let fatalities = 0;
+                h.client.setFatalHandler(() => ++fatalities);
+                try {
+                    const pending = [0, 1].map(() =>
+                        h.client.stats().then(
+                            (value) => outcomes.push({ status: 'fulfilled', value }),
+                            (error) => outcomes.push({ status: 'rejected', error })
+                        )
+                    );
+                    await drain();
+                    const id = requests(h.toWorker)[0].id;
+                    const valid = { type: protocol.WORKER_PROTOCOL_RESPONSE, version: 1, id, ok: true, result: {} };
+                    h.injectResponse({ type: RESPONSE_BATCH, version: 1, responses: [valid].concat(malformed) });
+                    await drain();
+                    assert.equal(outcomes.length, 2, 'a corrupted batch must not leave requests pending forever');
+                    assert.ok(
+                        outcomes.every(
+                            (item) => item.status === 'rejected' && item.error.name === 'WorkerProtocolError'
+                        )
+                    );
+                    assert.equal(fatalities, 1);
+                    assert.equal(h.worker.listeners.size, 0);
+                    await Promise.all(pending);
+                } finally {
+                    gate.resolve({});
                     h.dispose();
                 }
             },

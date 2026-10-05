@@ -100,7 +100,7 @@ impl StoredValue {
         }
     }
 
-    /// Same as [`Self::decode_for_store`] but reuses the buffer instead of copying the value.
+    /// Decodes as [`Self::decode_for_store`] and reuses the input buffer.
     pub fn decode_owned_for_store(store_flags: u64, mut bytes: Vec<u8>) -> Result<Self> {
         if store_uses_system_raw_values(store_flags) {
             return Ok(Self::plain(bytes));
@@ -150,10 +150,10 @@ impl StoredValue {
         }
 
         let expires_at_ms = read_u64_le(bytes, 8)?;
-        let value = bytes[VALUE_ENVELOPE_HEADER_SIZE..].to_vec();
-        validate_value(&value)?;
+        let value = &bytes[VALUE_ENVELOPE_HEADER_SIZE..];
+        validate_value(value)?;
         Ok(Self {
-            value,
+            value: value.to_vec(),
             expires_at_ms: if expires_at_ms == 0 {
                 None
             } else {
@@ -163,7 +163,7 @@ impl StoredValue {
     }
 }
 
-/// Expiry from the first bytes of an enveloped value; only the header is needed.
+/// Reads expiry from the envelope header. Zero means no expiry.
 pub fn decode_envelope_expiry(prefix: &[u8]) -> Result<Option<u64>> {
     if prefix.len() < VALUE_ENVELOPE_HEADER_SIZE {
         return Err(EngineError::Corruption(format!(
@@ -184,7 +184,7 @@ pub fn decode_envelope_expiry(prefix: &[u8]) -> Result<Option<u64>> {
     })
 }
 
-/// Whether a raw stored value is expired, reading only its envelope header.
+/// Checks expiry from the envelope header. Raw-value stores do not expire.
 pub fn stored_value_expired(store_flags: u64, raw: &[u8], now_ms: u64) -> Result<bool> {
     if store_uses_system_raw_values(store_flags) || !store_uses_value_envelope(store_flags) {
         return Ok(false);

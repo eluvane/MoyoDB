@@ -64,12 +64,11 @@ pub(crate) struct InternalCellRef<'a> {
     pub child_page_id: u64,
 }
 
-/// Highest B-tree level a page may declare. Levels strictly decrease on every
-/// descent, so this also bounds traversal depth on corrupt input.
+/// Levels must decrease on descent. This limit bounds corrupt-tree traversal.
 pub const MAX_TREE_LEVEL: u8 = 48;
 
-/// Full validation of an image that did not come from this process: size,
-/// magic, checksum, header bounds, kind/level invariants and the page id.
+/// Checks image size, magic, checksum, header invariants and expected page id.
+/// Cells require separate validation.
 pub(crate) fn verify_page_image(bytes: &[u8], expected_page_id: u64) -> Result<PageHeaderInfo> {
     let header = decode_page_header(bytes)?;
     if header.page_id != expected_page_id {
@@ -100,8 +99,8 @@ pub(crate) fn decode_page_header(bytes: &[u8]) -> Result<PageHeaderInfo> {
     decode_page_header_verified(bytes)
 }
 
-/// Header decode for bytes the pager already verified on load. Skips the
-/// checksum; the bounds checks are cheap and stay.
+/// Requires a verified or freshly encoded image. Rechecks header invariants
+/// without checking magic or checksum.
 pub(crate) fn decode_page_header_verified(bytes: &[u8]) -> Result<PageHeaderInfo> {
     if bytes.len() != PAGE_SIZE {
         return Err(EngineError::Corruption(format!(
@@ -420,8 +419,7 @@ fn encode_overflow_parts(
         upper: (chunk_start + chunk_len) as u16,
         right_sibling_page_id: 0,
     });
-    // Initialize each byte once: page metadata, both immutable fragments, then
-    // only the unused tail. Do not zero a full page just to overwrite its body.
+    // Append initialized bytes so payload bytes are not zeroed before copying.
     let mut buf = Vec::with_capacity(PAGE_SIZE);
     buf.extend_from_slice(header.as_bytes());
     buf.extend_from_slice(&next_overflow_page_id.to_le_bytes());

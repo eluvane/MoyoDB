@@ -5,8 +5,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import ts from 'typescript';
 import { createReadSuite } from '../tests/read-work-suite.mjs';
 
-// Production read methods, codecs and packet decoding; only the WASM engine
-// and worker transport are fixtures. No builds, storage or timing measurements.
+// Tests production read methods, codecs and packet decoding with WASM and
+// Worker transport fixtures. Storage and latency are outside its scope.
 const here = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
 const value = (flag) => {

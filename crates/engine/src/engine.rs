@@ -58,7 +58,7 @@ pub use crate::txn::TxMode;
 
 pub type ScanRange = RangeSpec;
 
-// Commit-time pruning work per transaction; the rest continues on later commits.
+// Limit pruning work per commit. Later commits remove the remaining records.
 const CHANGE_LOG_PRUNE_BATCH: usize = 1024;
 
 struct CommitPlan {
@@ -93,8 +93,8 @@ pub struct OpenConfig {
     pub cache_pages: usize,
     /// Checkpoint once this many WAL bytes are durable but not installed.
     pub checkpoint_wal_bytes: u64,
-    /// Checkpoint once this many committed pages wait in memory. Dirty pages
-    /// are pinned in the cache, so this bounds memory between checkpoints.
+    /// Checkpoint at this many committed dirty pages. Dirty pages are pinned
+    /// in the cache, so the threshold limits memory between checkpoints.
     pub checkpoint_dirty_pages: usize,
 }
 
@@ -137,10 +137,9 @@ impl Failpoint {
 
 /// Whether the in-memory state may still be trusted.
 ///
-/// Any failure after WAL bytes of a commit start hitting storage leaves the
-/// outcome of that commit unknown and the WAL tail possibly torn. From then on
-/// the engine refuses work until [`Engine::recover`] rebuilds its state from
-/// the files, or it is closed.
+/// A failure after a commit starts writing to the WAL leaves its outcome
+/// unknown and may leave an incomplete WAL tail. Further reads and writes
+/// require [`Engine::recover`] to rebuild state from the files.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum EngineHealth {
@@ -157,9 +156,9 @@ pub enum EngineHealth {
 #[serde(rename_all = "camelCase")]
 pub struct RecoveryReport {
     pub last_committed_txid: u64,
-    /// The commit whose outcome was unknown when the engine was poisoned.
+    /// The commit whose outcome was unknown when recovery became required.
     pub pending_txid: Option<u64>,
-    /// Whether that commit turned out to be durable.
+    /// Whether recovery found that commit durable.
     pub pending_committed: bool,
 }
 
@@ -222,9 +221,9 @@ impl<T> BatchExecutionReport<T> {
 
 /// Pages retired by commits, reused once no open snapshot can reach them.
 ///
-/// A page retired by commit T is reachable only from trees older than T, so
-/// it becomes reusable when every open snapshot is at T or newer. The pool
-/// lives in memory; pages still retired at close are reclaimed by compaction.
+/// A page retired by commit T is reachable only from trees older than T.
+/// It can be reused when every open snapshot is at T or newer. The pool is
+/// not persisted. Compaction reclaims pages not reused before close.
 #[derive(Debug, Default)]
 struct FreePagePool {
     ready: Vec<u64>,
@@ -278,9 +277,11 @@ pub struct Engine<B: FileBackend> {
     pager: Pager<B>,
     wal: B,
     superblock: SuperblockState,
-    // Highest txid flushed to the WAL. Checkpoint must not truncate past a
-    // txid memory has not applied.
+    // Highest txid flushed to the WAL. Checkpoint must retain WAL commits
+    // that memory has not applied.
     wal_durable_txid: u64,
+    // A commit with no dirty pages still requires checkpoint publication.
+    checkpoint_txid: u64,
     schema_version: u64,
     catalog: Arc<CatalogMap>,
     change_feed_floor_txid: u64,
@@ -303,6 +304,7 @@ impl<B: FileBackend> std::fmt::Debug for Engine<B> {
             .field("db_name", &self.db_name)
             .field("superblock", &self.superblock)
             .field("wal_durable_txid", &self.wal_durable_txid)
+            .field("checkpoint_txid", &self.checkpoint_txid)
             .field("schema_version", &self.schema_version)
             .field("catalog", &self.catalog)
             .field("change_feed_floor_txid", &self.change_feed_floor_txid)
@@ -358,6 +360,7 @@ impl<B: FileBackend> Engine<B> {
             wal,
             superblock: loaded.superblock.clone(),
             wal_durable_txid: 0,
+            checkpoint_txid: 0,
             schema_version: 0,
             catalog: Arc::new(CatalogMap::new()),
             change_feed_floor_txid: 0,
@@ -392,6 +395,7 @@ impl<B: FileBackend> Engine<B> {
             catalog.change_feed_floor_txid
         };
         self.wal_durable_txid = superblock.last_committed_txid;
+        self.checkpoint_txid = superblock.last_committed_txid;
         self.next_commit_txid = superblock.last_committed_txid.saturating_add(1);
         self.schema_version = catalog.schema_version;
         self.catalog = Arc::new(catalog.stores);
@@ -427,11 +431,10 @@ impl<B: FileBackend> Engine<B> {
         }
     }
 
-    /// Throws away all in-memory state and reloads it from the files: selects
-    /// the superblock, replays the durable WAL, reloads the catalog.
+    /// Discards transactions and cached state. Reloads the superblock,
+    /// replays the WAL as needed, then reloads the catalog.
     ///
-    /// Reports whether the commit that poisoned the engine made it to disk, so
-    /// callers can turn an ambiguous commit into a definite answer.
+    /// Reports whether the commit with an unknown outcome is durable.
     pub fn recover(&mut self) -> Result<RecoveryReport> {
         let pending_txid = match &self.health {
             EngineHealth::Closed => return Err(EngineError::Closed),
@@ -443,22 +446,27 @@ impl<B: FileBackend> Engine<B> {
         self.next_failpoint = None;
         self.free_pages.clear();
         self.pager.discard_cache();
-        // The failed operation may have left written-but-unflushed bytes, and
-        // load_state reads them as the truth: a superblock whose flush tore
-        // would let it truncate WAL records the durable superblock still
-        // needs. Make the files durable first so every state recovery reports
-        // survives a crash. Main goes before the manifest, which may point
-        // into it; a torn WAL tail made durable is dropped by its checksum.
-        self.pager.flush()?;
-        self.manifest.flush()?;
-        self.wal.flush()?;
-        let loaded = load_state(
-            &mut self.manifest,
-            &mut self.pager,
-            &mut self.wal,
-            &self.db_name,
-            false,
-        )?;
+        // Flush visible bytes before recovery so its result survives a crash.
+        // Otherwise, an unflushed superblock could cause recovery to discard
+        // WAL records still needed by the durable superblock. Flush main before
+        // the manifest that references it. Checksums reject an incomplete WAL tail.
+        let loaded = (|| {
+            self.pager.flush()?;
+            self.manifest.flush()?;
+            self.wal.flush()?;
+            load_state(
+                &mut self.manifest,
+                &mut self.pager,
+                &mut self.wal,
+                &self.db_name,
+                false,
+            )
+        })()
+        .inspect_err(|err| {
+            // Recovery discarded the dirty cache and may have replayed only
+            // part of the WAL. The engine requires recovery even if it was healthy.
+            self.poison(format!("recovery failed: {err}"), pending_txid);
+        })?;
         self.install_loaded(loaded);
         self.health = EngineHealth::Healthy;
         let last_committed_txid = self.superblock.last_committed_txid;
@@ -469,9 +477,9 @@ impl<B: FileBackend> Engine<B> {
         })
     }
 
-    /// Installs committed pages and closes the files. A poisoned engine is
-    /// closed without a checkpoint: its memory is not trusted, and the WAL
-    /// already holds everything that was durable.
+    /// Installs committed pages and closes the files. If recovery is required,
+    /// skips the checkpoint because memory cannot be trusted. Durable commits
+    /// remain recoverable from the files.
     pub fn close(&mut self) -> Result<()> {
         if self.health == EngineHealth::Closed {
             return Ok(());
@@ -488,7 +496,7 @@ impl<B: FileBackend> Engine<B> {
         checkpoint.and(closed)
     }
 
-    /// Closes the files without installing anything. Durable commits stay in
+    /// Closes the files without a checkpoint. Uninstalled durable commits stay in
     /// the WAL and are replayed by the next open.
     pub fn abandon(&mut self) -> Result<()> {
         if self.health == EngineHealth::Closed {
@@ -510,8 +518,8 @@ impl<B: FileBackend> Engine<B> {
 
     /// Writes dirty pages to the main file and publishes the superblock.
     ///
-    /// Commit durability is the WAL flush. This is the later install step: one
-    /// main-file flush for every page staged since the previous checkpoint.
+    /// The WAL flush makes commits durable. Checkpoint flushes the main file
+    /// once for all pages staged since the previous checkpoint.
     /// The WAL is truncated only when memory has applied every flushed commit.
     pub fn checkpoint(&mut self) -> Result<()> {
         self.ensure_healthy()?;
@@ -521,7 +529,7 @@ impl<B: FileBackend> Engine<B> {
     }
 
     fn checkpoint_inner(&mut self, known_wal_len: Option<u64>) -> Result<()> {
-        if !self.pager.has_dirty() {
+        if !self.pager.has_dirty() && self.checkpoint_txid == self.superblock.last_committed_txid {
             return Ok(());
         }
         self.pager.write_back_dirty()?;
@@ -570,6 +578,7 @@ impl<B: FileBackend> Engine<B> {
             self.wal.flush()?;
         }
         self.pager.mark_dirty_clean();
+        self.checkpoint_txid = published.last_committed_txid;
         Ok(())
     }
 
@@ -600,8 +609,7 @@ impl<B: FileBackend> Engine<B> {
         Ok(tx_id)
     }
 
-    /// Always allowed, including on a poisoned engine, so callers can release
-    /// their handles before recovering.
+    /// Allows callers to release transaction handles even when recovery is required.
     pub fn rollback_tx(&mut self, tx_id: u64) -> Result<()> {
         let mut tx = self
             .txns
@@ -632,9 +640,8 @@ impl<B: FileBackend> Engine<B> {
             staged_schema_version,
             staged_change_feed_policy,
         } = write_tx;
-        // The single writer no longer needs its base snapshot. Keeping this
-        // reference through publication would force a full catalog copy even
-        // when there are no readers of the current version.
+        // Release the writer's snapshot before publication. Keeping it would
+        // force a catalog copy even with no readers of the current version.
         drop(snapshot);
         let result = self.commit_staged(stores, staged_schema_version, staged_change_feed_policy);
         if self.write_tx_open == Some(tx_id) {
@@ -1332,18 +1339,15 @@ impl<B: FileBackend> Engine<B> {
         })
     }
 
-    /// Bulk-loads the live contents of this database into `target`, a freshly
-    /// created empty database, writing its pages directly instead of through
-    /// the WAL. One store at a time streams through the target's builder, so
-    /// memory stays proportional to a page run rather than the database.
+    /// Bulk-loads live contents into a new, empty `target` without using its WAL.
+    /// Streams one store at a time with memory proportional to a page run.
     ///
-    /// Crash safety comes from the caller: the target generation is only
-    /// published (control file swap) after this returns.
+    /// The caller must activate the target generation only after this succeeds.
     pub fn compact_into(&mut self, target: &mut Engine<B>) -> Result<u64> {
         self.compact_into_skipping_stores(target, &[])
     }
 
-    /// Compacts into a fresh target, omitting only the explicitly named
+    /// Compacts into a new, empty target. Omits the change log and the named
     /// internal stores. SDK rebuild uses this before regenerating its indexes.
     pub fn compact_into_skipping_stores(
         &mut self,
@@ -1397,9 +1401,8 @@ impl<B: FileBackend> Engine<B> {
         let mut stores = CatalogMap::new();
         let mut page_batch = Vec::with_capacity(crate::pager::PAGE_WRITE_BATCH_PAGES);
         let mut page_buffer = Vec::new();
-        // Default compaction preserves every SDK-owned internal store. Rebuild
-        // may explicitly omit its known indexes; other internal stores survive.
-        // The change log is left behind, and the target's feed floor is past it.
+        // Retain internal stores unless explicitly skipped. Always omit the
+        // change log. The target feed floor excludes the source history.
         for (name, meta) in self.catalog.iter() {
             if name.as_str() == SYSTEM_CHANGELOG_STORE_NAME
                 || skipped_stores.contains(name.as_str())
@@ -1653,8 +1656,8 @@ impl<B: FileBackend> Engine<B> {
         };
 
         let mut wal_offset = self.wal.append_offset()?;
-        // From the first WAL byte on, a failure leaves the log tail and the
-        // outcome of this commit unknown. Only recovery can say which it was.
+        // After WAL writes start, a failure makes the commit outcome unknown.
+        // Recovery must determine whether the commit is durable.
         let appended = append_generated_transaction(
             &mut self.wal,
             &mut wal_offset,
@@ -1702,9 +1705,6 @@ impl<B: FileBackend> Engine<B> {
     }
 
     fn maybe_checkpoint(&mut self, wal_len: u64) -> Result<()> {
-        if !self.pager.has_dirty() {
-            return Ok(());
-        }
         if !self.checkpoint_failpoint_armed()
             && self.pager.dirty_page_count() < self.checkpoint_dirty_pages
             && wal_len < self.checkpoint_wal_bytes
@@ -1971,9 +1971,8 @@ fn build_store_commit<'a, B: FileBackend>(
     apply_value_mutations(pager, base.store_root_page_id, &mutations, alloc).map(Some)
 }
 
-/// Re-encodes a whole store after its value format changed (a TTL put into a
-/// store created before value envelopes). Streams the old tree and the staged
-/// mutations in key order into a new tree, then retires the old one.
+/// Re-encodes a legacy store after a TTL write enables value envelopes.
+/// Merges the old tree and staged mutations in key order, then retires the old tree.
 fn rewrite_store_fully<'a, B: FileBackend>(
     pager: &mut Pager<B>,
     base: &StoreMetadata,
@@ -2050,8 +2049,8 @@ fn plan_snapshot_apply(
     now_ms: u64,
     alloc: &mut PageAllocator,
 ) -> Result<CommitPlan> {
-    // The previous trees are not walked and retired here: reset and import
-    // replace the whole database, and compaction reclaims their pages.
+    // Reset and import leave the previous trees allocated. Compaction reclaims
+    // their pages without a full tree walk during replacement.
     let mut final_catalog = CatalogMap::new();
     let mut page_images = Vec::new();
 
@@ -2184,9 +2183,8 @@ fn decode_change_log_record_txid(key: &[u8]) -> Result<u64> {
     Ok(u64::from_be_bytes(txid_bytes))
 }
 
-/// Encodes this stage's change records. Clearing or dropping a store is one
-/// store-level record; deletes are recorded only for keys that existed, which
-/// is checked from metadata without reading values.
+/// Clear and drop each produce one store-level record. Delete records require
+/// a live committed key, checked from metadata without loading value bodies.
 fn collect_change_payloads<'a, B: FileBackend>(
     pager: &mut Pager<B>,
     store_name: &str,
@@ -2340,8 +2338,8 @@ fn normalize_expired_stage_mutations(stage: &mut StagedStore, now_ms: u64) {
     stage.has_expiring_mutations = Some(has_expiring_mutations);
 }
 
-/// Resolves equal sorted keys once, cloning only the independently owned
-/// output values. Reading each distinct key lazily preserves error precedence.
+/// Reads each distinct key in sorted order and stops at the first read error.
+/// Clones duplicate results so each output value has independent ownership.
 fn read_many_in_order<K: AsRef<[u8]>, V: Clone + Default>(
     keys: &[K],
     order: &[usize],
@@ -2395,7 +2393,7 @@ fn get_committed_visible_in_batch<B: FileBackend>(
     }
 }
 
-/// Existence from the leaf cell alone, plus only the TTL header for enveloped stores.
+/// Checks existence from leaf metadata and the TTL header without loading value bodies.
 fn exists_committed_visible<B: FileBackend>(
     pager: &mut Pager<B>,
     root_page_id: u64,
@@ -2557,8 +2555,8 @@ fn exists_with_staged_in_batch<B: FileBackend>(
     Ok(exists)
 }
 
-/// Staged expiry is visible immediately; committed expiry is collected for
-/// publication only after every metadata lookup in the batch succeeds.
+/// Converts expired staged values to deletes immediately. Defers committed
+/// expiry cleanup until every metadata lookup in the batch succeeds.
 fn exists_with_staged_deferred_base<B: FileBackend>(
     pager: &mut Pager<B>,
     rw: &mut ReadwriteTx,
@@ -2630,9 +2628,8 @@ fn delete_with_staged_at<B: FileBackend>(
     now_ms: u64,
 ) -> Result<bool> {
     let existed = exists_with_staged(pager, rw, store, key, now_ms)?;
-    // The existence lookup already stages expired values for deletion. A
-    // genuinely absent key needs no mutation, and an earlier staged delete
-    // must remain in place. The transaction still commits normally.
+    // The lookup already stages expired values as deletes. An absent key
+    // needs no new mutation. Keep any existing staged delete.
     if !existed {
         return Ok(false);
     }
@@ -2676,9 +2673,8 @@ fn scan_committed_visible<B: FileBackend>(
     Ok(rows)
 }
 
-/// Merges the committed tree with staged mutations lazily, in range order,
-/// so `limit` bounds the work in both directions instead of materializing
-/// the whole range first.
+/// Merges committed and staged rows lazily in range order. Stops at `limit`
+/// live rows in either direction without materializing the complete range.
 fn scan_with_staged<B: FileBackend>(
     pager: &mut Pager<B>,
     rw: &mut ReadwriteTx,
@@ -2816,8 +2812,8 @@ fn scan_with_staged<B: FileBackend>(
     Ok(rows)
 }
 
-/// Expiry from the envelope header only, so expired overflow values are
-/// skipped without reading their chains.
+/// Checks only the envelope header. Expired overflow values need no further
+/// chain reads after the header is available.
 fn pending_value_expired<B: FileBackend>(
     pager: &mut Pager<B>,
     store_flags: u64,

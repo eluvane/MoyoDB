@@ -215,8 +215,7 @@ const mutations = [
 ];
 
 for (const mutation of mutations) {
-    // Only generated, isolated copies are modified. No Git operation, checkout
-    // or patching of the user's actual source tree occurs.
+    // Mutate temporary copies so the source tree stays intact.
     const copy = join(work, `mutant-${mutation.name}`);
     mkdirSync(copy, { recursive: true });
     for (const file of ['Cargo.toml', 'Cargo.lock', 'LICENSE', 'README.md']) {
@@ -224,8 +223,7 @@ for (const mutation of mutations) {
     }
     mkdirSync(join(copy, 'crates'), { recursive: true });
     cpSync(join(root, 'crates', 'engine'), join(copy, 'crates', 'engine'), { recursive: true });
-    // Cargo artifacts include cdylib outputs with stable names. Distinct package
-    // and library identities isolate mutations while reusing only dependency builds.
+    // Distinct package and library names prevent cdylib cache collisions.
     const packageName = `moyodb-engine-checker-${mutation.name}`;
     const libraryName = `moyodb_engine_checker_${mutation.name}`;
     const manifestPath = join(copy, 'crates', 'engine', 'Cargo.toml');
@@ -255,7 +253,7 @@ for (const mutation of mutations) {
     negatives += 1;
 }
 
-// A final original-package pass detects accidental mutation leakage through caches.
+// Recheck the original package for cache contamination from the mutants.
 const restored = join(work, 'original-after-mutants.json');
 exportCorpus(root, restored);
 check(restored);

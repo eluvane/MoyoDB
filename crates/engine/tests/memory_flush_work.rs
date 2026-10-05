@@ -1,5 +1,5 @@
-// Compile the actual backend source with cfg(test) so its copy counter stays
-// absent from the production library and measures the copy operations directly.
+// Compile the backend with cfg(test) to access its copy counter.
+// The production library excludes this counter.
 pub mod error {
     pub use moyodb_engine::error::{EngineError, Result};
 }

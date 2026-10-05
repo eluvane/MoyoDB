@@ -4,9 +4,8 @@ use std::borrow::Cow;
 
 const READ_CHUNK_SIZE: usize = 64 * 1024;
 
-/// Two adjacent chunks let a header and its complete record share the same
-/// bytes, even when the header itself straddles a chunk boundary. Ordinary
-/// records borrow the chunk; only straddling records need a small assembly copy.
+/// Two adjacent chunks let header and record reads reuse bytes.
+/// Reads within a chunk borrow its bytes. Reads across chunks copy.
 pub(super) struct WalReadBuffer<'a, B: FileBackend> {
     wal: &'a B,
     file_len: u64,
@@ -41,8 +40,6 @@ impl<'a, B: FileBackend> WalReadBuffer<'a, B> {
         }
         let current_end = self.start + self.current.len() as u64;
         if self.current.is_empty() || offset >= current_end {
-            // A previous straddling read may already have fetched this chunk.
-            // Promote it rather than reading those bytes from the file again.
             match self.next.take() {
                 Some(next) if offset < current_end + next.len() as u64 => {
                     self.current = next;
@@ -254,8 +251,8 @@ mod tests {
 
     #[test]
     fn torn_transaction_after_split_header_keeps_committed_prefix() -> Result<()> {
-        // 1278 empty commit records and one page/commit pair end eight bytes
-        // before a chunk boundary. The next record's header straddles it.
+        // The committed prefix ends eight bytes before a chunk boundary.
+        // The next header crosses the boundary.
         let mut wal = MemoryBackend::new();
         let mut offset = 0;
         for txid in 1..=1278 {

@@ -2,8 +2,8 @@ export type TxMode = 'readonly' | 'readwrite';
 export type TxId = number;
 export type DebugFailpoint = 'after_wal_flush' | 'after_main_flush' | 'before_superblock_flush' | null;
 /**
- * `clear` and `drop` are store-level changes: they carry an empty key and
- * apply to every key of the store at that point of the transaction.
+ * `clear` and `drop` use an empty key. They affect every key in the store
+ * at that point in the transaction.
  */
 export type ChangeKind = 'put' | 'delete' | 'clear' | 'drop';
 export type Unsubscribe = () => void;
@@ -47,15 +47,15 @@ export interface OpenOptions {
     migrate?: MigrateHook;
     indexes?: IndexDef[];
     /**
-     * Persistent change feed policy. When omitted, the policy stored in the
-     * database is kept (new databases keep the last 100 000 transactions).
+     * If omitted, keep the stored change feed policy. New databases default
+     * to a retention target of 100,000 committed transactions.
      */
     changeFeed?: ChangeFeedSettings;
 }
 export interface ChangeFeedSettings {
-    /** Disabling drops the stored history; `changesSince` then only accepts the latest txid. */
+    /** Setting `false` deletes retained history. `changesSince` then accepts only the latest txid. */
     enabled?: boolean;
-    /** Committed transactions kept in the log; `null` keeps everything. */
+    /** Retention target in committed transactions. `null` disables retention pruning. */
     retainTxids?: number | null;
 }
 export interface PutOptions {

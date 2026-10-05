@@ -41,8 +41,7 @@ fn format_fixture() -> SnapshotContents {
 
 #[test]
 fn encoding_keeps_v3_bytes_input_order_and_expiry_metadata() {
-    // A fixed wire fixture, independent of encode_snapshot's field iteration.
-    // Its checksum field starts at zero and is filled from the fixed bytes.
+    // Fixed wire bytes provide an oracle independent of encode_snapshot.
     let mut expected: Vec<u8> = concat!(
         "42 44 53 4e 41 50 30 31 03 00 00 00 00 00 00 00 ",
         "80 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ",
@@ -107,8 +106,7 @@ fn duplicate_detection_keeps_its_store_scope_and_decoder_boundary() {
     let bytes = encode_snapshot(&contents).unwrap();
     assert_eq!(decode_snapshot(&bytes).unwrap(), contents);
 
-    // Duplicate store names are currently rejected by the decoder, whereas
-    // the encoder permits them. A copy optimization must keep this boundary.
+    // The encoder permits duplicate store names. The decoder must reject them.
     contents.stores[1].name = contents.stores[0].name.clone();
     let bytes = encode_snapshot(&contents).unwrap();
     let duplicate = decode_snapshot(&bytes).unwrap_err();

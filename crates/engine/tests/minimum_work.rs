@@ -8,8 +8,7 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-// Allocation counters belong to this test thread, so parallel test harness
-// activity does not enter a measurement. Setup and reporting stay untracked.
+// Thread-local counters exclude other tests. Setup and reporting are untracked.
 thread_local! {
     static ALLOCATION_WORK: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
 }
@@ -167,8 +166,8 @@ impl Profile {
     }
 }
 
-/// Matching deterministic workloads for before/after physical-work comparison.
-/// This reports allocator requests (including reallocations), not live memory.
+/// Deterministic workloads permit comparison across engine changes.
+/// Allocation totals include reallocations and do not measure live memory.
 #[test]
 fn profile_remaining_work() -> Result<()> {
     for feed in [false, true] {
@@ -188,8 +187,7 @@ fn profile_remaining_work() -> Result<()> {
                         }
                         engine.commit_tx(tx)?;
                     }
-                    // Count the complete physical work, including the final tail
-                    // checkpoint that normal close would otherwise perform.
+                    // Include the final checkpoint that close would otherwise perform.
                     engine.checkpoint()
                 },
             )?;

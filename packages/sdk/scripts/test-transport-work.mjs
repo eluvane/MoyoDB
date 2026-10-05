@@ -5,9 +5,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import ts from 'typescript';
 import { createTransportSuite } from '../tests/transport-work-suite.mjs';
 
-// Exercises the real client, server, protocol and scheduler without a browser,
-// WASM, OPFS, a build, or benchmark timing. Native structuredClone accounts for
-// the buffers that the message boundary actually copies and transfers.
+// Tests production client, server, protocol and scheduler without a browser, WASM or OPFS.
+// Native structuredClone preserves buffer copy and transfer behavior at the message boundary.
 const here = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
 const sourceIndex = args.indexOf('--source-root');
@@ -47,9 +46,8 @@ try {
     for (const name of ['worker-client', 'worker-server', 'worker-protocol', 'internal']) {
         const input = await readFile(join(source, `${name}.ts`), 'utf8');
         const instrumented = name === 'worker-server';
-        // A test-only AST receiver hook observes actual registrations. It
-        // returns the same receiver, evaluated once, without touching Promise
-        // methods, native prototypes, or production source files.
+        // Count then registrations in emitted test code. Evaluate each receiver
+        // once and leave Promise methods and native prototypes unchanged.
         const prefix = instrumented
             ? `export const __transportWorkCounter = { thenRegistrations: 0 };
 function __transportWorkReceiver(receiver) {

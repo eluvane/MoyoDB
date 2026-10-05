@@ -5,8 +5,8 @@ import { fileURLToPath } from 'node:url';
 import { chromium } from '@playwright/test';
 import { createServer, version as viteVersion } from 'vite';
 
-// Node 24+. Opt-in diagnostics only: nested inclusive times are not additive
-// and routing/wrappers perturb elapsed time. Use the stock suite for latency.
+// Requires Node 24+. Nested times include each other; do not add them.
+// Instrumentation changes elapsed time. Use the stock suite for latency measurements.
 /* global window:readonly */
 const kind = 'instrumented browser structural and inclusive layer measurement (separate from stock benchmark)';
 const notes = [
@@ -33,8 +33,7 @@ const out = path.resolve(
 );
 await fs.mkdir(path.dirname(out), { recursive: true });
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
-// Hash the supplied artifact before starting the browser; normal asset serving
-// below retains the original diagnostic's reads and response/cache behavior.
+// Hash assets before browser startup to keep manifest reads outside measurements.
 async function artifactManifest(directory, prefix = '') {
     const entries = [];
     for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
@@ -54,7 +53,7 @@ const plugins = [
     {
         name: 'measurement-engine-artifact',
         configureServer(server) {
-            server.middlewares.use(async (req, res, next) => {
+            const serveArtifact = async (req, res, next) => {
                 const pathname = new URL(req.url, 'http://127.0.0.1').pathname;
                 if (!pathname.startsWith('/engine/')) return next();
                 try {
@@ -72,6 +71,9 @@ const plugins = [
                 } catch (error) {
                     next(error);
                 }
+            };
+            server.middlewares.use((req, res, next) => {
+                void serveArtifact(req, res, next).catch(next);
             });
         }
     }

@@ -54,8 +54,7 @@ export async function checkCompressionWork(api: CompressionApi): Promise<{ cases
                 }
             }
 
-            // Incompressible fallback must use the same input that compression saw,
-            // not reopen the caller's mutable view after awaiting the stream.
+            // Compression and its raw fallback must use the same snapshot of the caller's input.
             const source = bytes(2064, true);
             const input = source.subarray(8, 2056);
             const expected = input.slice();

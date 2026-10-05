@@ -112,9 +112,9 @@ export class ChangeFeedCompactedError extends MoyoDbError {
     }
 }
 /**
- * The outcome of a commit could not be confirmed (storage failed at or after
- * the WAL append) or the engine hit an unrecoverable fault. The database
- * rejects further work until it is reopened, which replays durable state.
+ * The engine state could not be trusted, or automatic recovery failed.
+ * A failed commit may already be durable. The worker attempts recovery before
+ * a new transaction and after a failed commit. Recovery discards all open transactions.
  */
 export class RecoveryRequiredError extends MoyoDbError {
     constructor(message: string) {

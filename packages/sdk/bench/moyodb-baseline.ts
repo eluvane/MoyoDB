@@ -478,7 +478,7 @@ async function deleteDBIfExists(name: string): Promise<void> {
     try {
         await removeOpfsDbDirectory(name);
     } catch {
-        // Benchmark cleanup is best-effort; open/create will report real failures.
+        // Ignore cleanup failures. Database open/create reports storage errors.
     }
 }
 

@@ -19,13 +19,13 @@ theorem applyBatch_append (state : ModelMap) (first second : List Mutation) :
     applyBatch state (first ++ second) = applyBatch (applyBatch state first) second := by
   simp [applyBatch, List.foldl_append]
 
-/-- A decoded physical tree. Sharing across roots is allowed, within a root is checked. -/
+/-- Decoded physical tree. Checks reject sharing within a root and allow sharing across roots. -/
 inductive Tree where
   /-- A root-zero empty tree with no physical page. -/
   | empty
   /-- A physical leaf and its decoded rows. -/
   | leaf (pageId : Nat) (rows : ModelMap)
-  /-- An internal page with its level and ordered minimum-key child separators. -/
+  /-- Internal page with its level. Checks require ordered child minimum-key separators. -/
   | branch (pageId level : Nat) (children : List (Bytes × Tree))
   deriving Repr
 
@@ -132,7 +132,7 @@ theorem lookup_none_not_mem {rows : ModelMap} {key value : Bytes}
         · exact hk (congrArg Prod.fst hm.symm)
         · exact ih ht hm
 
-/-- Routing cannot invent an entry, independently of ordering or valid separators. -/
+/-- Every successful route returns an existing row, regardless of ordering or separators. -/
 theorem route_some_mem (fuel : Nat) (tree : Tree) (key value : Bytes)
     (h : route fuel tree key = some value) : (key, value) ∈ flatten fuel tree := by
   induction fuel generalizing tree with
@@ -149,7 +149,7 @@ theorem route_some_mem (fuel : Nat) (tree : Tree) (key value : Bytes)
                 simpa [route, hc] using h
               exact List.mem_flatMap.mpr ⟨child, chooseChild_mem hc, ih child.2 ht⟩
 
-/-- A finite check of present keys certifies routing for EVERY byte-string key. -/
+/-- A finite check of present keys proves routing agrees with lookup for every byte-string key. -/
 theorem routing_refines_lookup (fuel : Nat) (tree : Tree)
     (h : routingOK fuel tree = true) (key : Bytes) :
     route fuel tree key = lookup (flatten fuel tree) key := by
@@ -166,7 +166,7 @@ theorem routing_refines_lookup (fuel : Nat) (tree : Tree)
 /-- Traversal fuel allowing at most 48 internal levels followed by one leaf. -/
 def depthBudget : Nat := 49
 
-/-- Proofs erase at runtime; accepted data carries the checked obligations. -/
+/-- Certificate with checked obligations. Proof fields are erased at runtime. -/
 structure CertifiedTree (expected : ModelMap) where
   /-- The exact decoded tree accepted by certification. -/
   tree : Tree

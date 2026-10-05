@@ -13,7 +13,7 @@ pub fn crc32(bytes: &[u8]) -> u32 {
 }
 
 /// CRC32 of `bytes` as if `zero_len` bytes starting at `zero_start` were zero.
-/// Hashes the prefix, a run of zeroes and the suffix, so no page-sized copy is made.
+/// The region is clamped to the slice. No page copy is needed.
 pub fn checksum_with_zeroed_region(bytes: &[u8], zero_start: usize, zero_len: usize) -> u32 {
     #[cfg(test)]
     work::record(bytes.len());
@@ -31,9 +31,8 @@ pub fn checksum_with_zeroed_region(bytes: &[u8], zero_start: usize, zero_len: us
     hasher.finalize()
 }
 
-// A CRC difference propagates through each following zero bit linearly.
-// These tables apply the two fixed transformations needed by a WAL page record.
-// They are evaluated at compile time, including on targets without CRC intrinsics.
+// CRC differences propagate linearly through zero bits.
+// Fixed transforms avoid generic CRC combination for pages and full overflow chunks.
 const CRC32_POLYNOMIAL: u32 = 0xedb8_8320;
 type CrcTransform = [[u32; 256]; 4];
 
@@ -84,11 +83,9 @@ fn transform_crc(table: &CrcTransform, crc: u32) -> u32 {
 
 /// CRC32 of `prefix` followed by an immutable, freshly encoded page.
 ///
-/// The page encoder already hashed the page with its checksum field zeroed.
-/// Inserting that little-endian checksum changes the CRC by the checksum's
-/// linear propagation from the field to the page end. Combining this corrected
-/// page CRC with the prefix CRC avoids reading the page payload a second time.
-/// This requires the original page checksum; arbitrary input must be hashed.
+/// Requires an unchanged page and its checksum computed with the field zeroed.
+/// Correcting for the stored little-endian checksum avoids hashing the page again.
+/// Arbitrary input must be hashed directly.
 ///
 /// If `advance(c, n)` propagates a CRC difference through `n` zero bytes, the
 /// result is `advance(crc32(prefix), PAGE_SIZE) ^ c ^ advance(c, PAGE_SIZE - k)`,
@@ -127,10 +124,9 @@ pub(crate) fn crc32_with_generated_overflow(
         ^ !advance_crc(!chunk_checksum, OVERFLOW_CHUNK_LEN - chunk_len)
 }
 
-/// CRCs for chunks of two differently prefixed views of one payload. Visit
-/// the union of both page-boundary sequences with one incremental hasher.
+/// Hashes the payload once for two prefixed views with different chunk boundaries.
+/// Each prefix must be shorter than an overflow chunk.
 /// For cumulative CRCs a and b, CRC(payload[start..end]) = b ^ advance(a, len).
-/// The two output vectors are scoped to these immutable encoded values.
 pub(crate) fn paired_payload_checksums(
     first_prefix: &[u8],
     second_prefix: &[u8],
@@ -255,7 +251,6 @@ mod tests {
             let page_checksum = checksum_with_zeroed_region(&page, PAGE_HEADER_CHECKSUM_OFFSET, 4);
             page[PAGE_HEADER_CHECKSUM_OFFSET..PAGE_HEADER_CHECKSUM_OFFSET + 4]
                 .copy_from_slice(&page_checksum.to_le_bytes());
-            // Include empty/short prefixes and both page-aligned boundary sides.
             let prefix = vec![index as u8; [0, 1, 15, 40, 255, 4095, 4096, 4097][index % 8]];
             let mut complete = prefix.clone();
             complete.extend_from_slice(&page);

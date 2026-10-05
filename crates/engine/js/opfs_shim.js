@@ -7,16 +7,14 @@ const CONTROL_CHECKSUM_OFFSET = 24;
 const CONTROL_NAME_OFFSET = 32;
 const CONTROL_MAGIC = new Uint8Array([66, 68, 66, 82, 79, 79, 84, 49]);
 // Chromium rejects a SyncAccessHandle.write larger than a signed 32-bit count.
-// This is an API limit, not a batching target; the engine already owns the input.
 const OPFS_MAX_WRITE_SIZE = 0x7fffffff;
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 let rootDir = null;
 let nextSessionId = 1;
 const sessions = new Map();
-// Session data handles are private and exclusively owned. Rust backend aliases
-// share a handle, so successful writes/truncates keep one append offset coherent.
-// Authoritative length reads still reach OPFS for validation and statistics.
+// Exclusive session handles keep cached sizes valid across Rust backend clones.
+// Length checks for validation and statistics still query OPFS.
 const appendOffsets = new WeakMap();
 function namedError(name, message) {
     const error = new Error(message);
@@ -73,7 +71,7 @@ function writeU64(view, offset, value) {
     view.setBigUint64(offset, BigInt(value), true);
 }
 function readU64(view, offset) {
-    return Number(view.getBigUint64(offset, true));
+    return view.getBigUint64(offset, true);
 }
 function fnv1a32(bytes, zeroOffset = -1, zeroLength = 0) {
     let hash = 0x811c9dc5;
@@ -88,13 +86,12 @@ function fnv1a32(bytes, zeroOffset = -1, zeroLength = 0) {
 function isGenerationNameValid(name) {
     return typeof name === 'string' && /^gen-[a-z0-9]+-[a-z0-9]+$/i.test(name);
 }
-// Every byte must reach the file or the call fails: a short write that returns
-// normally would let callers publish state that is not on disk.
+// Returns only after all bytes are written. The caller must flush for durability.
 export function writeAll(handle, bytes, at) {
     let writtenTotal = 0;
     while (writtenTotal < bytes.length) {
-        // Preserve the engine's batch instead of fragmenting a WAL append.
-        // Only the browser's size limit or a short write needs a suffix view.
+        // Preserve the engine's batch; split only at the browser size limit or
+        // after a short write. Suffix views borrow the original buffer.
         const end = Math.min(bytes.length, writtenTotal + OPFS_MAX_WRITE_SIZE);
         const chunk = writtenTotal === 0 && end === bytes.length ? bytes : bytes.subarray(writtenTotal, end);
         const rawWritten = handle.write(chunk, { at: at + writtenTotal });
@@ -109,7 +106,7 @@ export function writeAll(handle, bytes, at) {
     }
     return writtenTotal;
 }
-// Fills `buffer` from `at`, stopping only at end of file. Bytes past EOF stay zero.
+// Reads until the buffer is full or a read returns zero. The unread suffix is unchanged.
 export function readAll(handle, buffer, at) {
     let readTotal = 0;
     while (readTotal < buffer.length) {
@@ -147,8 +144,8 @@ export function encodeControlSlot(generationCounter, activeGeneration) {
     view.setUint32(CONTROL_CHECKSUM_OFFSET, checksum, true);
     return slot;
 }
-// Returns null for any slot whose bytes do not checksum. Fields are interpreted
-// only after the checksum passes, so a torn slot never masks its valid sibling.
+// Reject incomplete slots and bad magic or checksums. Validate the remaining
+// fields after the checksum passes, so torn fields cannot mask a valid slot.
 export function decodeControlSlot(slotIndex, bytes) {
     if (bytes.length < CONTROL_SLOT_SIZE) {
         return null;
@@ -183,9 +180,9 @@ export function decodeControlSlot(slotIndex, bytes) {
         activeGeneration
     };
 }
-// `absent`  — the file is empty: no generation has ever been published.
-// `invalid` — the file has bytes but no slot checksums.
-// `valid`   — `control` is the newest checksummed slot.
+// `absent`: empty file.
+// `invalid`: nonempty file with no valid slot.
+// `valid`: `control` is the valid slot with the highest generation counter.
 export function readControlStateFromAccessHandle(accessHandle) {
     const size = Number(accessHandle.getSize());
     if (!Number.isSafeInteger(size) || size < 0) {
@@ -225,13 +222,9 @@ async function hasLegacyDataFiles(dbRoot, fileKind = 0) {
     }
     return await hasLegacyDataFiles(dbRoot, fileKind + 1);
 }
-// Resolves which directory holds the live database, failing closed on damage.
-//
-// Legacy root files are removed before the first write into a published
-// generation (see opfsCleanupInactiveEntries and opfsOpenActiveDb). So an
-// unreadable control file next to legacy files can only be a torn first
-// publication, and legacy is still authoritative. Without legacy files it is
-// real corruption of the pointer to live data.
+// Legacy files remain authoritative after a torn first publication. They must
+// be removed before a published generation accepts writes, so later control
+// damage cannot make stale legacy files appear current.
 async function resolveActiveGeneration(dbRoot) {
     const state = await readControlFile(dbRoot);
     if (state.status === 'valid') {
@@ -261,7 +254,11 @@ async function writeControlState(dbRoot, activeGeneration, expectedCurrentGenera
             );
         }
         const nextSlot = current.control ? (current.control.slotIndex === 0 ? 1 : 0) : 0;
-        const nextGenerationCounter = (current.control?.generationCounter ?? 0) + 1;
+        const generationCounter = current.control?.generationCounter ?? 0n;
+        if (generationCounter === 0xffffffffffffffffn) {
+            throw namedError('StorageError', 'control generation counter exhausted');
+        }
+        const nextGenerationCounter = generationCounter + 1n;
         const encoded = encodeControlSlot(nextGenerationCounter, activeGeneration);
         writeAll(accessHandle, encoded, nextSlot * CONTROL_SLOT_SIZE);
         accessHandle.flush();
@@ -295,8 +292,7 @@ async function createGenerationDirectory(dbRoot) {
 async function getDbRoot(encodedDbName, createIfMissing) {
     const stackdb = await getOrCreateStackdbRoot();
     if (createIfMissing) {
-        // This already returns an existing directory. A failed lookup first
-        // adds a storage round trip to every newly created database.
+        // Creation also opens existing directories, avoiding a separate lookup.
         return await stackdb.getDirectoryHandle(encodedDbName, { create: true });
     }
     const dbRoot = await lookupDirectoryHandle(stackdb, encodedDbName);
@@ -330,8 +326,7 @@ async function resolveActiveDataDir(dbRoot) {
     if (!activeDir) {
         throw corruptionError(`active generation ${activeGeneration} is missing`);
     }
-    // A crash after publication but before legacy cleanup leaves stale root
-    // files. They must be gone before this generation accepts writes.
+    // Remove stale legacy files before writes can make this generation newer.
     await removeLegacyDataFiles(dbRoot);
     return {
         dirHandle: activeDir,
@@ -361,8 +356,8 @@ function closeSessionsForDb(encodedDbName) {
     }
 }
 async function openSessionForDir(dbPath, dirHandle, generationName) {
-    // Generation resolution and legacy cleanup have already finished. Only
-    // independent file acquisitions overlap; no session is visible yet.
+    // Acquire independent files concurrently. Publish the session only after
+    // all handles are acquired; failures must release every acquired handle.
     const opened = await Promise.allSettled(
         FILE_NAMES.map(async (fileName) => {
             const fileHandle = await dirHandle.getFileHandle(fileName, { create: true });
@@ -381,14 +376,13 @@ async function openSessionForDir(dbPath, dirHandle, generationName) {
     }
     const failed = opened.find((result) => result.status === 'rejected');
     if (failed) {
-        // Drain every acquisition before failing, including late successes.
-        // Promise.all would let those handles escape cleanup after rejection.
+        // Waiting for all results also captures late successes for cleanup.
         for (const handle of handles.values()) {
             try {
                 handle.close();
             } catch {}
         }
-        // Preserve file-order error precedence, not completion-order races.
+        // Error precedence follows FILE_NAMES order, regardless of completion order.
         throw failed.reason;
     }
     const sessionId = nextSessionId;
@@ -477,8 +471,8 @@ export async function opfsReadActiveGeneration(encodedDbName) {
     const dbRoot = await getDbRoot(encodedDbName, false);
     return await resolveActiveGeneration(dbRoot);
 }
-// Rust supplies its owned WASM buffer as a view valid only during this call.
-// Keep the requested length contract even for a reused destination past EOF.
+// The WASM view is valid only during this synchronous call. Zero the unread
+// suffix to preserve the backend read contract when the destination is reused.
 export function opfsReadAtInto(sessionId, fileKind, offset, buffer) {
     const handle = getAccessHandle(sessionId, fileKind);
     const read = readAll(handle, buffer, Number(offset));
@@ -496,8 +490,8 @@ export function opfsWriteAt(sessionId, fileKind, offset, bytes) {
     try {
         const at = Number(offset);
         const written = writeAll(handle, bytes, at);
-        // An empty write never calls OPFS and cannot extend the file. An
-        // unobserved EOF cannot be inferred from a successful overwrite.
+        // Empty writes cannot extend the file. A successful overwrite alone
+        // cannot establish the full file length.
         if (written > 0) {
             const previous = appendOffsets.get(handle);
             const end = at + written;
@@ -509,8 +503,8 @@ export function opfsWriteAt(sessionId, fileKind, offset, bytes) {
         }
         return written;
     } catch (error) {
-        // A failed call can still have written a prefix. Recovery must observe
-        // the actual file, including when the browser throws a non-Error value.
+        // A failed write may leave a prefix. The next append must read the
+        // actual file length, even when the thrown value is not an Error.
         appendOffsets.delete(handle);
         throw error;
     }
@@ -551,9 +545,8 @@ export async function opfsPrepareRebuildTarget(encodedDbName) {
     const generationName = await createGenerationDirectory(dbRoot);
     return { generationName };
 }
-// Publishes `generationName` as the live database. Resolves only after the
-// control file has been flushed and read back selecting the new generation;
-// the caller may switch its live engine only after that.
+// Resolves after the control file is flushed and verified to select the new
+// generation. The caller may then switch its live engine.
 export async function opfsSwapActiveGeneration(encodedDbName, generationName, expectedCurrentGeneration) {
     if (!isGenerationNameValid(generationName)) {
         throw new Error(`invalid generation name ${generationName}`);
@@ -565,8 +558,8 @@ export async function opfsSwapActiveGeneration(encodedDbName, generationName, ex
     }
     await writeControlState(dbRoot, generationName, expectedCurrentGeneration ?? null);
 }
-// Legacy root files are removed strictly (see resolveActiveGeneration); stale
-// generation directories are best effort because nothing can select them.
+// Legacy-file removal must succeed to prevent stale fallback after control
+// damage. Inactive generation cleanup is best effort.
 export async function opfsCleanupInactiveEntries(encodedDbName) {
     const dbRoot = await lookupDirectoryHandle(await getOrCreateStackdbRoot(), encodedDbName);
     if (!dbRoot) {

@@ -1,6 +1,7 @@
 import type { Range } from './types';
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+const jsonDecoder = new TextDecoder('utf-8', { fatal: true });
 const TYPE_NULL = 0x10;
 const TYPE_FALSE = 0x20;
 const TYPE_TRUE = 0x21;
@@ -20,15 +21,25 @@ export function utf8Decode(bytes: Uint8Array): string {
     return decoder.decode(bytes);
 }
 export function jsonEncode(value: unknown): Uint8Array {
-    return utf8Encode(JSON.stringify(value));
+    const serialized = JSON.stringify(value) as string | undefined;
+    if (serialized === undefined) {
+        throw new TypeError('value has no JSON representation');
+    }
+    return utf8Encode(serialized);
 }
 export function jsonDecode<T>(bytes: Uint8Array): T {
-    return JSON.parse(utf8Decode(bytes)) as T;
+    return JSON.parse(jsonDecoder.decode(bytes)) as T;
 }
 export function u64Key(value: bigint | number): Uint8Array {
+    if (typeof value === 'number' && (!Number.isSafeInteger(value) || value < 0)) {
+        throw new RangeError('u64Key number inputs must be safe non-negative integers; use bigint for larger values');
+    }
     const asBigInt = typeof value === 'bigint' ? value : BigInt(value);
     if (asBigInt < 0n) {
         throw new RangeError('u64Key only accepts non-negative values');
+    }
+    if (asBigInt > F64_MASK) {
+        throw new RangeError('u64Key value exceeds the unsigned 64-bit range');
     }
     const buf = new ArrayBuffer(8);
     const view = new DataView(buf);
@@ -111,6 +122,13 @@ function encodeCompoundKeyPart(value: CompoundKeyPart): Uint8Array {
         return encodeSortableNumber(value);
     }
     if (typeof value === 'string') {
+        // Reject lone surrogates so TextEncoder cannot map distinct keys to U+FFFD.
+        for (const character of value) {
+            const codePoint = character.codePointAt(0) as number;
+            if (codePoint >= 0xd800 && codePoint <= 0xdfff) {
+                throw new TypeError('compound key string parts must contain valid Unicode scalar values');
+            }
+        }
         const body = utf8Encode(value);
         const out = new Uint8Array(1 + body.length);
         out[0] = TYPE_STRING;

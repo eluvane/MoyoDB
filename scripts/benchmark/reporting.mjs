@@ -6,6 +6,34 @@ export function readCliOption(argv, flag) {
     return index < 0 ? undefined : argv[index + 1];
 }
 
+const comparisonFields = [
+    'profile',
+    'browserName',
+    'browserVersion',
+    'persistentContext',
+    'indexedDbDurability',
+    'moyoDbDurability',
+    'sdkBuildMode',
+    'wasmBuildMode',
+    'backendPath',
+    'headless',
+    'recordCount',
+    'keySize',
+    'valueSize',
+    'batchSize',
+    'transactionBoundaries',
+    'warmupCount',
+    'sampleCount'
+];
+
+export function benchmarkCaseKey(suite, entry) {
+    const context = entry.comparisonContext;
+    if (!context || !comparisonFields.every((field) => Object.hasOwn(context, field))) {
+        return undefined;
+    }
+    return JSON.stringify([suite, entry.id, ...comparisonFields.map((field) => context[field])]);
+}
+
 export async function writeJsonFile(filePath, value) {
     await writeTextFile(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }

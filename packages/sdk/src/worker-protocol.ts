@@ -98,8 +98,8 @@ const PACKED_BINARY_LIST_V1 = 'moyodb:packed-binary-list:v1';
 const PACKED_NULLABLE_BINARY_LIST_V1 = 'moyodb:packed-nullable-binary-list:v1';
 const PACKED_SCAN_ROWS_V1 = 'moyodb:packed-scan-rows:v1';
 const PACKED_BATCH_OPS_V1 = 'moyodb:packed-batch-ops:v1';
-// Engine-native getMany output: u32 count | count x u32 length (u32::MAX =
-// missing) | concatenated values, all little-endian. Forwarded without repacking.
+// Engine getMany format: u32 count | count x u32 length | concatenated values.
+// Integers are little-endian; u32::MAX marks a missing value. No repacking is needed.
 const PACKED_OPTIONAL_VALUES_V1 = 'moyodb:packed-optional-values:v1';
 const BATCH_OP_DELETE = 0;
 const BATCH_OP_PUT = 1;
@@ -140,7 +140,7 @@ interface PackedIndexScanPage {
 export type WorkerProtocolReadyMessage = {
     type: typeof WORKER_PROTOCOL_READY;
     version: typeof WORKER_PROTOCOL_VERSION;
-    /** Optional capability: peers without it continue using single messages. */
+    /** Enables batching; omitted by peers that use single messages. */
     batching?: 1;
 };
 
@@ -231,7 +231,13 @@ export function isWorkerProtocolRequestBatchMessage(value: unknown): value is Wo
 }
 
 export function isWorkerProtocolResponseBatchMessage(value: unknown): value is WorkerProtocolResponseBatchMessage {
-    return isWorkerProtocolBatch(value, WORKER_PROTOCOL_RESPONSE_BATCH, 'responses');
+    if (!isWorkerProtocolBatch(value, WORKER_PROTOCOL_RESPONSE_BATCH, 'responses')) {
+        return false;
+    }
+    for (const response of (value as WorkerProtocolResponseBatchMessage).responses) {
+        if (!isWorkerProtocolResponseMessage(response)) return false;
+    }
+    return true;
 }
 
 function isWorkerProtocolBatch(value: unknown, type: string, items: string): boolean {
@@ -316,8 +322,7 @@ export function prepareWorkerCommandPayload<M extends WorkerCommand>(
     if (command === 'autocommit') {
         const [mode, inner, innerArgs] = args as WorkerCommandArgs<'autocommit'>;
         if (isAutocommitCommand(inner) && Array.isArray(innerArgs)) {
-            // Inner arguments are packed exactly as for the transaction-scoped
-            // command; the placeholder transaction id is stripped again.
+            // The normal packer expects a transaction ID. Use a placeholder, then remove it.
             const prepared = prepareWorkerCommandPayload(inner, [0, ...innerArgs] as never);
             return {
                 args: [mode, inner, (prepared.args as unknown[]).slice(1)],
@@ -415,21 +420,30 @@ export function decodeWorkerCommandPayload<M extends WorkerCommand>(
 
     if (command === 'getMany' || command === 'deleteMany') {
         const [txId, store, keys] = args as WorkerCommandArgs<'getMany'> | WorkerCommandArgs<'deleteMany'>;
-        if (isPackedBinaryList(keys)) {
+        if (!Array.isArray(keys)) {
+            if (!isPackedBinaryList(keys)) {
+                throw workerProtocolError('WorkerProtocolError', 'invalid packed binary-list argument');
+            }
             return [txId, store, unpackBinaryList(keys)] as WorkerCommandArgs<M>;
         }
     }
 
     if (command === 'putMany') {
         const [txId, store, entries, options] = args as WorkerCommandArgs<'putMany'>;
-        if (isPackedBinaryList(entries)) {
+        if (!Array.isArray(entries)) {
+            if (!isPackedBinaryList(entries)) {
+                throw workerProtocolError('WorkerProtocolError', 'invalid packed putMany argument');
+            }
             return [txId, store, unpackBinaryPairs(entries), options] as WorkerCommandArgs<M>;
         }
     }
 
     if (command === 'applyBatch') {
         const [txId, store, ops] = args as WorkerCommandArgs<'applyBatch'>;
-        if (isPackedBatchOps(ops)) {
+        if (!Array.isArray(ops)) {
+            if (!isPackedBatchOps(ops)) {
+                throw workerProtocolError('WorkerProtocolError', 'invalid packed batch argument');
+            }
             return [txId, store, unpackBatchOps(ops)] as WorkerCommandArgs<M>;
         }
     }
@@ -574,9 +588,7 @@ export function prepareWorkerResponsePayload<M extends WorkerCommand>(
         };
     }
 
-    // The remaining command results are protocol scalars, voids, or JSON-like
-    // metadata. Avoid a generic deep walk when the result type cannot contain
-    // transfer-worthy binary payloads.
+    // Remaining result types contain no binary payloads, so they need no buffer walk.
     return {
         result,
         transfer: []
@@ -595,14 +607,28 @@ export function decodeWorkerResponsePayload<M extends WorkerCommand>(
         return unpackPackedOptionalValues(result.bytes) as WorkerCommandResult<M>;
     }
 
-    if (command === 'scanByIndexPage' && isRecord(result)) {
+    if (command === 'getMany' && !Array.isArray(result)) {
+        throw workerProtocolError('WorkerProtocolError', 'invalid packed getMany response');
+    }
+
+    if (command === 'scanByIndexPage') {
+        if (
+            !isRecord(result) ||
+            (!Array.isArray(result.rows) && !isPackedScanRows(result.rows)) ||
+            (result.cursor !== null && !(result.cursor instanceof Uint8Array))
+        ) {
+            throw workerProtocolError('WorkerProtocolError', 'invalid packed index scan page response');
+        }
         const rows = isPackedScanRows(result.rows) ? unpackScanRows(result.rows) : result.rows;
-        const cursor = result.cursor instanceof Uint8Array ? result.cursor : null;
-        return { rows, cursor } as WorkerCommandResult<M>;
+        return { rows, cursor: result.cursor } as WorkerCommandResult<M>;
     }
 
     if ((command === 'scan' || command === 'scanByIndex') && isPackedScanRows(result)) {
         return unpackScanRows(result);
+    }
+
+    if ((command === 'scan' || command === 'scanByIndex') && !Array.isArray(result)) {
+        throw workerProtocolError('WorkerProtocolError', 'invalid packed scan response');
     }
 
     return result;
@@ -624,9 +650,9 @@ export function collectTransferablesForValue(value: unknown): Transferable[] {
 }
 
 /**
- * Snapshot at the original postMessage point, before a batching microtask can
- * observe further caller/API mutations. Newly prepared buffers move into this
- * snapshot; ordinary caller buffers are cloned once and then moved on delivery.
+ * Capture the message before batching can observe later mutations. Listed
+ * transferables move into the snapshot; other ArrayBuffers are cloned.
+ * SharedArrayBuffers remain shared. byteLength is a batch-size estimate.
  */
 export function captureWorkerPayload<T>(
     value: T,
@@ -1158,7 +1184,10 @@ function packBatchOps(ops: Array<BatchOp>): PackedBatchOpsV1 {
     const metadataBytes = checkedByteCount(count, 9, 'packed batch metadata');
     let payloadBytes = 0;
     for (let index = 0; index < count; index += 1) {
-        const op = ops[index];
+        const op: unknown = ops[index];
+        if (!isRecord(op) || (op.kind !== 'put' && op.kind !== 'delete')) {
+            throw workerProtocolError('WorkerProtocolError', 'batch operation kind is not put or delete');
+        }
         if (!(op.key instanceof Uint8Array)) {
             throw workerProtocolError('WorkerProtocolError', 'batch operation key is not a Uint8Array');
         }

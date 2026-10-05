@@ -22,8 +22,7 @@ import {
     writeVerificationIndices
 } from './workloads';
 
-// Keys are the same bytes MoyoDB stores; IndexedDB orders binary keys bytewise,
-// so ranges and reverse scans select the same records in both engines.
+// Use the same key bytes and byte order as MoyoDB so scan results match.
 type IdbKey = Uint8Array<ArrayBuffer>;
 type IdbEntry = [IdbKey, Uint8Array];
 
@@ -435,7 +434,7 @@ async function smallTxCommits(
     }
 }
 
-/** One request outstanding at a time: the next get is issued from the previous success handler. */
+// Keep one request pending. Issue the next get in the success handler to keep the transaction active.
 function sequentialGets(db: IDBDatabase, keys: IdbKey[]): Promise<unknown[]> {
     const tx = db.transaction(STORE_NAME, 'readonly');
     const store = tx.objectStore(STORE_NAME);

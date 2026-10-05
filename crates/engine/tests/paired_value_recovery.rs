@@ -86,7 +86,7 @@ fn large_user_and_feed_values_recover_at_each_publication_boundary() -> Result<(
             assert_eq!(&record.key, key);
             assert_eq!(record.value.as_deref(), Some(value.as_slice()));
         }
-        // The recovery install is repeatable and preserves both copies.
+        // Repeated recovery must preserve the latest change-feed transaction.
         let latest = feed.latest_tx_id;
         recovered.recover()?;
         assert_eq!(
@@ -209,8 +209,7 @@ fn overwrites_keep_snapshot_values_and_feed_history_independent() -> Result<()> 
     assert_eq!(feed.changes[1].tx_id, second);
     assert_eq!(feed.changes[1].value.as_deref(), Some(new.as_slice()));
 
-    // Retiring both the current user value and old feed records must not retire
-    // the value still referenced by the older transaction snapshot.
+    // Deletion and feed pruning must retain the value referenced by the old snapshot.
     let tx = engine.begin_tx(TxMode::Readwrite)?;
     engine.delete(tx, "docs", key)?;
     engine.set_change_feed_policy(

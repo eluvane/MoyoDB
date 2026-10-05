@@ -13,8 +13,7 @@ use crate::value::{
 };
 use zerocopy::IntoBytes;
 
-/// The prior contiguous encoder, retained only as a disk-byte oracle. It
-/// initializes a whole page to zero and hashes every byte of the complete page.
+// Independent byte-for-byte reference: zero the page and hash its full image.
 fn reference_page(page_id: u64, next: u64, chunk: &[u8]) -> Vec<u8> {
     let start = PAGE_HEADER_SIZE + 12;
     let header = PageHeader {

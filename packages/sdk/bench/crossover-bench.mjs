@@ -5,7 +5,6 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { chromium } from '@playwright/test';
 import { createServer, version as viteVersion } from 'vite';
 
-// Browser callbacks passed to page.evaluate execute in the page's global scope.
 /* global window:readonly */
 
 // Run with Node 24+ from the repository root after npm ci and both WASM builds.
@@ -66,7 +65,7 @@ const plugins = [
     {
         name: 'verified-single-profile-engine-crossover',
         configureServer(server) {
-            server.middlewares.use(async (request, response, next) => {
+            const serveArtifact = async (request, response, next) => {
                 const pathname = new URL(request.url, 'http://127.0.0.1').pathname;
                 if (!pathname.startsWith('/engine/')) return next();
                 const artifact = activeArtifact;
@@ -101,6 +100,9 @@ const plugins = [
                 } finally {
                     pendingAssetReads--;
                 }
+            };
+            server.middlewares.use((request, response, next) => {
+                void serveArtifact(request, response, next).catch(next);
             });
         }
     }
@@ -134,15 +136,13 @@ try {
         browser = await chromium.launch(launchOptions);
         context = await browser.newContext();
     }
-    // launchPersistentContext may create an initial about:blank page. Every
-    // page here belongs to this newly created task-owned browser context.
+    // A persistent context may include an initial about:blank page.
     for (const initialPage of context.pages()) await initialPage.close();
     for (let round = 0; round < 6; round++) {
-        const order = round % 2 === 0 ? artifacts : [...artifacts].reverse();
+        const order = round % 2 === 0 ? artifacts : artifacts.toReversed();
         for (const artifact of order) {
-            // Close the previous suite's page while its artifact remains selected.
-            // detectWasmBuildProfile retains an initialized WASM instance in that
-            // page's module map; a shared page would retain only the first artifact.
+            // Close the page before switching artifacts. Its environment probe
+            // caches the initialized WASM module, so each artifact needs a fresh page.
             if (page) {
                 await page.close();
                 page = undefined;
@@ -208,9 +208,8 @@ try {
                 { workloadNames, round, persistent, variant: artifact.name, baseGitSha }
             );
             if (pendingAssetReads !== 0) throw Error('stock suite returned with pending engine asset reads');
-            // The stock environment detector awaited this exact import before
-            // creating any DB Worker. Confirm the cached main-page instance is
-            // still initialized without causing another engine asset fetch.
+            // Check the instance cached by the environment probe without fetching
+            // engine assets again.
             const responsesBeforeMainCheck = assetResponses.length;
             const mainPageBuildProfile = await page.evaluate(async () => {
                 const engine = await import(new URL('/engine/moyodb_engine.js', window.location.href).href);
@@ -251,8 +250,8 @@ try {
                     `unexpected fresh engine fetches ${activeSuite}: workers=${dbWorkerLoads}, wasm=${wasmResponses.length}, glue=${glueResponses.length}, snippets=${JSON.stringify(snippetLoadsByPath)}, expected workers=${expectedWorkerLoads} plus one main-page probe`
                 );
             }
-            // detectBenchEnvironment awaits the main-page probe before running
-            // any workload, so these first responses identify the page instance.
+            // The environment probe runs before workloads, so the first responses
+            // belong to the main page.
             const mainPageProbe = {
                 wasm: wasmResponses[0],
                 glue: glueResponses[0],

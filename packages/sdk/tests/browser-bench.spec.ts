@@ -25,16 +25,14 @@ const gitSha = proc?.env?.MOYODB_BENCH_GIT_SHA ?? proc?.env?.GITHUB_SHA ?? 'unkn
 const indexedDbDurability = normalizeDurability(proc?.env?.MOYODB_BENCH_IDB_DURABILITY);
 const persistentContext = proc?.env?.MOYODB_BENCH_PERSISTENT_CONTEXT === '1';
 
-// Keep the ordinary incognito fixture as the default. The persistent variant
-// launches its own browser, without also requesting the default browser fixture.
+// Use the Playwright fixture to avoid launching an unused default browser.
 const test = persistentContext
     ? base.extend({
           context: async ({ playwright, browserName, launchOptions, headless, channel, baseURL }, use) => {
               const userDataDir = await mkdtemp(join(tmpdir(), 'moyodb-bench-profile-'));
               let context: BrowserContext | undefined;
               try {
-                  // Playwright applies the project's context options to contexts
-                  // created through its playwright fixture, including this one.
+                  // The Playwright fixture supplies project context options here.
                   context = await playwright[browserName].launchPersistentContext(userDataDir, {
                       ...launchOptions,
                       headless,

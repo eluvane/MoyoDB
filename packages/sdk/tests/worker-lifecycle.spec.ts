@@ -85,7 +85,7 @@ test('independent databases can open and write concurrently', async ({ page }) =
                 }
             })
         );
-        // Both workers finish before deletion, even if one open failed.
+        // Deletion must wait for both attempts, including a failed open.
         await Promise.all(dbNames.map((name) => window.moyodb.deleteDB(name)));
         return settled.map((result) =>
             result.status === 'fulfilled'
@@ -97,4 +97,99 @@ test('independent databases can open and write concurrently', async ({ page }) =
         { status: 'fulfilled', value: 'value-0' },
         { status: 'fulfilled', value: 'value-1' }
     ]);
+});
+
+test('concurrent same-name opens retain independent handles on one owner', async ({ page }) => {
+    await prepareMoyoDbPage(page);
+    const result = await page.evaluate(async (name) => {
+        const settled = await Promise.allSettled([
+            window.moyodb.openDB(name, { requestPersistence: false }),
+            window.moyodb.openDB(name, { requestPersistence: false })
+        ]);
+        const outcomes = settled.map((item) => (item.status === 'fulfilled' ? 'opened' : (item.reason as Error).name));
+        const handles = settled.flatMap((item) => (item.status === 'fulfilled' ? [item.value] : []));
+        try {
+            if (handles.length !== 2) {
+                return { outcomes, stores: null };
+            }
+            await handles[0].createStore('shared');
+            await handles[0].close();
+            return { outcomes, stores: await handles[1].listStores() };
+        } finally {
+            await Promise.all(handles.map((handle) => handle.close()));
+        }
+    }, uniqueDbName('same-name-opens'));
+    expect(result).toEqual({ outcomes: ['opened', 'opened'], stores: ['shared'] });
+});
+
+test('closing a shared handle consumes its pending begin before resolving', async ({ page }) => {
+    await prepareMoyoDbPage(page);
+    const result = await page.evaluate(async (name) => {
+        const first = await window.moyodb.openDB(name, { requestPersistence: false });
+        const second = await window.moyodb.openDB(name, { requestPersistence: false });
+        try {
+            const pending = first.begin('readwrite');
+            const settled = Promise.allSettled([pending]);
+            await first.close();
+            const [begun] = await settled;
+            const beginError = begun.status === 'rejected' ? (begun.reason as Error).name : 'NO_ERROR';
+            // A fulfilled begin must be rolled back so a regression cannot block the next writer.
+            if (begun.status === 'fulfilled') {
+                await begun.value.rollback();
+            }
+            const stats = await second.stats();
+            const writer = await second.begin('readwrite');
+            await writer.rollback();
+            return { beginError, activeTransactions: stats.active_txns };
+        } finally {
+            await Promise.all([first.close(), second.close()]);
+        }
+    }, uniqueDbName('close-pending-begin'));
+    expect(result).toEqual({ beginError: 'DatabaseClosedError', activeTransactions: 0 });
+});
+
+test('repeated close waits for worker cleanup', async ({ page }) => {
+    await prepareMoyoDbPage(page);
+    const result = await page.evaluate(async (name) => {
+        const db = await window.moyodb.openDB(name, { requestPersistence: false });
+        const first = db.close();
+        let repeatedFinished = false;
+        const repeated = db.close().then(() => {
+            repeatedFinished = true;
+        });
+        // Worker replies require a browser task. Microtasks keep cleanup pending during this check.
+        for (let index = 0; index < 20; index += 1) {
+            await Promise.resolve();
+        }
+        const finishedBeforeCleanup = repeatedFinished;
+        await Promise.all([first, repeated]);
+        const reopened = await window.moyodb.openDB(name, { requestPersistence: false });
+        try {
+            return { finishedBeforeCleanup, stores: await reopened.listStores() };
+        } finally {
+            await reopened.close();
+        }
+    }, uniqueDbName('repeated-close'));
+    expect(result).toEqual({ finishedBeforeCleanup: false, stores: [] });
+});
+
+test('reset consumes a begin requested before transaction invalidation', async ({ page }) => {
+    await prepareMoyoDbPage(page);
+    const result = await page.evaluate(async (name) => {
+        const db = await window.moyodb.openDB(name, { requestPersistence: false });
+        try {
+            const pending = db.begin('readonly');
+            const settled = Promise.allSettled([pending]);
+            await db.reset();
+            const [begun] = await settled;
+            const stats = await db.stats();
+            return {
+                beginError: begun.status === 'rejected' ? (begun.reason as Error).name : 'NO_ERROR',
+                activeTransactions: stats.active_txns
+            };
+        } finally {
+            await db.close();
+        }
+    }, uniqueDbName('reset-pending-begin'));
+    expect(result).toEqual({ beginError: 'TransactionClosedError', activeTransactions: 0 });
 });

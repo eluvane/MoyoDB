@@ -91,8 +91,8 @@ fn scenario(name: &str, batches: Vec<Vec<OwnedMutation>>, witness: bool) -> Resu
         }
         pager.flush()?;
         pager = Pager::new(pager.into_inner(), 128);
-        // Read the actual backend images, including all unchanged and retained pages.
-        // No Rust decoder supplies Lean's expected contents or structural facts.
+        // Include unchanged and retained backend images. Lean derives page
+        // contents and structure independently of the Rust decoder.
         let mut pages = Vec::new();
         for id in &captured_ids {
             let bytes = pager.read_page(*id)?;
@@ -132,8 +132,8 @@ fn scenario(name: &str, batches: Vec<Vec<OwnedMutation>>, witness: bool) -> Resu
             }));
         }
         if witness {
-            // The separator mutant preserves the full scan: the negative witness
-            // must concern physical routing, not a compiler failure or lost inputs.
+            // The separator mutant must preserve all scan rows. The negative
+            // witness must expose a routing error with no lost inputs.
             let actual = scan(&mut pager, root, &RangeSpec::default())?;
             let input: Vec<_> = batch
                 .iter()

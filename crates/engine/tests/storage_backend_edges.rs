@@ -55,6 +55,52 @@ fn memory_backend_rejects_operations_after_close() {
 }
 
 #[test]
+fn memory_backend_rejects_unrepresentable_read_capacity_without_poisoning_state() {
+    let backend = MemoryBackend::from_durable(b"stable".to_vec());
+    let oversized = isize::MAX as usize + 1;
+
+    assert!(matches!(
+        backend.read_at(0, oversized).unwrap_err(),
+        EngineError::Storage(_)
+    ));
+    assert_eq!(backend.read_at(0, 6).unwrap(), b"stable");
+}
+
+#[test]
+fn memory_backend_rejects_unrepresentable_write_capacity_without_poisoning_state() {
+    let mut backend = MemoryBackend::from_durable(b"stable".to_vec());
+    backend.write_at(0, b"S").unwrap();
+    let oversized = isize::MAX as u64 + 1;
+
+    assert!(matches!(
+        backend.write_at(oversized - 1, b"x").unwrap_err(),
+        EngineError::Storage(_)
+    ));
+    assert_eq!(backend.len().unwrap(), 6);
+    assert_eq!(backend.read_at(0, 6).unwrap(), b"Stable");
+    assert_eq!(backend.durable_snapshot().unwrap(), b"stable");
+    backend.flush().unwrap();
+    assert_eq!(backend.durable_snapshot().unwrap(), b"Stable");
+}
+
+#[test]
+fn memory_backend_rejects_unrepresentable_truncate_capacity_without_poisoning_state() {
+    let mut backend = MemoryBackend::from_durable(b"stable".to_vec());
+    backend.write_at(0, b"S").unwrap();
+    let oversized = isize::MAX as u64 + 1;
+
+    assert!(matches!(
+        backend.truncate(oversized).unwrap_err(),
+        EngineError::Storage(_)
+    ));
+    assert_eq!(backend.len().unwrap(), 6);
+    assert_eq!(backend.read_at(0, 6).unwrap(), b"Stable");
+    assert_eq!(backend.durable_snapshot().unwrap(), b"stable");
+    backend.flush().unwrap();
+    assert_eq!(backend.durable_snapshot().unwrap(), b"Stable");
+}
+
+#[test]
 #[cfg(not(target_arch = "wasm32"))]
 fn native_opfs_backend_reports_unsupported_platform() {
     let mut backend = OpfsBackend::new(7, 1);

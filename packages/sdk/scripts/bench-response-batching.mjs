@@ -8,11 +8,10 @@ import { parseArgs } from 'node:util';
 import { pathToFileURL } from 'node:url';
 import { isMainThread, parentPort, Worker, workerData } from 'node:worker_threads';
 
-// A transport component benchmark, NOT a database/browser/IndexedDB benchmark.
-// Both variants use their real SDK client, protocol and server in a real Node
-// Worker. The engine is an identical preloaded in-memory fixture, without WASM,
-// OPFS, persistence or B-tree work. Compilation, Worker startup, preload and
-// byte-for-byte verification are outside the timed region in BOTH variants.
+// Measures SDK client, protocol and server transport in a Node Worker.
+// Both variants use the same preloaded memory fixture. WASM, OPFS, persistence
+// and B-tree work are excluded. Compilation, Worker startup, preload and byte
+// verification are outside both timed regions.
 const modules = ['worker-client', 'worker-server', 'worker-protocol', 'internal'];
 
 async function compile(source, destination) {
@@ -165,7 +164,7 @@ async function sample(connection, spec) {
         await client.rollback(txId);
     }
     const elapsedMs = performance.now() - start;
-    // Exclude the two unchanged begin/rollback messages from get-only counts.
+    // Subtract begin and rollback messages to count only get requests.
     const requestMessages = connection.requestMessages - requestStart - 2;
     const counts = await client.stats();
     assert.equal(counts.gets, spec.count);

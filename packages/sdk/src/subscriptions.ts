@@ -114,6 +114,9 @@ export class SubscriptionHub {
             return;
         }
         this.#closed = true;
+        for (const entry of this.#entries) {
+            entry.active = false;
+        }
         this.#entries.clear();
         this.#disposeChannel();
     }

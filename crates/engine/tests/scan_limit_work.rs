@@ -205,8 +205,7 @@ impl Fixture {
             .find(|cell| cell.key == key)
             .expect("fixture expiry cell");
         let mut stored = StoredValue::decode_for_store(self.store_flags, &cell.value)?;
-        // A valid expired committed envelope makes this independent of sleeps
-        // and of the time spent seeding or compiling the test.
+        // A fixed expired timestamp makes the fixture independent of test timing.
         stored.expires_at_ms = Some(1);
         cell.value = stored.encode_for_store(self.store_flags)?;
         cell.total_value_len = u32::try_from(cell.value.len()).expect("small fixture value");
@@ -248,8 +247,8 @@ fn assert_limit_work(reverse: bool, staged: bool) -> Result<()> {
     let ro = readonly.engine.begin_tx(TxMode::Readonly)?;
     let rw = readwrite.engine.begin_tx(TxMode::Readwrite)?;
     if staged {
-        // put checks the committed key with lookup_prefix. has performs that
-        // same lookup in the reference engine, so both caches start alike.
+        // has and put both use lookup_prefix on the committed key.
+        // Warm both caches through that lookup before comparing scan reads.
         assert!(readonly.engine.has(ro, "kv", key)?);
         readwrite.engine.put(rw, "kv", key, b"fresh")?;
     }

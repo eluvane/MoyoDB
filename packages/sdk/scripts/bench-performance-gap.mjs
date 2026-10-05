@@ -8,8 +8,8 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 
-// Runs the repository's actual, unmodified browser workload runners. Diagnostic
-// mode is separate: its instrumented timings must never become an A/B baseline.
+// Stock mode uses unchanged browser workload runners for A/B comparisons.
+// Diagnostic instrumentation changes timings.
 const here = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(here, '../../..');
 const defaultWorkloads = [
@@ -168,8 +168,8 @@ if (engines.includes('moyodb')) {
     );
 }
 
-// Serialized into each diagnostic Worker. No imports or engine initialization
-// occur here: the original Worker retains its normal module-loading order.
+// Serialized into each diagnostic Worker. Keep imports and engine initialization
+// in the original Worker to preserve module load order.
 function installWorkerProbe(config) {
     const self = globalThis;
     const { navigator } = self;
@@ -296,8 +296,7 @@ function installWorkerProbe(config) {
     } catch (error) {
         hookErrors.push(`installation: ${error.name}: ${error.message}`);
     }
-    // Count the real protocol envelopes. Diagnostic control messages are kept
-    // outside the SDK and excluded from message accounting.
+    // Exclude diagnostic control messages from SDK protocol counts.
     self.addEventListener('message', (event) => {
         const data = event.data;
         if (data?.[config.token] === 'snapshot') {
@@ -305,8 +304,7 @@ function installWorkerProbe(config) {
             emitSnapshot(data.requestId);
             return;
         }
-        // Module import is asynchronous; retain messages sent immediately to
-        // raw capability-probe Workers until their original handler exists.
+        // Queue messages until the imported Worker module installs its handlers.
         if (!imported) {
             event.stopImmediatePropagation();
             queuedUntilImport.push({ data, origin: event.origin, ports: event.ports });
@@ -342,8 +340,7 @@ function installWorkerProbe(config) {
                 pending.delete(reply.id);
             }
         }
-        // The final stats arrive before the SDK sees close/destroy completion
-        // and terminates the Worker. Native close/termination is never delayed.
+        // Send final stats before the close/destroy response lets the SDK terminate this Worker.
         if (closing) emitSnapshot();
         return nativePost(...args);
     };
@@ -431,7 +428,6 @@ function installWorkerProbe(config) {
     };
 }
 
-// Installed before the page's first script, and only in diagnostic mode.
 function installPageProbe({ token, workerProbeSource }) {
     const { location } = globalThis;
     const NativeWorker = globalThis.Worker;
@@ -442,11 +438,8 @@ function installPageProbe({ token, workerProbeSource }) {
     class DiagnosticWorker extends NativeWorker {
         constructor(url, options) {
             const originalUrl = new URL(String(url), location.href).href;
-            // Keep stock environment/capability/echo Workers wholly untouched.
-            // The SDK waits for protocol READY, so its open request cannot be
-            // lost while the wrapper imports the original Worker module.
+            // SDK requests wait for READY, so module import cannot lose the open request.
             if (!new URL(originalUrl).pathname.endsWith('/src/worker.ts')) return new NativeWorker(url, options);
-            // All Workers in the six stock workloads are module Workers.
             if (options?.type !== 'module')
                 throw new Error(`Diagnostic wrapper requires a module Worker: ${originalUrl}`);
             const bootstrap = `(${workerProbeSource})(${JSON.stringify({ token })});\nawait import(${JSON.stringify(originalUrl)});\nself.__moyoBrowserBenchDiagnostic.imported();`;
@@ -541,7 +534,7 @@ function installPageProbe({ token, workerProbeSource }) {
                 const delta = { ...item };
                 for (const field of ['calls', 'errors', 'elapsedMs', 'requestedBytes', 'transferredBytes'])
                     delta[field] -= previous?.[field] ?? 0;
-                // maxRequestBytes is cumulative per Worker/file/method, not an additive delta.
+                // Keep the lifetime maximum per Worker, file and operation; do not subtract it.
                 delta.maxRequestBytesScope = 'worker-lifetime';
                 metrics.push(delta);
             }
@@ -590,7 +583,9 @@ function installPageProbe({ token, workerProbeSource }) {
         records,
         snapshots,
         async wrapRunners() {
-            const { moyoDbBaseline } = await import('/bench/moyodb-baseline.ts');
+            const { moyoDbBaseline } = await import(
+                new URL('/bench/moyodb-baseline.ts', globalThis.location.href).href
+            );
             const prepare = moyoDbBaseline.prepare;
             moyoDbBaseline.prepare = async (ctx) => {
                 const cleanup = await measure(ctx, 'prepare', () => prepare(ctx));
@@ -604,12 +599,12 @@ function installPageProbe({ token, workerProbeSource }) {
     };
 }
 
-// Independent post-suite probe. Its writes, byte verification, API close-return
-// time and reopen time are never included in the headline workload samples.
+// Workload samples exclude this post-suite probe's writes, byte verification,
+// close and reopen measurements.
 async function reopenProbe({ engines, prefix }) {
     const { indexedDB } = globalThis;
-    const { openDB } = await import('/src/index.ts');
-    const { keyBytes, valueBytes } = await import('/bench/workloads.ts');
+    const { openDB } = await import(new URL('/src/index.ts', globalThis.location.href).href);
+    const { keyBytes, valueBytes } = await import(new URL('/bench/workloads.ts', globalThis.location.href).href);
     const count = 128,
         valueSize = 4096;
     const entries = Array.from({ length: count }, (_, index) => [keyBytes(index, 16), valueBytes(index, valueSize)]);
@@ -754,7 +749,7 @@ function contentParity(report) {
 }
 
 const require = createRequire(join(resolve(values['dependency-root']), 'package.json'));
-const { chromium } = require('playwright');
+const { chromium } = require('@playwright/test');
 let vite;
 if (values.serve) {
     const { createServer } = await import(pathToFileURL(require.resolve('vite')).href);
@@ -791,14 +786,12 @@ try {
             await context.route('**/src/worker.ts*', async (route) => {
                 const response = await route.fetch();
                 let source = await response.text();
-                // Route-only diagnostics preserve the original sequencing and
-                // evaluate each original awaited expression exactly once.
+                // Preserve await order and evaluate each expression once.
                 source = source.replaceAll(
                     'await assertCapabilities()',
                     "await globalThis.__moyoBrowserBenchDiagnostic.timeAsync('assertCapabilities', () => assertCapabilities())"
                 );
-                // After the capability probe removal, the synchronous platform
-                // checks remain synchronous: do not introduce an await here.
+                // Keep synchronous capability checks synchronous.
                 source = source.replaceAll(
                     'assertCapabilities();',
                     "globalThis.__moyoBrowserBenchDiagnostic.timeSync('assertCapabilities', () => assertCapabilities());"
@@ -829,7 +822,7 @@ try {
     await cdp.detach();
     const unknownNames = await page.evaluate(
         async ({ names, scalingSpecs }) => {
-            const { WORKLOADS } = await import('/bench/workloads.ts');
+            const { WORKLOADS } = await import(new URL('/bench/workloads.ts', globalThis.location.href).href);
             const template = WORKLOADS.find((workload) => workload.name === 'large_value_64kb');
             for (const spec of scalingSpecs) {
                 if (WORKLOADS.some((workload) => workload.name === spec.name))

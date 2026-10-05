@@ -3,6 +3,7 @@ import { access, mkdir, readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+    benchmarkCaseKey,
     formatDeltaPercent,
     formatNumber,
     readCliOption,
@@ -57,11 +58,19 @@ if (!previousExists) {
 
 const previous = JSON.parse(await readFile(resolvedPreviousPath, 'utf8'));
 const currentCases = flattenCases(current);
-const previousCases = flattenCases(previous);
+const previousCases = new Map(flattenCases(previous).map((entry) => [benchmarkCaseKey(entry.suite, entry), entry]));
 const comparisons = [];
-for (const [caseId, currentEntry] of currentCases) {
-    const previousEntry = previousCases.get(caseId);
+const unmatchedCases = [];
+for (const currentEntry of currentCases) {
+    const key = benchmarkCaseKey(currentEntry.suite, currentEntry);
+    const previousEntry = key === undefined ? undefined : previousCases.get(key);
     if (!previousEntry) {
+        unmatchedCases.push({
+            suite: currentEntry.suite,
+            id: currentEntry.id,
+            label: currentEntry.label,
+            source: currentEntry.source
+        });
         continue;
     }
     const opsDeltaPct = deltaPercent(currentEntry.metrics.opsPerSec, previousEntry.metrics.opsPerSec);
@@ -82,9 +91,10 @@ for (const [caseId, currentEntry] of currentCases) {
         regressionReasons.push(`p99 latency ${formatDeltaPercent(p99LatencyDeltaPct)}`);
     }
     comparisons.push({
-        id: caseId,
+        id: `${currentEntry.suite}::${currentEntry.id}`,
         suite: currentEntry.suite,
         label: currentEntry.label,
+        comparisonContext: currentEntry.comparisonContext,
         previous: previousEntry.metrics,
         current: currentEntry.metrics,
         delta: {
@@ -106,9 +116,18 @@ const summaryLines = [
     `Previous baseline: ${previous.generatedAt}`,
     `Thresholds: throughput -${throughputRegressionPct}%, avg/p95 +${latencyRegressionPct}%, p99 +${tailLatencyRegressionPct}%`,
     '',
-    regressions.length === 0
-        ? 'No regressions crossed the governance threshold.'
-        : `Detected ${regressions.length} benchmark governance regression(s).`,
+    `Compared ${comparisons.length} of ${currentCases.length} current cases with matching browser, profile, storage, build and workload settings.`,
+    ...(unmatchedCases.length > 0
+        ? [
+              `${unmatchedCases.length} case(s) had no matching baseline or lacked comparison settings; legacy baselines must be recollected.`,
+              ''
+          ]
+        : ['']),
+    comparisons.length === 0
+        ? 'No comparable benchmark cases were available.'
+        : regressions.length === 0
+          ? 'No regressions crossed the governance threshold.'
+          : `Detected ${regressions.length} benchmark governance regression(s).`,
     ''
 ];
 const suites = new Set(comparisons.map((entry) => entry.suite));
@@ -143,8 +162,13 @@ await writeJsonFile(path.join(outDir, 'comparison.json'), {
     previousGeneratedAt: previous.generatedAt,
     currentGeneratedAt: current.generatedAt,
     thresholds: thresholdPolicy(),
-    comparisons
+    comparisons,
+    unmatchedCases
 });
+if (failOnRegression && comparisons.length === 0) {
+    console.error('Benchmark regression gate failed: no comparable benchmark cases with matching settings.');
+    process.exit(1);
+}
 if (failOnRegression && regressions.length > 0) {
     console.error(`Benchmark regression gate failed with ${regressions.length} regression(s).`);
     process.exit(1);
@@ -194,18 +218,13 @@ async function resolveDownloadedBaseline(filePath) {
 }
 
 function flattenCases(report) {
-    return new Map(
-        (report.suites ?? []).flatMap((suite) =>
-            (suite.cases ?? [])
-                .filter((entry) => entry?.metrics)
-                .map((entry) => [
-                    `${suite.suite}::${entry.id}`,
-                    {
-                        suite: suite.suite,
-                        ...entry
-                    }
-                ])
-        )
+    return (report.suites ?? []).flatMap((suite) =>
+        (suite.cases ?? [])
+            .filter((entry) => entry?.metrics)
+            .map((entry) => ({
+                ...entry,
+                suite: suite.suite
+            }))
     );
 }
 

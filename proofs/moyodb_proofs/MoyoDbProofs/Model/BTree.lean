@@ -4,7 +4,7 @@ namespace MoyoDbProofs.Model
 
 /-- A key and its encoded value. -/
 abbrev KV := Bytes × Bytes
-/-- The reference map, represented by ordered key-value rows. -/
+/-- Reference map rows. Sorted, unique keys are a separate invariant. -/
 abbrev ModelMap := List KV
 
 /-- Extract keys in the existing row order. -/
@@ -26,7 +26,7 @@ def erase (m : ModelMap) (key : Bytes) : ModelMap :=
   | (k, v) :: xs =>
       if k = key then erase xs key else (k, v) :: erase xs key
 
-/-- Insert or replace a row while preserving lexicographic order. -/
+/-- Insert or replace a row. Sorted input remains in lexicographic order. -/
 def insertSorted (key value : Bytes) : ModelMap → ModelMap
   | [] => [(key, value)]
   | (k, v) :: xs =>
@@ -35,7 +35,7 @@ def insertSorted (key value : Bytes) : ModelMap → ModelMap
       | .eq => (key, value) :: xs
       | .gt => (k, v) :: insertSorted key value xs
 
-/-- Remove previous occurrences, then insert the replacement in order. -/
+/-- Remove previous occurrences, then insert in lexicographic order if the input is sorted. -/
 def insert (m : ModelMap) (key value : Bytes) : ModelMap :=
   let without := erase m key
   insertSorted key value without

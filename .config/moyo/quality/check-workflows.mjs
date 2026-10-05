@@ -17,8 +17,10 @@ function hasTopLevelKey(text, key) {
 }
 
 function checkUsesPinned(file, text) {
-    for (const match of text.matchAll(/^\s*uses:\s*([^\s#]+).*$/gm)) {
-        const value = match[1];
+    for (const match of text.matchAll(/^[\t ]*(?:-[\t ]*)?uses:[\t ]*([^\s#]+)/gm)) {
+        const raw = match[1];
+        const quoted = (raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"));
+        const value = quoted ? raw.slice(1, -1) : raw;
         if (value.startsWith('docker://')) {
             continue;
         }
@@ -44,7 +46,7 @@ function checkCheckoutPolicy(file, text) {
 }
 
 function checkInstallPolicy(file, text) {
-    for (const match of text.matchAll(/^\s*run:\s*(.+)$/gm)) {
+    for (const match of text.matchAll(/^[\t ]*(?:-[\t ]*)?run:[\t ]*(\S.*)$/gm)) {
         const command = match[1].trim();
         if (/\bnpm\s+ci\b/.test(command)) {
             for (const flag of ['--ignore-scripts', '--no-audit', '--no-fund']) {
@@ -67,7 +69,7 @@ function checkInstallPolicy(file, text) {
 
 function checkMultilineShellPolicy(file, lines) {
     for (const [index, line] of lines.entries()) {
-        if (!/^\s*run:\s*[|>]\s*$/.test(line)) {
+        if (!/^[\t ]*(?:-[\t ]*)?run:[\t ]*[|>][\t ]*$/.test(line)) {
             continue;
         }
         const baseIndent = line.match(/^\s*/)?.[0].length ?? 0;

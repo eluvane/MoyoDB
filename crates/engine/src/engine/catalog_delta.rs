@@ -13,8 +13,8 @@ use crate::storage::backend::FileBackend;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// Only changed store metadata, relative to the committed catalog. A tombstone
-/// hides the base entry; removing a newly created entry cancels its delta.
+/// Store metadata changes relative to the committed catalog. A tombstone hides
+/// the base entry. Removing a newly created entry cancels its delta.
 #[derive(Debug, Default)]
 pub(super) struct CatalogDelta {
     stores: BTreeMap<String, Option<StoreMetadata>>,
@@ -46,8 +46,8 @@ impl CatalogDelta {
         previous
     }
 
-    /// Called only when the catalog changes. Store keys are already ordered;
-    /// the reserved metadata keys sort after every UTF-8 store name.
+    /// Store keys are ordered. Reserved metadata keys sort after every UTF-8
+    /// store name, so appending them preserves mutation order.
     pub(super) fn build_tree<B: FileBackend>(
         &self,
         pager: &mut Pager<B>,
@@ -63,10 +63,9 @@ impl CatalogDelta {
                 value.as_ref().map(encode_store_metadata).transpose()?,
             ));
         }
-        // Open may synthesize a nonzero floor for an older database with no
-        // change log. Reassert that floor even if its effective value did not
-        // change, or creating the first log would lose it on the next open.
-        // With an existing log, the in-memory floor is the persisted floor.
+        // Open can synthesize a floor when no change log exists. Persist that
+        // floor when creating the first log so the next open does not lose it.
+        // An existing log already has its floor persisted.
         if floor != view.change_feed_floor_txid
             || (floor != 0 && !view.catalog.contains_key(SYSTEM_CHANGELOG_STORE_NAME))
         {
@@ -102,8 +101,8 @@ impl CatalogDelta {
         if self.is_empty() {
             return;
         }
-        // With no reader of the current version, change metadata in place.
-        // A live snapshot keeps its map and roots immutable via copy-on-write.
+        // Copy only when a live snapshot shares this catalog. Its map and roots
+        // must stay unchanged.
         let catalog = Arc::make_mut(catalog);
         for (name, value) in self.stores {
             match value {

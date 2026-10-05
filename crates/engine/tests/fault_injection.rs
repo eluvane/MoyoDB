@@ -1,12 +1,11 @@
 //! Storage fault injection across manifest, main file, and WAL.
 //!
-//! Every write, flush, and truncate issued by a commit, a checkpoint, a close,
-//! or crash recovery is failed in turn. After each fault the process either
-//! "crashes" (the database is reopened from the bytes that were durable at that
-//! moment) or keeps running and recovers in place once storage works again.
+//! Each write, flush, and truncate during commit, checkpoint, close, or crash
+//! recovery fails in turn. After each fault, reopen from durable bytes or
+//! recover in place after storage is restored.
 //!
-//! Faults are not atomic: a short write stores half its bytes, and a torn flush
-//! persists only a prefix or only a suffix of the writes pending on that file.
+//! Short writes store half their bytes. Torn flushes persist only a prefix
+//! or suffix of the pending file operations.
 
 use moyodb_engine::engine::{Engine, OpenConfig, ScanRange, TxMode};
 use moyodb_engine::error::{EngineError, Result};
@@ -109,8 +108,8 @@ impl Pending {
     }
 }
 
-/// `working` is what reads see; `durable` is what survives a crash. A
-/// successful flush makes them equal; a torn flush applies part of `pending`.
+/// Reads see `working`; crashes retain `durable`. A successful flush makes
+/// them equal. A torn flush applies only part of `pending`.
 #[derive(Default)]
 struct FileState {
     working: Vec<u8>,
@@ -256,7 +255,7 @@ impl FaultBundle {
         }
     }
 
-    /// The database as a crash at this instant would leave it.
+    /// Only durable file bytes survive the simulated crash.
     fn crash_copy(&self) -> Self {
         Self::with_contents([
             lock(&self.manifest.state).durable.clone(),
@@ -305,7 +304,6 @@ fn seed_rows() -> Rows {
     (0..40).map(|index| (key(index), value(index, 1))).collect()
 }
 
-/// Inserts, overwrites, deletes, and writes an overflow value in one commit.
 fn mutated_rows() -> Rows {
     let mut rows = seed_rows();
     for index in 40..80 {
@@ -380,7 +378,7 @@ fn assert_before_or_after(rows: &Rows, ctx: &str) {
     );
 }
 
-/// The recovered database accepts a new commit, and that commit survives the next crash.
+/// A commit after recovery must survive the next crash.
 fn assert_writable(bundle: &FaultBundle, config: &OpenConfig, expected: &Rows, ctx: &str) {
     let mut engine = reopen(bundle, config, ctx);
     let tx = engine
@@ -417,8 +415,8 @@ fn eager_checkpoint() -> OpenConfig {
     }
 }
 
-/// Fails the `target`th counted operation of one commit plus close. Returns
-/// false once `target` is past the last operation, which ends the sweep.
+/// Fail counted operation `target` during commit or close. Return false
+/// when no operation reaches `target`, so the fault sweep terminates.
 fn commit_case(config: &OpenConfig, fault: Fault, target: u64) -> bool {
     let bundle = FaultBundle::new();
     let mut engine = Engine::open(DB, bundle.files(), config.clone()).expect("open fresh database");
@@ -451,7 +449,6 @@ fn commit_case(config: &OpenConfig, fault: Fault, target: u64) -> bool {
     true
 }
 
-/// Storage comes back and the poisoned engine recovers without a restart.
 fn recover_in_place(
     bundle: &FaultBundle,
     engine: &mut Engine<FaultyFile>,
@@ -515,9 +512,8 @@ fn every_fault_during_commit_with_eager_checkpoint_is_atomic() {
     sweep(eager_checkpoint(), commit_case);
 }
 
-/// A crash leaves a durable but uninstalled commit in the WAL; every storage
-/// operation of the recovery that replays it is then failed in turn. Recovery
-/// must stay idempotent: the next clean open still finds the commit.
+/// Fail each storage operation while replaying a durable, uninstalled WAL
+/// commit. A later clean open must recover the same commit.
 fn recovery_case(config: &OpenConfig, fault: Fault, target: u64) -> bool {
     let bundle = FaultBundle::new();
     let mut engine = Engine::open(DB, bundle.files(), config.clone()).expect("open fresh database");
@@ -552,9 +548,9 @@ fn every_fault_during_crash_recovery_is_idempotent() {
     sweep(deferred_checkpoint(), recovery_case);
 }
 
-/// The dirty image set spans several bounded main-file write batches. Every
-/// failure, including a partial batch and a torn flush of multiple batches,
-/// must retain all acknowledged values in both restart and in-place recovery.
+/// Dirty images span several main-file write batches. Partial writes and
+/// torn flushes must retain acknowledged values after restart or recovery
+/// in the same engine.
 fn large_checkpoint_case(config: &OpenConfig, fault: Fault, target: u64) -> bool {
     let bundle = FaultBundle::new();
     let mut engine =

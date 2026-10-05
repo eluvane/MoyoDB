@@ -35,7 +35,7 @@ pub struct Snapshot {
     pub schema_version: u64,
     pub catalog_root_page_id: u64,
     pub last_committed_txid: u64,
-    /// Shared immutable metadata. Serde retains the original map representation.
+    /// Shared immutable metadata. Serde serializes it as a map.
     pub catalog: Arc<CatalogMap>,
 }
 
@@ -88,8 +88,7 @@ pub enum BatchOp {
     Delete { key: Vec<u8> },
 }
 
-/// Borrowed form of [`BatchOp`], so packed payloads can be applied without
-/// copying every key and value out of the transport buffer first.
+/// Borrows [`BatchOp`] data or packed payload bytes without copying keys or values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchOpRef<'a> {
     Put { key: &'a [u8], value: &'a [u8] },
@@ -121,8 +120,8 @@ pub struct StagedStore {
     pub cleared: bool,
     pub flags: u64,
     pub force_full_rewrite: bool,
-    /// None means unknown, including after deserializing an older stage.
-    /// Only engine-owned empty stages can start with a known absence of TTLs.
+    /// `None` means unknown, including after deserialization.
+    /// Only engine-owned empty stages can start with `Some(false)`.
     #[doc(hidden)]
     #[serde(skip)]
     pub has_expiring_mutations: Option<bool>,

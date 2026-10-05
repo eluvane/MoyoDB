@@ -64,8 +64,7 @@ fn pager_with_images(images: &[(u64, Vec<u8>)]) -> Result<Pager<MemoryBackend>> 
 }
 
 fn reference_cells(image: &[u8], mutations: &[Mutation<'_>]) -> Result<Vec<LeafCell>> {
-    // The existing public owned decoder supplies the old reader's full cells.
-    // Apply the fixture's replacement/deletion independently of TreeWriter.
+    // The owned decoder keeps this mutation oracle independent of TreeWriter.
     let old = decode_page(image)?;
     let mut cells = Vec::new();
     for mut cell in old.leaf_cells {

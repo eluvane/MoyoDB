@@ -137,9 +137,9 @@ type WasmEngine = {
     clear_store(txId: WasmU64, name: string): void;
     get(txId: WasmU64, store: string, key: Uint8Array): Uint8Array | null;
     get_many(txId: WasmU64, store: string, keys: Array<Uint8Array>): Array<Uint8Array | null>;
-    /** Packed optional values: u32 count | count x u32 length (u32::MAX = missing) | bytes. */
+    /** Little-endian u32 count | count x u32 length (u32::MAX = missing) | bytes. */
     get_many_packed(txId: WasmU64, store: string, keys: Uint8Array): Uint8Array;
-    /** Key metadata only; the value is never materialized. */
+    /** Checks existence without loading the value body; TTL headers may be read. */
     has(txId: WasmU64, store: string, key: Uint8Array): boolean;
     /** Optional for SDK compatibility with older bindings. */
     has_many?(txId: WasmU64, store: string, keys: Array<Uint8Array>): boolean[];
@@ -176,12 +176,12 @@ type WasmModule = {
         generationName: string;
     }>;
     /**
-     * Publishes `generationName` as the active generation, but only if the
-     * control file still names `expectedCurrent` (`null` = no control file).
-     * The written control file is read back and verified before resolving.
+     * Publishes only if the active generation matches `expectedCurrent`.
+     * `null` requires no active generation. The written control file is
+     * flushed and verified before resolving.
      */
     swapActiveGeneration(name: string, generationName: string, expectedCurrent: string | null): Promise<void>;
-    /** Active generation name, `null` when there is no control file; rejects on a corrupt one. */
+    /** Active generation, or null for legacy storage. Corrupt control state needs legacy files for fallback. */
     readActiveGeneration(name: string): Promise<string | null>;
     cleanupInactiveEntries(name: string): Promise<void>;
     dbDirectorySize(name: string): Promise<number>;
@@ -234,8 +234,8 @@ interface TrackedStoreChanges {
     keys: Map<string, TrackedKeyChange>;
 }
 type TrackedTxnChanges = Map<string, TrackedStoreChanges>;
-// Published maps are immutable. A transaction detaches only on create/drop,
-// and owns that detached map until commit transfers it to the committed view.
+// Published maps stay immutable. Create/drop gives the transaction a private
+// copy, which commit publishes.
 type StoreCompressionSnapshot =
     | { owned: false; values: ReadonlyMap<string, CompressionOption> }
     | { owned: true; values: Map<string, CompressionOption> };
@@ -575,8 +575,8 @@ class DbWorker implements WorkerApi {
     private txChanges = new Map<number, TrackedTxnChanges>();
     private txModes = new Map<number, TxMode>();
     /**
-     * Index schema each transaction runs against: the committed schema at
-     * `begin`, replaced by `reconcileIndexes`. Never mutated in place.
+     * Shared committed schema at begin. Reconciliation replaces the array;
+     * it never mutates the shared schema.
      */
     private txIndexSchemas = new Map<number, NormalizedIndexDef[]>();
     private indexesBySchema = new WeakMap<NormalizedIndexDef[], Map<string, NormalizedIndexDef[]>>();
@@ -658,7 +658,7 @@ class DbWorker implements WorkerApi {
         let failure: unknown = null;
         try {
             this.rollbackAllTransactions();
-            // The files are deleted next; checkpointing into them is wasted work.
+            // Skip the checkpoint because the database files will be deleted.
             this.engine?.abandon();
             const wasm = await this.loadWasm();
             await wasm.deleteDB(dbName);
@@ -740,13 +740,22 @@ class DbWorker implements WorkerApi {
         try {
             txid = fromWasmU64(this.withEngine((engine) => engine.commit_tx(toWasmU64(txId))));
         } catch (err) {
+            // A failed public commit consumes its handle, but some engine errors
+            // retain the transaction. Release it before clearing the SDK state.
+            try {
+                if (this.engine && !this.engine.needs_recovery()) {
+                    this.withEngine((engine) => engine.rollback_tx(toWasmU64(txId)));
+                }
+            } catch {}
             this.cleanupTxState(txId);
             const recovery = this.recoverEngineIfNeeded();
-            // A durable commit is reported as committed. Injected failpoints
-            // stand for a crash, which never gets to report anything.
+            // Report a recovered durable commit as success. Injected failures
+            // model a crash. RecoveryRequiredError refers to an earlier failed
+            // operation, so its recovery report cannot confirm this commit.
             if (
                 !recovery?.pendingCommitted ||
                 recovery.pendingTxid === null ||
+                isNamedError(err, 'RecoveryRequiredError') ||
                 isNamedError(err, 'InjectedFailureError')
             ) {
                 throw err;
@@ -834,8 +843,8 @@ class DbWorker implements WorkerApi {
     async getMany(txId: number, store: string, keys: Array<Uint8Array>): Promise<Array<Uint8Array | null>> {
         const values = this.withEngine((engine) => engine.get_many(toWasmU64(txId), store, keys));
         const compressed = !isInternalStoreName(store) && this.storeCompressionForTx(txId, store) !== false;
-        // The binding owns this result array. Normalize every borrowed view
-        // before any decoder suspends, including values queued behind the pool.
+        // Normalize all borrowed views before a decoder can suspend. Values
+        // waiting for a decoder must also retain stable buffers.
         for (let index = 0; index < values.length; index += 1) {
             const value = values[index];
             if (value !== null) {
@@ -853,11 +862,10 @@ class DbWorker implements WorkerApi {
             this.withEngine((engine) => engine.get_many_packed(toWasmU64(txId), store, packedKeys))
         );
         if (isInternalStoreName(store) || this.storeCompressionForTx(txId, store) === false) {
-            // Raw values go back to the caller in the engine's own layout.
+            // The protocol accepts the engine packet directly.
             return packedOptionalValues(packed);
         }
-        // These views belong to the private normalized packet; queued decoders
-        // retain it until all active work completes.
+        // Decoders retain views of this private packet, including while queued.
         return this.decodeStoreValues(txId, store, unpackPackedOptionalValues(packed));
     }
     has(txId: number, store: string, key: Uint8Array): Promise<boolean> {
@@ -879,7 +887,7 @@ class DbWorker implements WorkerApi {
             this.recordPutChange(txId, store, key, baselineExists);
             return;
         }
-        // Index maintenance needs the previous value to find its old index keys.
+        // The previous document is needed to remove its old index keys.
         const oldValue = await this.readStoreValue(txId, store, key);
         const oldKeyFor = oldValue === null ? null : createIndexKeyExtractor(oldValue);
         const newKeyFor = createIndexKeyExtractor(value);
@@ -1001,8 +1009,7 @@ class DbWorker implements WorkerApi {
     }
     async delete(txId: number, store: string, key: Uint8Array): Promise<boolean> {
         const defs = this.indexesForStoreInTx(txId, store);
-        // Only index maintenance needs the old value; otherwise the engine's
-        // metadata answer is enough.
+        // Load the previous document only when its index keys must be removed.
         const oldValue = defs.length === 0 ? null : await this.readStoreValue(txId, store, key);
         const oldKeyFor = oldValue === null ? null : createIndexKeyExtractor(oldValue);
         const oldLogicalKeys = oldKeyFor === null ? [] : defs.map((def) => ({ def, logicalKey: oldKeyFor(def) }));
@@ -1222,10 +1229,9 @@ class DbWorker implements WorkerApi {
             if (this.rawStoreExistsInTx(txId, def.store)) {
                 let rows: ScanItem[];
                 if (sourceRows !== null) {
-                    // The scheduler serializes this transaction's commands.
-                    // Source keys/bytes are immutable here; only TTL changes.
-                    // One native call observes a fresh timestamp and stages
-                    // expiry before this index's first document validation.
+                    // The transaction lane keeps source keys and bytes stable.
+                    // Refresh TTL visibility and stage expiry before validating
+                    // this index, using one timestamp for all cached rows.
                     const visible = this.withEngine((engine) =>
                         engine.has_many!(
                             toWasmU64(txId),
@@ -1241,7 +1247,7 @@ class DbWorker implements WorkerApi {
                     }
                     rows = sourceRows.filter((_row, index) => visible[index]);
                 } else {
-                    // Old bindings and larger sources retain fresh full scans.
+                    // Full scans refresh visibility when caching is unavailable.
                     rows = await this.readStoreScan(txId, def.store, EMPTY_RANGE);
                     if (canRefreshVisibility && rows.length <= RECONCILE_DOCUMENT_CACHE_ROWS) {
                         let inputBytes = 0;
@@ -1252,8 +1258,7 @@ class DbWorker implements WorkerApi {
                             }
                         }
                         if (inputBytes <= RECONCILE_DOCUMENT_CACHE_BYTES) {
-                            // This shares owned buffers with the JSON cache;
-                            // it does not retain a second copy of each value.
+                            // Source rows and the document cache share owned value buffers.
                             sourceRows = rows;
                         }
                     }
@@ -1327,8 +1332,8 @@ class DbWorker implements WorkerApi {
                 options.limit === undefined || changes.length < options.limit ? normalizeWasmBytes(change.key) : null;
             let value: Uint8Array | undefined;
             if (change.value !== undefined) {
-                // Keep validating the visible tail: an output limit has never
-                // suppressed its value-record corruption errors.
+                // Validate returned public records beyond the output limit
+                // so their corruption errors still reach the caller.
                 value = await this.decodeStoreValueForFeed(change.store, normalizeWasmBytes(change.value));
             }
             if (key === null) {
@@ -1478,14 +1483,9 @@ class DbWorker implements WorkerApi {
         }
     }
     /**
-     * Compaction publishes a new generation with a strict swap:
-     * 1. read the active generation (a corrupt control file aborts here);
-     * 2. stream every live row into a fresh generation inside the engine;
-     * 3. compare-and-swap the control file against the generation read in 1;
-     * 4. if the swap reports an error, re-read the control file to learn
-     *    which generation is actually active before deciding what to clean up.
-     * The old engine is abandoned, not closed: its files are no longer
-     * active, so it must not checkpoint into them.
+     * Publishes a fresh generation only if the active generation has not changed.
+     * A failed swap may have reached storage; read the control file before cleanup.
+     * After publication, abandon the old engine to avoid a checkpoint into inactive files.
      */
     private async runCompactionOperation(operation: MaintenanceOperation): Promise<CompactionResult> {
         const dbName = this.requireDbName();
@@ -1524,8 +1524,7 @@ class DbWorker implements WorkerApi {
                 { allowDuringMaintenance: true }
             );
             if (operation === 'rebuild' && defs.length > 0) {
-                // compact copies index entries as they are; rebuild regenerates
-                // them from the rows so stale entries do not survive.
+                // Rebuild recreates indexes from live documents; compact preserves index entries.
                 const previousEngine = this.engine;
                 const previousMaintenance = this.maintenanceOperation;
                 this.engine = target;
@@ -1575,8 +1574,7 @@ class DbWorker implements WorkerApi {
                     rebuiltEngine?.abandon();
                 } catch {}
                 if (generationName !== null) {
-                    // Only unpublished generations are removed; if the control
-                    // file cannot be read, nothing is deleted.
+                    // Cleanup requires proof that the target generation is inactive.
                     const active = await readActiveGenerationOrNull(wasm, dbName);
                     if (active !== undefined && active !== generationName) {
                         try {
@@ -1591,8 +1589,8 @@ class DbWorker implements WorkerApi {
         }
     }
     /**
-     * Brings a poisoned engine back to a trusted state. Returns `null` when
-     * the engine was healthy. All open transactions are gone afterwards.
+     * Returns null when no recovery is needed. A recovery attempt invalidates
+     * all open transactions, even if recovery fails.
      */
     private recoverEngineIfNeeded(): { pendingTxid: number | null; pendingCommitted: boolean } | null {
         const engine = this.engine;
@@ -1607,8 +1605,10 @@ class DbWorker implements WorkerApi {
                 'RecoveryRequiredError',
                 `database ${this.dbName ?? ''} needs recovery and recovery failed: ${remapError(error).message}`
             );
+        } finally {
+            // Engine recovery discards transactions before storage I/O can fail.
+            this.clearRuntimeCaches();
         }
-        this.clearRuntimeCaches();
         return {
             pendingTxid: fromOptionalWasmU64(report.pendingTxid),
             pendingCommitted: report.pendingCommitted === true
@@ -1639,7 +1639,7 @@ class DbWorker implements WorkerApi {
         const trackedStore = this.getOrCreateTrackedStore(txId, store);
         trackedStore.touched = true;
         trackedStore.storeLevel = kind;
-        // Earlier key changes are subsumed by the store-level change.
+        // The clear/drop event replaces earlier key changes.
         trackedStore.keys.clear();
     }
     private recordPutChange(txId: number, store: string, key: Uint8Array, baselineExists: boolean): void {
@@ -1946,8 +1946,7 @@ class DbWorker implements WorkerApi {
                 }
             }
         };
-        // Drain started decoders before publishing a failure. This preserves
-        // its original error and leaves no work running behind a rejected read.
+        // Drain active decoders before reporting the first observed failure.
         await Promise.all(Array.from({ length: Math.min(COMPRESSED_READ_CONCURRENCY, values.length) }, decodeNext));
         if (state.failed) {
             throw state.failure;
@@ -1955,8 +1954,8 @@ class DbWorker implements WorkerApi {
         return values;
     }
     private indexesForStoreInTx(txId: number, store: string): NormalizedIndexDef[] {
-        // Schema arrays are immutable and shared by transactions at begin.
-        // A schema replacement gets its own lookup; old readers keep theirs.
+        // Cache by immutable schema array so readers keep their original lookup
+        // after another transaction publishes a replacement.
         const schema = this.indexSchemaForTx(txId);
         let byStore = this.indexesBySchema.get(schema);
         if (!byStore) {
@@ -2070,8 +2069,8 @@ class DbWorker implements WorkerApi {
     }
     private readRawScan(txId: number, store: string, range: Range): ScanItem[] {
         const rows = this.withEngine((engine) => engine.scan(toWasmU64(txId), store, toWasmRange(range))) as ScanItem[];
-        // wasm-bindgen creates a fresh array and fresh row objects for this
-        // scan, so normalization can retain both ownership containers.
+        // The binding returns a fresh array and row objects, so normalization
+        // can update them without affecting another caller.
         for (const row of rows) {
             row.key = normalizeWasmBytes(row.key);
             row.value = normalizeWasmBytes(row.value);
@@ -2120,8 +2119,8 @@ class DbWorker implements WorkerApi {
                 range.gt = cursor;
                 delete range.gte;
             }
-            // A live conflict decides the operation. Do not materialize an
-            // unrelated tail; grow bounded chunks only while skipping rows.
+            // Stop at the first live conflict. Grow bounded chunks only while
+            // skipping stale rows so unrelated tail errors stay unobserved.
             const rows = this.readRawScan(txId, def.internalStore, range);
             for (const row of rows) {
                 cursor = row.key;
@@ -2129,7 +2128,7 @@ class DbWorker implements WorkerApi {
                 if (bytesEqual(decoded.primaryKey, primaryKey)) {
                     continue;
                 }
-                // Readwrite TTL cleanup and document errors stay in row order.
+                // Keep TTL cleanup and document errors in index row order.
                 const value = await this.readStoreValue(txId, def.store, decoded.primaryKey);
                 if (value === null) {
                     this.cleanupStaleIndexRow(txId, def, row.key);
@@ -2152,10 +2151,9 @@ class DbWorker implements WorkerApi {
         }
     }
     /**
-     * Reads up to `limit` live rows of an index range, starting after
-     * `cursor` (a physical index key from a previous page). Raw index entries
-     * are fetched in bounded chunks, so stale entries skipped along the way
-     * never force the whole range into memory.
+     * Resumes after a physical index key in the scan direction. Bounded raw
+     * chunks prevent stale entries from forcing the whole range into memory.
+     * The output limit counts only live rows.
      */
     private async loadVisibleIndexPage(
         txId: number,
@@ -2169,9 +2167,8 @@ class DbWorker implements WorkerApi {
         const reverse = physical.reverse === true;
         let resumeAfter = cursor;
         const visible: ScanItem[] = [];
-        // Do not fetch a full chunk only to discard its tail at a small limit.
-        // Entirely stale chunks grow geometrically, avoiding one scan per stale
-        // row when a getByIndex/limit=1 must walk a long expired prefix.
+        // Start with the requested row count. Grow wholly stale chunks
+        // geometrically to avoid one scan per expired row at small limits.
         let staleChunkFloor = 1;
         for (;;) {
             const chunkLimit = Math.min(INDEX_SCAN_RAW_CHUNK_ROWS, Math.max(limit - visible.length, staleChunkFloor));
@@ -2201,8 +2198,8 @@ class DbWorker implements WorkerApi {
             for (let index = 0; index < rawRows.length; index += 1) {
                 if (index === batchEnd) {
                     batchStart = index;
-                    // A stale chunk can be larger than the remaining demand.
-                    // Never read primary values past the next possible limit.
+                    // Stale chunks may exceed demand. Bound primary reads by
+                    // the remaining output count to avoid unused values and errors.
                     batchEnd = Math.min(rawRows.length, index + limit - visible.length);
                     batch = this.readIndexPrimaryValues(txId, def, rawRows, batchStart, batchEnd);
                 }
@@ -2239,7 +2236,7 @@ class DbWorker implements WorkerApi {
         start: number,
         end: number
     ): { entries: DecodedIndexEntryKey[]; values: Array<Uint8Array | null> } | null {
-        // Readwrite lookups may stage TTL expiry; keep their original row order.
+        // Write transactions may stage TTL expiry, so use reads in index row order.
         if (this.txModes.get(txId) !== 'readonly' || end - start <= 1) {
             return null;
         }
@@ -2255,9 +2252,8 @@ class DbWorker implements WorkerApi {
                 )
             );
         } catch {
-            // Readonly speculation has no transaction writes. Replay scalar
-            // reads so an earlier document error still precedes a later read
-            // or malformed-key error, as it does on the sequential path.
+            // Readonly batch reads stage no writes. Retry in row order so an
+            // earlier document error precedes a later read or malformed-key error.
             return null;
         }
         if (values.length !== entries.length) {
@@ -2435,7 +2431,7 @@ function applyChangeFeedPolicy(engine: WasmEngine, settings: Required<ChangeFeed
         throw remapError(error);
     }
 }
-/** Active generation name, `null` without a control file, `undefined` when it cannot be read. */
+/** Active generation, null for legacy storage, undefined if reading fails. */
 async function readActiveGenerationOrNull(wasm: WasmModule, dbName: string): Promise<string | null | undefined> {
     try {
         return await wasm.readActiveGeneration(dbName);

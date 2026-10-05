@@ -1,5 +1,5 @@
-// Runs in Node and Chromium. The WASM boundary is an ordered in-memory fixture;
-// no assertions here imply disk durability, Rust work counts or OPFS latency.
+// Runs in Node and Chromium with an ordered engine fixture in memory.
+// These assertions do not cover disk durability, Rust work counts, or OPFS latency.
 export function createSuite({ runtime, indexing, codec }) {
     const { jsonEncode, indexKey, u64Key } = codec;
     const empty = new Uint8Array();
@@ -197,8 +197,7 @@ export function createSuite({ runtime, indexing, codec }) {
             }
         };
     }
-    // Reconcile/lifecycle tests need separate stores and real transaction
-    // snapshots. Values in this fixture are immutable, owned engine records.
+    // Store maps model transaction snapshots. Engine records are owned and immutable.
     function catalogFixture({ defs = [], docs = [], internalRows = [], nativeVisibility = false } = {}) {
         const worker = new runtime.constructor();
         let committed = new Map([['docs', new Map()]]);
@@ -281,6 +280,7 @@ export function createSuite({ runtime, indexing, codec }) {
             },
             commit_tx(id) {
                 const tx = txFor(id);
+                if (tx.mode === 'readonly') throw named('ReadonlyTransactionError');
                 if (tx.mode === 'readwrite') {
                     for (const rows of tx.stores.values()) normalizeStagedExpiry(tx, rows, now);
                     committed = new Map(
@@ -373,9 +373,8 @@ export function createSuite({ runtime, indexing, codec }) {
                     scanBytes.set(store, (scanBytes.get(store) ?? 0) + row.key.byteLength + row.value.byteLength);
                     if (result.length >= (range.limit ?? Infinity)) break;
                 }
-                // Like the old full source scan, base TTL cleanup is applied
-                // only when the complete issued read succeeds. Staged puts
-                // were already normalized and remain deleted on later errors.
+                // Base TTL cleanup runs only after the full read succeeds.
+                // Staged expiry remains applied if a later read fails.
                 for (const key of expiredBaseKeys) rows.delete(key);
                 return result;
             }
@@ -535,7 +534,7 @@ export function createSuite({ runtime, indexing, codec }) {
             eq(f.worker.storeCompressionForTx(newer, 'created'), 'gzip');
             eq(f.worker.storeCompressionForTx(newer, 'second'), 'gzip');
             eq(f.worker.storeCompressionForTx(oldReader, 'created'), false);
-            // A subsequent writer must detach from the newly published map too.
+            // The published map must remain unchanged for existing readers.
             const secondWriter = await f.worker.begin('readwrite');
             await f.worker.dropStore(secondWriter, 'created');
             await f.worker.commit(secondWriter);
@@ -561,6 +560,21 @@ export function createSuite({ runtime, indexing, codec }) {
         await f.worker.rollback(rw);
         f.close();
     });
+    test('rejected readonly commit releases the retained engine transaction', async () => {
+        const key = u64Key(1);
+        const f = catalogFixture({ docs: [{ key, value: document(1) }] });
+        try {
+            const reader = await f.worker.begin('readonly');
+            await rejects(() => f.worker.commit(reader), 'ReadonlyTransactionError');
+            await rejects(() => f.worker.get(reader, 'docs', key), 'TransactionClosedError');
+            eq(f.worker.txChanges.size, 0);
+            eq(f.worker.txStoreCompression.size, 0);
+            const writer = await f.worker.begin('readwrite');
+            await f.worker.commit(writer);
+        } finally {
+            f.close();
+        }
+    });
     for (const [failure, recovered, shouldSucceed] of [
         ['StorageError', false, false],
         ['StorageError', true, true],
@@ -580,6 +594,54 @@ export function createSuite({ runtime, indexing, codec }) {
             f.close();
         });
     }
+    test('failed recovery invalidates every discarded transaction and metadata snapshot', async () => {
+        const f = fixture();
+        try {
+            await f.worker.begin('readonly');
+            const writer = await f.worker.begin('readwrite');
+            f.setCommitFailure('StorageError', true);
+            f.worker.engine.recover = () => {
+                throw named('StorageError');
+            };
+            await rejects(() => f.worker.commit(writer), 'RecoveryRequiredError');
+            eq(f.worker.txChanges.size, 0);
+            eq(f.worker.txModes.size, 0);
+            eq(f.worker.txIndexSchemas.size, 0);
+            eq(f.worker.txStoreCompression.size, 0);
+            eq(f.worker.committedIndexes, null);
+            eq(f.worker.committedStoreCompression, null);
+        } finally {
+            f.close();
+        }
+    });
+    test('recovery of an earlier commit cannot make a rejected transaction commit succeed', async () => {
+        const f = fixture();
+        try {
+            const reader = await f.worker.begin('readonly');
+            const writer = await f.worker.begin('readwrite');
+            let needsRecovery = false;
+            let recoveryAttempts = 0;
+            f.worker.engine.needs_recovery = () => needsRecovery;
+            f.worker.engine.commit_tx = () => {
+                if (needsRecovery) throw named('RecoveryRequiredError');
+                needsRecovery = true;
+                throw named('StorageError');
+            };
+            f.worker.engine.recover = () => {
+                if (++recoveryAttempts === 1) throw named('StorageError');
+                needsRecovery = false;
+                return { pendingTxid: 42n, pendingCommitted: true };
+            };
+            await rejects(() => f.worker.commit(writer), 'RecoveryRequiredError');
+            await rejects(() => f.worker.commit(reader), 'RecoveryRequiredError');
+            eq(recoveryAttempts, 2);
+            eq(f.events, [], 'the earlier durable commit must not be emitted for the rejected reader');
+            eq(f.worker.txChanges.size, 0);
+            eq(f.worker.committedStoreCompression, null);
+        } finally {
+            f.close();
+        }
+    });
     test('all transaction caches released on invalidation', async () => {
         const f = fixture({ defs: definitions(1), document: document(1) });
         await f.worker.begin('readonly');
@@ -789,7 +851,7 @@ export function createSuite({ runtime, indexing, codec }) {
         async () => {
             const defs = definitions(1, true);
             const docs = Array.from({ length: 32 }, (_, i) => ({ key: u64Key(i), value: jsonEncode({ k0: 'taken' }) }));
-            // A corrupt document at the tail cannot precede the first conflict.
+            // The first conflict must take priority over corruption in later rows.
             docs[31].value = new Uint8Array([255]);
             const f = catalogFixture({
                 defs,
@@ -1328,8 +1390,7 @@ export function createSuite({ runtime, indexing, codec }) {
                     f.worker.resolveVisibleIndexedValue = function (...args) {
                         const primaryKey = args[3].primaryKey;
                         const savedSlice = primaryKey.slice;
-                        // Observe only this decoded key. Native prototypes and
-                        // the decoder's independent ownership stay unchanged.
+                        // Count copies of this key without changing decoder ownership or native prototypes.
                         Object.defineProperty(primaryKey, 'slice', {
                             value(...sliceArgs) {
                                 primaryKeySlices++;
@@ -1708,8 +1769,8 @@ export function createSuite({ runtime, indexing, codec }) {
         f.close();
         return { metadata, indexed, paging, stale };
     }
-    // Untimed fixture construction; no storage, wasm-bindgen, Worker messaging or
-    // IndexedDB in these microbenchmarks. The caller controls warmups/order.
+    // Fixture setup is not timed. These cases exclude storage, wasm-bindgen,
+    // Worker messages, and IndexedDB. The caller controls warmups and order.
     function makeBenchmarks() {
         const metadata = fixture({ stores: 1000, recordWrites: false });
         const indexed = fixture({ defs: definitions(8), document: document(8, '', 65536), recordWrites: false });

@@ -24,7 +24,7 @@ It provides ordered byte keys, range scans, snapshots, TTL, recovery checks, and
 ## Quick start
 
 ```bash
-npm install @moyodb/sdk@1.0.0
+npm install @moyodb/sdk@1.0.1
 ```
 
 ```ts

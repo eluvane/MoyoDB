@@ -1,6 +1,6 @@
 import { WorkerProtocolClient } from './worker-client';
 import type { ChangeFeedSettings, DebugFailpoint, OpenOptions } from './types';
-import { InvalidOpenOptionsError, normalizeError } from './errors';
+import { DatabaseBusyError, DatabaseClosedError, InvalidOpenOptionsError, normalizeError } from './errors';
 import { isRecord, withTimeout } from './internal';
 const VALID_FAILPOINTS = new Set<Exclude<DebugFailpoint, null>>([
     'after_wal_flush',
@@ -49,10 +49,27 @@ export interface RegistryEntry {
     persistenceBridge: MainThreadPersistenceBridge;
     options: NormalizedOpenOptions;
     invalidated: boolean;
+    schemaMigrationInProgress: boolean;
     txInvalidationListeners: Set<() => void>;
     handleInvalidationListeners: Set<() => void>;
 }
 const registry = new Map<string, RegistryEntry>();
+const lifecycleOperations = new Map<string, Promise<void>>();
+function queueLifecycleOperation<T>(dbName: string, operation: () => Promise<T>): Promise<T> {
+    const previous = lifecycleOperations.get(dbName) ?? Promise.resolve();
+    const result = previous.then(operation);
+    const settled = result.then(
+        () => undefined,
+        () => undefined
+    );
+    lifecycleOperations.set(dbName, settled);
+    void settled.then(() => {
+        if (lifecycleOperations.get(dbName) === settled) {
+            lifecycleOperations.delete(dbName);
+        }
+    });
+    return result;
+}
 function requirePlainOptionsObject(options: unknown): asserts options is OpenOptions {
     if (options === null || typeof options !== 'object' || Array.isArray(options)) {
         throw new InvalidOpenOptionsError('open options must be an object');
@@ -201,6 +218,7 @@ function createEntry(
         persistenceBridge,
         options,
         invalidated: false,
+        schemaMigrationInProgress: false,
         txInvalidationListeners: new Set(),
         handleInvalidationListeners: new Set()
     };
@@ -260,89 +278,99 @@ export function unsafeDebugCrashWorker(dbName: string): boolean {
 }
 export async function acquireDbWorker(dbName: string, options: OpenOptions = {}): Promise<RegistryEntry> {
     const normalized = normalizeOptions(options);
-    const existing = registry.get(dbName);
-    if (existing) {
-        if (existing.invalidated) {
-            registry.delete(dbName);
-        } else {
-            assertCompatibleOptions(dbName, existing.options, normalized);
-            if (normalized.debugFailpoint !== null) {
-                try {
-                    await existing.proxy.setFailpoint(normalized.debugFailpoint);
-                } catch (error) {
-                    throw normalizeError(error);
+    return queueLifecycleOperation(dbName, async () => {
+        const existing = registry.get(dbName);
+        if (existing) {
+            if (existing.invalidated) {
+                registry.delete(dbName);
+            } else {
+                if (existing.schemaMigrationInProgress) {
+                    throw new DatabaseBusyError(`database ${dbName} is migrating; wait for openDB() to resolve`);
                 }
+                assertCompatibleOptions(dbName, existing.options, normalized);
+                if (normalized.debugFailpoint !== null) {
+                    try {
+                        await existing.proxy.setFailpoint(normalized.debugFailpoint);
+                    } catch (error) {
+                        throw normalizeError(error);
+                    }
+                }
+                existing.refs += 1;
+                return existing;
             }
-            existing.refs += 1;
-            return existing;
         }
-    }
-    const { worker, proxy, persistenceBridge } = createWorker();
-    const entry = createEntry(dbName, worker, proxy, persistenceBridge, normalized);
-    try {
-        await proxy.open({
-            dbName,
-            options: normalized
-        });
-        registry.set(dbName, entry);
-        return entry;
-    } catch (error) {
-        persistenceBridge.close();
-        proxy.dispose(new Error('worker open failed'));
-        worker.terminate();
-        throw normalizeError(error);
-    }
+        const { worker, proxy, persistenceBridge } = createWorker();
+        const entry = createEntry(dbName, worker, proxy, persistenceBridge, normalized);
+        try {
+            await proxy.open({
+                dbName,
+                options: normalized
+            });
+            registry.set(dbName, entry);
+            return entry;
+        } catch (error) {
+            persistenceBridge.close();
+            proxy.dispose(new Error('worker open failed'));
+            worker.terminate();
+            throw normalizeError(error);
+        }
+    });
 }
 export async function releaseDbWorker(entry: RegistryEntry): Promise<void> {
-    if (entry.invalidated) {
-        return;
-    }
-    const current = registry.get(entry.dbName);
-    if (!current) {
-        return;
-    }
-    current.refs -= 1;
-    if (current.refs > 0) {
-        return;
-    }
-    registry.delete(entry.dbName);
-    try {
-        await current.proxy.close();
-    } finally {
-        current.persistenceBridge.close();
-        current.proxy.dispose(new Error('worker was released'));
-        current.worker.terminate();
-    }
+    return queueLifecycleOperation(entry.dbName, async () => {
+        if (entry.invalidated || registry.get(entry.dbName) !== entry) {
+            return;
+        }
+        entry.refs -= 1;
+        if (entry.refs > 0) {
+            return;
+        }
+        registry.delete(entry.dbName);
+        try {
+            await entry.proxy.close();
+        } finally {
+            entry.persistenceBridge.close();
+            entry.proxy.dispose(new Error('worker was released'));
+            entry.worker.terminate();
+        }
+    });
 }
 export async function destroyDbWorker(entry: RegistryEntry): Promise<void> {
-    const current = registry.get(entry.dbName) ?? entry;
+    return queueLifecycleOperation(entry.dbName, () => destroyEntry(entry));
+}
+async function destroyEntry(entry: RegistryEntry): Promise<void> {
+    if (entry.invalidated || registry.get(entry.dbName) !== entry) {
+        throw new DatabaseClosedError();
+    }
     registry.delete(entry.dbName);
-    invalidateEntry(current);
-    current.refs = 0;
+    invalidateEntry(entry);
+    entry.refs = 0;
     try {
-        await current.proxy.destroy();
+        await entry.proxy.destroy();
     } catch (error) {
         throw normalizeError(error);
     } finally {
-        current.persistenceBridge.close();
-        current.proxy.dispose(new Error('worker was released'));
-        current.worker.terminate();
+        entry.persistenceBridge.close();
+        entry.proxy.dispose(new Error('worker was released'));
+        entry.worker.terminate();
     }
 }
 export async function deleteDbByName(dbName: string): Promise<void> {
-    const current = registry.get(dbName);
-    if (current) {
-        await destroyDbWorker(current);
-        return;
-    }
-    const { worker, proxy, persistenceBridge } = createWorker();
-    try {
-        await proxy.deleteDB(dbName);
-    } catch (error) {
-        throw normalizeError(error);
-    } finally {
-        persistenceBridge.close();
-        proxy.dispose(new Error('temporary worker was terminated'));
-        worker.terminate();
-    }
+    return queueLifecycleOperation(dbName, async () => {
+        const current = registry.get(dbName);
+        if (current) {
+            await destroyEntry(current);
+            return;
+        }
+        const { worker, proxy, persistenceBridge } = createWorker();
+        try {
+            await proxy.deleteDB(dbName);
+        } catch (error) {
+            throw normalizeError(error);
+        } finally {
+            persistenceBridge.close();
+            proxy.dispose(new Error('temporary worker was terminated'));
+            worker.terminate();
+        }
+    });
 }

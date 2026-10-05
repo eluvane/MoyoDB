@@ -195,8 +195,7 @@ fn compaction_batches_consecutive_pages_and_reopens_without_changing_source() {
     }
     reopened.rollback_tx(ro).unwrap();
 
-    // Count native/OPFS crossings, not elapsed time. The previous scalar writer
-    // performs one crossing per image; bounded batches need only a few here.
+    // Backend write counts measure native/OPFS crossings, independent of timing.
     assert!(
         writes.len() <= image_count.div_ceil(64) + 1,
         "{image_count} images required {} backend writes",

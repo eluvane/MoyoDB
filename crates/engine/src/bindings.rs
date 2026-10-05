@@ -1,5 +1,87 @@
-// Binding-only byte representation; native serializer tests inspect this same
-// adapter without changing ChangeFeed's general JSON or storage representation.
+#[cfg(any(target_arch = "wasm32", test))]
+fn open_engine_for_binding<B: crate::storage::backend::FileBackend + Clone>(
+    name: &str,
+    files: crate::storage::backend::FileSet<B>,
+    config: crate::engine::OpenConfig,
+) -> crate::error::Result<crate::engine::Engine<B>> {
+    // Engine::open consumes the files on failure. Keep aliases to release
+    // the OPFS session so the same worker can retry.
+    let mut cleanup = [
+        files.manifest.clone(),
+        files.main.clone(),
+        files.wal.clone(),
+    ];
+    let opened = crate::engine::Engine::open(name, files, config);
+    if opened.is_err() {
+        for file in &mut cleanup {
+            // Release every file and preserve the initialization error.
+            let _ = file.close();
+        }
+    }
+    opened
+}
+
+#[cfg(test)]
+mod open_binding_tests {
+    use super::open_engine_for_binding;
+    use crate::engine::OpenConfig;
+    use crate::error::{EngineError, Result};
+    use crate::storage::memory::MemoryBundle;
+
+    #[test]
+    fn failed_open_releases_every_file_without_replacing_the_original_error() {
+        let bundle = MemoryBundle::new();
+        let result = open_engine_for_binding(
+            "missing",
+            bundle.files(),
+            OpenConfig {
+                create_if_missing: false,
+                ..OpenConfig::default()
+            },
+        );
+        let error = match result {
+            Ok(_) => panic!("a missing database must not open"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            EngineError::Storage("database missing and create_if_missing=false".into())
+        );
+        for file in [&bundle.manifest, &bundle.main, &bundle.wal] {
+            assert!(matches!(file.len(), Err(EngineError::Storage(_))));
+        }
+    }
+
+    #[test]
+    fn corrupt_open_releases_every_file() -> Result<()> {
+        let mut bundle = MemoryBundle::new();
+        bundle.manifest.write_at(0, &[0x55; 8192])?;
+        bundle.manifest.flush()?;
+        let result = open_engine_for_binding("corrupt", bundle.files(), OpenConfig::default());
+        assert!(matches!(result, Err(EngineError::Corruption(_))));
+        for file in [&bundle.manifest, &bundle.main, &bundle.wal] {
+            assert!(matches!(file.len(), Err(EngineError::Storage(_))));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn successful_open_keeps_files_available_until_close() -> Result<()> {
+        let bundle = MemoryBundle::new();
+        let mut engine = open_engine_for_binding("healthy", bundle.files(), OpenConfig::default())?;
+        for file in [&bundle.manifest, &bundle.main, &bundle.wal] {
+            assert!(file.len().is_ok());
+        }
+        engine.close()?;
+        for file in [&bundle.manifest, &bundle.main, &bundle.wal] {
+            assert!(matches!(file.len(), Err(EngineError::Storage(_))));
+        }
+        Ok(())
+    }
+}
+
+// This byte representation is specific to WASM. ChangeFeed keeps its JSON
+// and storage formats. Native tests use the same adapter.
 #[cfg(any(target_arch = "wasm32", test))]
 struct WasmChangeFeed<'a>(&'a crate::change_feed::ChangeFeed);
 
@@ -459,10 +541,9 @@ mod wasm {
         js_value_from_serializable(&WasmRebuildTargetInfo { generation_name })
     }
 
-    /// Publishes `generation_name` as the active generation. With
-    /// `expected_current` set, the swap fails unless the control file still
-    /// names that generation (or is absent, for `null`), and the written
-    /// control file is read back and verified before this resolves.
+    /// Publishes `generation_name` only if the active generation matches
+    /// `expected_current`. `None` requires no active generation.
+    /// Verifies the written control file before returning.
     #[wasm_bindgen(js_name = swapActiveGeneration)]
     pub async fn swap_active_generation(
         name: String,
@@ -474,8 +555,9 @@ mod wasm {
             .map_err(js_error)
     }
 
-    /// Active generation from the control file, or `null` for the legacy
-    /// layout. A corrupt control file is an error, never `null`.
+    /// Returns the active generation, or `null` for the legacy layout.
+    /// A corrupt control file permits legacy fallback only while legacy data
+    /// files remain. Otherwise it is an error.
     #[wasm_bindgen(js_name = readActiveGeneration)]
     pub async fn read_active_generation(name: String) -> std::result::Result<JsValue, JsValue> {
         Ok(OpfsBackend::read_active_generation(&name)
@@ -499,8 +581,7 @@ mod wasm {
             .map_err(js_error)? as f64)
     }
 
-    /// `"debug"` or `"release"`; benchmark reports record which build they
-    /// measured instead of trusting the build script that was supposed to run.
+    /// Returns `"debug"` or `"release"` for the loaded WASM build.
     #[wasm_bindgen(js_name = buildProfile)]
     pub fn build_profile() -> String {
         if cfg!(debug_assertions) {
@@ -526,7 +607,8 @@ mod wasm {
             files: FileSet<OpfsBackend>,
             open: &WasmOpenOptions,
         ) -> std::result::Result<(), JsValue> {
-            let engine = Engine::open(name, files, open.config()).map_err(js_error)?;
+            let engine =
+                super::open_engine_for_binding(name, files, open.config()).map_err(js_error)?;
             self.inner = Some(engine);
             Ok(())
         }
@@ -578,8 +660,8 @@ mod wasm {
             self.finish_open(&name, files, &open)
         }
 
-        /// Checkpoints (when healthy) and closes. The handle is released even
-        /// when closing fails, so a retry never reuses a half-closed engine.
+        /// Checkpoints a healthy engine and closes it. Releases the binding
+        /// handle even on error so a retry cannot reuse a partially closed engine.
         #[wasm_bindgen]
         pub fn close(&mut self) -> std::result::Result<(), JsValue> {
             match self.inner.take() {
@@ -620,8 +702,8 @@ mod wasm {
             self.inner_mut()?.checkpoint().map_err(js_error)
         }
 
-        /// Streams this database into `target`, a freshly opened empty
-        /// generation. Returns the txid the target was published at.
+        /// Streams this database into a new, empty target generation.
+        /// Returns the target txid. The caller must activate the generation.
         #[wasm_bindgen]
         pub fn compact_into(
             &mut self,
@@ -631,8 +713,8 @@ mod wasm {
             self.inner_mut()?.compact_into(target).map_err(js_error)
         }
 
-        /// Rebuild-only omission of explicitly named internal stores. The
-        /// default compaction path retains every store as before.
+        /// Omits the named internal stores during a rebuild. Compaction
+        /// also omits the change log and retains the other stores.
         #[wasm_bindgen]
         pub fn compact_into_skipping_stores(
             &mut self,
@@ -721,7 +803,7 @@ mod wasm {
             self.inner_mut()?.has(tx_id, &store, key).map_err(js_error)
         }
 
-        /// One existence batch with one TTL clock and no value materialization.
+        /// Checks existence using one TTL timestamp without loading value bodies.
         #[wasm_bindgen]
         pub fn has_many(
             &mut self,
@@ -752,9 +834,9 @@ mod wasm {
             Ok(uint8_array_options_to_js_array(values).into())
         }
 
-        /// Keys arrive packed; values leave packed as
-        /// `u32 count | count x u32 length (u32::MAX = missing) | bytes`,
-        /// one buffer instead of one JS array per value.
+        /// Returns packed values as
+        /// `u32 count | count x u32 length (u32::MAX = missing) | bytes`.
+        /// All integers are little-endian.
         #[wasm_bindgen]
         pub fn get_many_packed(
             &mut self,
@@ -901,8 +983,8 @@ mod wasm {
             }
         }
 
-        /// Returns one byte per op: for puts whether the key existed before,
-        /// for deletes whether a key was deleted. The op kinds are the caller's.
+        /// Returns one byte per operation in input order. For puts, 1 means
+        /// the key existed before the write. For deletes, 1 means it was deleted.
         #[wasm_bindgen]
         pub fn apply_batch_packed(
             &mut self,
@@ -1066,7 +1148,7 @@ mod wasm {
         Ok(out)
     }
 
-    /// Splits a packed list into slices of the input; nothing is copied.
+    /// Returns slices that borrow the packed payload without copying its bytes.
     fn parse_packed_binary_list<'a>(
         bytes: &'a [u8],
         what: &str,

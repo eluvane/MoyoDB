@@ -1,6 +1,5 @@
-//! Immutable encoded values used while planning a commit. The payload stays
-//! borrowed from the staged put; only its small prefix and optional per-chunk
-//! checksums are owned here. Public arbitrary-byte APIs keep the generic path.
+//! Commit planning borrows immutable payloads and owns only their prefixes
+//! and optional chunk checksums.
 
 #[cfg(test)]
 mod tests;
@@ -51,9 +50,8 @@ impl<'a> PreparedValue<'a> {
         }
     }
 
-    /// Hash a shared, immutable payload once for its two independent encodings.
-    /// Identity is checked only to establish that both views borrow those exact
-    /// bytes; no pointer or content cache survives this pair or this commit.
+    /// Hashes both prefixed views in one payload pass only when they borrow
+    /// the same slice. Checksums remain local to these immutable values.
     pub(crate) fn share_payload_checksums(&mut self, other: &mut Self) {
         #[cfg(test)]
         if work::generic_only() {
@@ -75,8 +73,8 @@ impl<'a> PreparedValue<'a> {
     }
 }
 
-/// The shared tree algorithms are monomorphized for ordinary slices and for
-/// prepared values. Slice callers do not allocate an adapter collection.
+/// Lets tree algorithms borrow slices or prepared values without copying
+/// values into a common representation.
 pub(crate) trait ValueSource {
     fn parts(&self) -> ValueParts<'_>;
 }

@@ -15,7 +15,7 @@ const MISSING = Symbol('moyodb.indexing.missing');
 const FNV64_OFFSET = BigInt('0xcbf29ce484222325');
 const FNV64_PRIME = BigInt('0x100000001b3');
 const FNV64_MASK = BigInt('0xffffffffffffffff');
-// Legacy SDK internal namespace preserved for storage-format compatibility; do not rename without a migration.
+// Persisted store names use this legacy namespace. Renaming requires a migration.
 const INTERNAL_STORE_PREFIX = '__browserdb:';
 const INTERNAL_INDEX_STORE_PREFIX = '__browserdb:index:';
 export const INDEX_METADATA_STORE = '__browserdb:indexes';
@@ -111,7 +111,7 @@ export function compareNormalizedIndexDefinitions(left: NormalizedIndexDef, righ
     return compareStringsByCodeUnit(serializeIndexKeyPath(left), serializeIndexKeyPath(right));
 }
 export function indexDefinitionIdentity(store: string, name: string): string {
-    return `${store}\u0000${name}`;
+    return JSON.stringify([store, name]);
 }
 export function findIndexDefinition(
     defs: ReadonlyArray<NormalizedIndexDef>,
@@ -133,17 +133,22 @@ export function decodeIndexMetadataValue(bytes: Uint8Array): NormalizedIndexDef 
     let parsed: unknown;
     try {
         parsed = JSON.parse(fatalDecoder.decode(bytes));
+        const [def] = normalizeIndexDefinitions([parsed]);
+        return def;
     } catch (error) {
         throw new SerializationError(`invalid persisted index metadata: ${String(error)}`);
     }
-    const [def] = normalizeIndexDefinitions([parsed]);
-    return def;
 }
 export function encodeIndexEntryKey(logicalIndexKey: Uint8Array, primaryKey: Uint8Array): Uint8Array {
     return encodeCompoundKeyParts([logicalIndexKey, primaryKey]);
 }
 export function decodeIndexEntryKey(bytes: Uint8Array): DecodedIndexEntryKey {
-    const parts = splitCompoundKey(bytes);
+    let parts: Uint8Array[];
+    try {
+        parts = splitCompoundKey(bytes);
+    } catch (error) {
+        throw new SerializationError(`invalid index entry key encoding: ${String(error)}`);
+    }
     if (parts.length !== 2) {
         throw new SerializationError('invalid index entry key encoding');
     }
@@ -188,9 +193,9 @@ export function extractLogicalIndexKey(def: NormalizedIndexDef, valueBytes: Uint
     return extractLogicalIndexKeyFromDocument(def, decodeIndexedDocument(valueBytes));
 }
 /**
- * One synchronous mutation plan may extract several keys from the same bytes.
- * Decode lazily to preserve per-definition validation order; never reuse this
- * extractor across operations or an asynchronous boundary.
+ * Reuse the decoded document only within one synchronous mutation plan.
+ * Lazy decoding preserves validation order. Do not retain the extractor
+ * across operations or an await.
  */
 export function createIndexKeyExtractor(valueBytes: Uint8Array): (def: NormalizedIndexDef) => Uint8Array | null {
     let decoded = false;
@@ -283,7 +288,9 @@ function makeInternalIndexStoreName(store: string, name: string): string {
     if (encoder.encode(candidate).length <= 255) {
         return candidate;
     }
-    const payload = utf8Encode(indexDefinitionIdentity(store, name));
+    // Preserve the persisted hash format. Normalization rejects distinct
+    // identities that map to the same internal store, including separator collisions.
+    const payload = utf8Encode(`${store}\u0000${name}`);
     return `${INTERNAL_INDEX_STORE_PREFIX}h:${fnv1a64Hex(payload)}`;
 }
 function base64Url(bytes: Uint8Array): string {
@@ -315,7 +322,7 @@ function resolveKeyPath(root: unknown, keyPath: string): unknown {
             return MISSING;
         }
         const target = Object(current) as Record<string, unknown>;
-        if (!(segment in target)) {
+        if (!Object.hasOwn(target, segment)) {
             return MISSING;
         }
         current = Reflect.get(target, segment);
@@ -323,11 +330,21 @@ function resolveKeyPath(root: unknown, keyPath: string): unknown {
     return current;
 }
 function encodeDocumentIndexValue(value: unknown): Uint8Array {
-    if (value instanceof Uint8Array) {
-        return encodeIndexScalar(value);
-    }
-    if (value === null || typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
-        return encodeIndexScalar(value);
+    if (
+        value === null ||
+        typeof value === 'string' ||
+        typeof value === 'number' ||
+        typeof value === 'boolean' ||
+        value instanceof Uint8Array
+    ) {
+        try {
+            return encodeIndexScalar(value);
+        } catch (error) {
+            if (error instanceof TypeError) {
+                throw new SerializationError(`invalid indexed keyPath value: ${error.message}`);
+            }
+            throw error;
+        }
     }
     throw new SerializationError(
         `indexed keyPath values must resolve to string, number, boolean, null, or Uint8Array; got ${describeValue(value)}`

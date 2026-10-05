@@ -520,9 +520,8 @@ fn get_many_observes_staged_values_deletes_and_empty_store_errors() -> Result<()
     Ok(())
 }
 
-// This scalar oracle compiles before the native batch API exists. Method
-// resolution selects the inherent API once it is added; qualified calls keep
-// the independent oracle available for equality checks.
+// Qualified trait calls use the scalar oracle. Ordinary method calls use
+// the inherent batch API, so both paths remain available for comparison.
 trait HasManyOracle {
     fn has_many<K: AsRef<[u8]>>(&mut self, tx: u64, store: &str, keys: &[K]) -> Result<Vec<bool>>;
 }

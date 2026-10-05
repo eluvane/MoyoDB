@@ -85,6 +85,25 @@ function buildSuites(browserReports) {
                 id: `${result.engine}:${result.workloadName}`,
                 label: `${result.engine} / ${result.workloadName}`,
                 source: file,
+                comparisonContext: {
+                    profile: report.profile,
+                    browserName: report.browser?.name,
+                    browserVersion: report.browser?.version,
+                    persistentContext: report.environment?.persistentContext,
+                    indexedDbDurability: report.environment?.indexedDbDurability,
+                    moyoDbDurability: report.environment?.moyoDbDurability,
+                    sdkBuildMode: report.environment?.sdkBuildMode,
+                    wasmBuildMode: report.environment?.wasmBuildMode,
+                    backendPath: report.environment?.backendPath,
+                    headless: report.environment?.headless,
+                    recordCount: result.recordCount,
+                    keySize: result.keySize,
+                    valueSize: result.valueSize,
+                    batchSize: result.batchSize,
+                    transactionBoundaries: result.transactionBoundaries,
+                    warmupCount: result.warmupCount,
+                    sampleCount: result.sampleCount
+                },
                 metrics: {
                     opsPerSec: mean > 0 ? 1000 / mean : 0,
                     avgLatencyMs: mean,
@@ -115,9 +134,9 @@ function renderSummary(baseline) {
         '',
         '## Policy',
         '',
-        '- Native Rust Criterion timings are engine-core microbenchmarks.',
-        '- Browser timings include SDK, Worker, WASM and storage-backend overhead.',
-        '- Compare only matching workloads, browser profiles, sample counts and persistence modes.',
+        '\\- Native Rust Criterion timings are engine-core microbenchmarks.\\',
+        '\\- Browser timings include SDK, Worker, WASM and storage-backend overhead.\\',
+        '\\- Compare only matching workloads, browser profiles, sample counts and persistence modes.',
         ''
     ];
     for (const suite of baseline.suites) {
@@ -156,7 +175,7 @@ async function readSuiteMetadata() {
 }
 
 async function readBrowserReports() {
-    let files = [];
+    let files;
     try {
         files = (await readdir(resultsDir)).filter((name) => name.endsWith('.json')).sort();
     } catch {

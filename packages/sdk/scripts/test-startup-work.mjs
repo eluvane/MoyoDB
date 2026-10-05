@@ -5,9 +5,8 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import ts from 'typescript';
 
-// Portable control-flow/work-accounting fixture. DbWorker and OwnershipLease
-// are production code; WASM and browser boundaries are deterministic doubles.
-// This is not a browser timing or OPFS durability test.
+// Tests production DbWorker and OwnershipLease with deterministic WASM and browser fixtures.
+// Browser latency and OPFS durability are outside its scope.
 const here = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
 const flag = (name) => {
@@ -209,8 +208,7 @@ try {
         join(output, 'worker-server.mjs'),
         'export let runtime; export function exposeWorkerApi(api) { runtime = api; }\n'
     );
-    // Module initialization registers one persistence bridge. Dispose it before
-    // constructing the individually controlled production runtimes below.
+    // Close the runtime created at import to release its persistence bridge.
     const importEnvironment = createEnvironment();
     await import(pathToFileURL(join(output, 'worker.mjs')).href);
     const { runtime: initial } = await import(pathToFileURL(join(output, 'worker-server.mjs')).href);
@@ -223,8 +221,8 @@ try {
         const runtimes = [];
         const makeRuntime = () => {
             const runtime = new WorkerRuntime();
-            // The private TS field is a normal emitted property. This replaces
-            // the WASM-loading boundary, not DbWorker.open or its control flow.
+            // TypeScript emits this private field as a normal property.
+            // Replace WASM loading while retaining DbWorker.open control flow.
             runtime.wasmReady = Promise.resolve(env.wasm);
             runtimes.push(runtime);
             return runtime;
@@ -315,8 +313,6 @@ try {
                 name: 'StorageError',
                 message: 'injected real database open failure'
             });
-            // The controlled real-open boundary must be reached with the lease
-            // held, and its failure must not escape cleanup.
             for (let turns = 0; turns < 100 && env.count('engine.acquireHandles') === 0; turns += 1)
                 await Promise.resolve();
             assert.equal(env.count('engine.acquireHandles'), 1);

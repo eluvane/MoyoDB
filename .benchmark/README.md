@@ -4,9 +4,9 @@ This directory is the canonical benchmark control plane for MoyoDB. It contains 
 
 ## What belongs here
 
-- `suites.json` lists the supported benchmark suites and the local command names.
-- `policy.json` defines the default regression thresholds used by `npm run bench:compare`.
-- Generated `baseline.json`, `summary.md`, raw browser JSON and comparison reports belong in ignored subdirectories.
+\- `suites.json` lists the supported benchmark suites and the local command names.\
+\- `policy.json` defines the default regression thresholds used by `npm run bench:compare`.\
+\- Generated `baseline.json`, `summary.md`, raw browser JSON and comparison reports belong in ignored subdirectories.
 
 ## Local commands
 
@@ -21,3 +21,7 @@ Use `npm run bench:rust` only when the machine is intended to execute native Cri
 ## Reading results
 
 MoyoDB has two intentionally separate benchmark layers: native Rust engine microbenchmarks and browser SDK/WASM/Worker/OPFS measurements. They are both useful, but they are not interchangeable. Compare only rows with the same workload shape, browser profile, sample count and persistence mode.
+
+Collected browser rows retain their browser version, profile, storage and durability settings, build modes and workload/sample configuration in `comparisonContext`. The comparator matches all of these settings and reports unmatched rows. Baselines collected before this context was recorded must be recollected with matching settings; `bench:compare:gate` fails when an existing baseline has no comparable rows.
+
+Run `npm run test:tooling` to check the collector, comparator and repository policy scripts against synthetic CLI fixtures.

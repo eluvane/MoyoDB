@@ -220,3 +220,43 @@ test('failed migrations rollback schema and version changes', async ({ page }) =
     expect(result.stable).toBe('v1');
     expect(result.tempExists).toBe(false);
 });
+
+test('another same-tab open cannot observe an in-progress migration', async ({ page }) => {
+    await prepareMoyoDbPage(page);
+    const result = await page.evaluate(async (name) => {
+        let migrationStarted = () => {};
+        const entered = new Promise<void>((resolve) => {
+            migrationStarted = resolve;
+        });
+        let finishMigration = () => {};
+        const gate = new Promise<void>((resolve) => {
+            finishMigration = resolve;
+        });
+        const opening = window.moyodb.openDB(name, {
+            requestPersistence: false,
+            version: 1,
+            migrate: async ({ db }) => {
+                await db.createStore('migrated');
+                migrationStarted();
+                await gate;
+            }
+        });
+        await entered;
+        let competingError = 'NO_ERROR';
+        try {
+            const competing = await window.moyodb.openDB(name, { requestPersistence: false });
+            await competing.close();
+        } catch (error) {
+            competingError = (error as Error).name;
+        } finally {
+            finishMigration();
+        }
+        const db = await opening;
+        try {
+            return { competingError, version: await db.getVersion(), stores: await db.listStores() };
+        } finally {
+            await db.close();
+        }
+    }, uniqueDbName('migration-open-ownership'));
+    expect(result).toEqual({ competingError: 'DatabaseBusyError', version: 1, stores: ['migrated'] });
+});

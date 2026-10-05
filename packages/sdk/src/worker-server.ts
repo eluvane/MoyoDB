@@ -36,7 +36,7 @@ export interface WorkerServerHandle {
     close(): void;
 }
 
-/** Commands whose first argument is a transaction handle; they run in that transaction's lane. */
+/** The first argument identifies the transaction lane. */
 const TRANSACTION_COMMANDS = new Set<WorkerCommand>([
     'commit',
     'rollback',
@@ -59,7 +59,7 @@ const TRANSACTION_COMMANDS = new Set<WorkerCommand>([
     'setSchemaVersion'
 ]);
 
-/** Commands that replace or tear down engine state and must not overlap any other engine work. */
+/** These commands require exclusive access to the open engine. */
 const EXCLUSIVE_COMMANDS = new Set<WorkerCommand>([
     'open',
     'close',
@@ -71,22 +71,17 @@ const EXCLUSIVE_COMMANDS = new Set<WorkerCommand>([
 ]);
 
 /**
- * Commands that never touch the open engine. They bypass scheduling so a slow
- * browser API (storage estimate, persistence prompt) cannot stall a close.
+ * These commands do not use the open engine, so browser storage calls
+ * can run without delaying its close.
  */
 const UNSCHEDULED_COMMANDS = new Set<WorkerCommand>(['deleteDB', 'storageInfo', 'requestPersistence']);
 
 const noop = () => {};
 
 /**
- * Orders requests the way the engine needs them:
- * - operations of one transaction run strictly one after another, so an
- *   awaited step (compression, uniqueness check) cannot interleave with the
- *   next operation of the same transaction;
- * - readwrite autocommits queue behind each other instead of failing on the
- *   single-writer rule;
- * - exclusive commands wait for all in-flight work and hold back new work
- *   until they finish.
+ * Serializes each transaction lane, including awaited work. Readwrite
+ * autocommits share one writer lane. Exclusive commands wait for scheduled
+ * work and block later scheduled work until they finish.
  */
 class RequestScheduler {
     #lanes = new Map<number | string, Promise<void>>();
@@ -178,9 +173,8 @@ class ResponseQueue {
                     this.flushScheduled = false;
                     return;
                 }
-                // Same-lane requests settle in successive microtasks. Give
-                // them a task boundary to coalesce, but never wait for a slow
-                // sibling. Fully settled batches flush earlier in dispatch.
+                // A task boundary groups replies from successive transaction-lane
+                // microtasks and releases ready replies while other requests remain pending.
                 this.flushChannel ??= this.createFlushChannel();
                 this.flushChannel.port2.postMessage(null);
             });
@@ -245,9 +239,7 @@ export function exposeWorkerApi(
             const respond: SendResponse = (response, transfer) => {
                 responses.enqueue(response, transfer);
                 remaining -= 1;
-                // Do not add a task hop when every reply is already ready.
-                // The queue's task fallback still releases partial results
-                // when any request suspends or produces no protocol reply.
+                // Flush fully settled batches in this task. The fallback releases partial replies.
                 if (remaining === 0) responses.flush();
             };
             for (const request of event.data.requests) {

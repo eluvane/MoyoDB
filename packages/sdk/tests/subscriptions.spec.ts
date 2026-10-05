@@ -298,3 +298,38 @@ test('db.subscribe and db.watch reject reserved internal store names', async ({ 
         }
     ]);
 });
+
+test('closing a handle from a subscriber stops the remaining commit callbacks', async ({ page }) => {
+    await prepareMoyoDbPage(page);
+    const delivered = await page.evaluate(async (name) => {
+        const db = await window.moyodb.openDB(name, { requestPersistence: false });
+        const calls: string[] = [];
+        let closing: Promise<void> | null = null;
+        try {
+            await db.createStore('alpha');
+            await db.createStore('beta');
+            const firstCallback = new Promise<void>((resolve) => {
+                db.subscribe((store) => {
+                    calls.push(`first:${store}`);
+                    closing = db.close();
+                    resolve();
+                });
+            });
+            db.subscribe((store) => {
+                calls.push(`second:${store}`);
+            });
+            const tx = await db.begin('readwrite');
+            const key = window.moyodb.utf8Encode('key');
+            const value = window.moyodb.utf8Encode('value');
+            await tx.put('alpha', key, value);
+            await tx.put('beta', key, value);
+            await tx.commit();
+            await firstCallback;
+            await closing;
+            return calls;
+        } finally {
+            await db.close();
+        }
+    }, uniqueDbName('subscription-close'));
+    expect(delivered).toEqual(['first:alpha']);
+});

@@ -30,10 +30,9 @@ export interface WorkloadRunner {
     prepare?(ctx: SampleContext): Promise<(() => Promise<void>) | void>;
     run(ctx: SampleContext): Promise<void>;
     /**
-     * Runs after the timed region and before cleanup. Throws when the data the
-     * sample read or wrote differs from the deterministic dataset; otherwise
-     * returns a content checksum that must match across engines, or null when
-     * the workload has no comparable content.
+     * Runs after timing, before cleanup. Throws if sample data differs from the
+     * deterministic dataset. Returns a checksum that must match across engines,
+     * or null when the workload has no comparable content.
      */
     verify?(ctx: SampleContext): Promise<string | null>;
     cleanup?(ctx: SampleContext): Promise<void>;

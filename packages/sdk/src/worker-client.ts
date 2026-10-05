@@ -41,7 +41,7 @@ import {
 import { isRecord } from './internal';
 
 interface PendingRequest {
-    /** Command whose response format the result is decoded with. */
+    /** Response command; autocommit replies use the inner command's format. */
     command: WorkerCommand;
     resolve: (value: unknown) => void;
     reject: (error: Error) => void;
@@ -292,8 +292,7 @@ export class WorkerProtocolClient implements WorkerApi {
             this.awaitingReady -= 1;
         }
         this.ensureOpen();
-        // Concurrent calls are already waiting in the same READY microtask
-        // queue. A lone call keeps its original immediate postMessage path.
+        // Calls awaiting readiness together can share a batch. A lone call posts immediately.
         const shouldQueue = this.batching && (this.awaitingReady > 0 || this.queuedRequests.length > 0);
         const id = this.nextRequestId;
         this.nextRequestId += 1;

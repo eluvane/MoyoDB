@@ -14,8 +14,6 @@ if (files.length === 0) {
 
 const reports = [];
 for (const file of files) {
-    // `file` is a name returned by readdir, so this path stays inside resultsDir.
-    // Node's fetch does not implement file: URLs.
     const raw = await readFile(join(resultsDir, file), 'utf8');
     try {
         const parsed = JSON.parse(raw);
@@ -147,19 +145,19 @@ if (parityRows.length > 0) {
 lines.push('');
 lines.push('## Reading this report');
 lines.push('');
-lines.push('- Percentiles are computed from raw browser samples; warmups are excluded.');
+lines.push('\\- Percentiles are computed from raw browser samples; warmups are excluded.\\');
 lines.push(
-    '- Compare only rows with matching workload, browser, record count, key/value size, batch size, and transaction boundaries.'
+    '\\- Compare only rows with matching workload, browser, record count, key/value size, batch size, and transaction boundaries.\\'
 );
 lines.push(
-    '- Random-read rows name their request mode: sequential, pipelined, or bulk. Compare rows of the same mode across engines.'
+    '\\- Random-read rows name their request mode: sequential, pipelined, or bulk. Compare rows of the same mode across engines.\\'
 );
 lines.push(
-    '- Rows without a Git SHA, with a WASM profile other than `release`, or without an IndexedDB durability value are not publishable numbers.'
+    '\\- Rows without a Git SHA, with a WASM profile other than `release`, or without an IndexedDB durability value are not publishable numbers.\\'
 );
-lines.push('- With fewer than about 20 measured samples, p95/p99 say little about tail latency.');
-lines.push('- Do not treat native Criterion results as browser SDK/OPFS performance.');
-lines.push('- Commit the raw JSON alongside any published report so claims remain reproducible.');
+lines.push('\\- With fewer than about 20 measured samples, p95/p99 say little about tail latency.\\');
+lines.push('\\- Do not treat native Criterion results as browser SDK/OPFS performance.\\');
+lines.push('\\- Commit the raw JSON alongside any published report so claims remain reproducible.');
 
 await writeFile(outPath, `${lines.join('\n')}\n`);
 console.log(`wrote ${join('bench', 'results', 'report.md')}`);

@@ -4,8 +4,8 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { parseArgs } from 'node:util';
-// JavaScript-layer benchmark with an ordered fake WASM backend. This deliberately
-// does not report engine, OPFS, Worker transport or IndexedDB performance.
+// Measures SDK JavaScript with an ordered mock WASM backend.
+// Engine, OPFS, Worker transport and IndexedDB performance are outside its scope.
 const { values } = parseArgs({
     options: {
         before: { type: 'string' },

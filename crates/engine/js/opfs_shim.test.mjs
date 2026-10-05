@@ -1,7 +1,3 @@
-// IO and control-file publication tests against an in-memory OPFS.
-// Covers the failure modes of the original report: short writes accepted as
-// success, a torn newer slot masking the valid one, and a corrupt control file
-// being treated like a missing one.
 import assert from 'node:assert/strict';
 import { beforeEach, describe, test } from 'node:test';
 import { setImmediate as nextTurn } from 'node:timers/promises';
@@ -15,7 +11,7 @@ class MemoryFile {
     /** Replaces read; receives (dst, at, file) and returns the byte count. */
     readHook = null;
     reads = [];
-    /** Replaces the default write; receives (src, at, file) and returns the byte count. */
+    /** Replaces write; receives (src, at, file) and returns the byte count. */
     writeHook = null;
 }
 
@@ -182,8 +178,8 @@ async function openReadSession(bytes) {
     return { sessionId, file, name };
 }
 
-// Views do not own a new backing buffer. Count payload allocations and slice
-// copies only during a synchronous operation, restoring both hooks afterwards.
+// Counts new backing buffers and slice copies during synchronous work.
+// Views that borrow an existing buffer do not count as allocations.
 function measureReadBuffers(operation) {
     const NativeUint8Array = globalThis.Uint8Array;
     const prototype = NativeUint8Array.prototype;
@@ -441,6 +437,18 @@ describe('control slots', () => {
         assert.equal(state.control.slotIndex, 1);
     });
 
+    test('orders adjacent full-width u64 counters without rounding them', () => {
+        for (const older of [9007199254740992n, 0xfffffffffffffffen]) {
+            for (const newerSlot of [0, 1]) {
+                const slots = [encodeControlSlot(older, 'gen-old-1'), encodeControlSlot(older + 1n, 'gen-new-2')];
+                if (newerSlot === 0) slots.reverse();
+                const state = readControlStateFromAccessHandle(handleOver(controlBytes(...slots)));
+                assert.equal(state.control.activeGeneration, 'gen-new-2');
+                assert.equal(state.control.slotIndex, newerSlot);
+            }
+        }
+    });
+
     test('a non-empty file without a valid slot is invalid, not absent', () => {
         assert.equal(readControlStateFromAccessHandle(handleOver(new Uint8Array(0))).status, 'absent');
         assert.equal(readControlStateFromAccessHandle(handleOver(new Uint8Array(8192))).status, 'invalid');
@@ -473,7 +481,41 @@ describe('swapActiveGeneration', () => {
         assert.equal(await opfsReadActiveGeneration(seeded.name), 'gen-b-2');
         const state = readControlStateFromAccessHandle(handleOver(seeded.controlFile.bytes));
         assert.equal(state.control.slotIndex, 1);
-        assert.equal(state.control.generationCounter, 2);
+        assert.equal(state.control.generationCounter, 2n);
+    });
+
+    test('increments a full-width u64 counter exactly before publishing', async () => {
+        const counter = 9007199254740992n;
+        const olderSlot = encodeControlSlot(counter, 'gen-a-1');
+        const seededLarge = await seedDb({
+            control: controlBytes(olderSlot),
+            generations: ['gen-a-1', 'gen-b-2']
+        });
+        await opfsSwapActiveGeneration(seededLarge.name, 'gen-b-2', 'gen-a-1');
+        assert.equal(await opfsReadActiveGeneration(seededLarge.name), 'gen-b-2');
+        const selected = readControlStateFromAccessHandle(handleOver(seededLarge.controlFile.bytes));
+        assert.equal(selected.control.slotIndex, 1);
+        const view = new DataView(seededLarge.controlFile.bytes.buffer);
+        assert.equal(view.getBigUint64(CONTROL_SLOT_SIZE + 12, true), counter + 1n);
+        assert.deepEqual(seededLarge.controlFile.bytes.subarray(0, CONTROL_SLOT_SIZE), olderSlot);
+    });
+
+    test('rejects an exhausted u64 counter before overwriting either control slot', async () => {
+        const bytes = controlBytes(encodeControlSlot(0xffffffffffffffffn, 'gen-a-1'));
+        const before = bytes.slice();
+        const seededMax = await seedDb({ control: bytes, generations: ['gen-a-1', 'gen-b-2'] });
+        let writes = 0;
+        seededMax.controlFile.writeHook = (src, at, file) => {
+            writes += 1;
+            return storeBytes(file, src, at);
+        };
+        await assert.rejects(opfsSwapActiveGeneration(seededMax.name, 'gen-b-2', 'gen-a-1'), {
+            name: 'StorageError',
+            message: 'control generation counter exhausted'
+        });
+        assert.equal(writes, 0);
+        assert.deepEqual(seededMax.controlFile.bytes, before);
+        assert.equal(await opfsReadActiveGeneration(seededMax.name), 'gen-a-1');
     });
 
     test('fails when the write stores nothing and keeps the old generation', async () => {
@@ -512,8 +554,8 @@ describe('swapActiveGeneration', () => {
     });
 });
 
-// Resolve one wave of independent native calls at a time, in reverse order.
-// This measures dependencies, not browser latency or filesystem throughput.
+// Reverse completion order exposes hidden call dependencies. Wave counts
+// measure dependency depth, not browser latency or filesystem throughput.
 function queuedOpenIo(t, dir, { failStage, failKind, failure, unsupportedKind, closeFailureKind } = {}) {
     const names = ['manifest.bin', 'main.bin', 'wal.bin'];
     const getFile = dir.getFileHandle.bind(dir);
@@ -1293,8 +1335,8 @@ describe('private OPFS append offsets', () => {
             try {
                 assert.equal(opfs.opfsAppendOffset(sessionId, 1), 4n);
                 const failing = t.mock.method(MemoryAccessHandle.prototype, operation, function () {
-                    // A failed operation may have changed the file, or the
-                    // browser may report an uncertain state requiring recovery.
+                    // The cached size must be discarded when a failure leaves
+                    // the actual file length uncertain.
                     this.file.bytes = new Uint8Array(7);
                     throw failure;
                 });

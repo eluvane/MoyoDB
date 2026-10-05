@@ -45,11 +45,14 @@ function stripJsonc(input) {
             continue;
         }
         if (char === '/' && next === '*') {
+            // Comments separate tokens even when their body is empty.
+            output += ' ';
             i += 2;
             while (i < input.length && !(input[i] === '*' && input[i + 1] === '/')) {
                 output += input[i] === '\n' ? '\n' : ' ';
                 i += 1;
             }
+            if (i >= input.length) throw new SyntaxError('Unterminated JSONC block comment');
             i += 1;
             continue;
         }
@@ -65,7 +68,7 @@ function collect(dir, files = []) {
         const stat = statSync(path);
         if (stat.isDirectory()) {
             collect(path, files);
-        } else if (/\.(json|jsonc)$/u.test(path)) {
+        } else if (/\.(?:json|jsonc)$/u.test(path)) {
             files.push(path);
         }
     }

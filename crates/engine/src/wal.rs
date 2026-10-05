@@ -86,9 +86,9 @@ pub fn append_transaction<B: FileBackend>(
     append_transaction_inner::<false, B>(wal, offset, txid, page_images, commit)
 }
 
-/// Appends immutable page images just produced by the engine's page encoders.
-/// Their existing page checksums can be combined into the WAL checksum without
-/// rehashing their payload. External images use `append_transaction` instead.
+/// Requires unchanged page images from the engine's page encoders.
+/// Reuses their page checksums for the WAL checksum.
+/// Use `append_transaction` for external images.
 pub(crate) fn append_generated_transaction<B: FileBackend>(
     wal: &mut B,
     offset: &mut u64,
@@ -131,8 +131,7 @@ fn append_transaction_inner<const GENERATED: bool, B: FileBackend>(
         capacity += wal_record_total_len(WAL_PAGE_IMAGE_BODY_HEADER_SIZE + bytes.len());
     }
 
-    // Encode each WAL record directly into the transaction batch. Keeping the
-    // payload and the record as separate Vecs doubles copies in append-heavy paths.
+    // A single batch avoids separate payload and record copies.
     let mut batch = Vec::with_capacity(capacity);
     for (page_id, bytes) in page_images {
         encode_page_image_record_into::<GENERATED>(&mut batch, txid, *page_id, bytes)?;
@@ -144,7 +143,7 @@ fn append_transaction_inner<const GENERATED: bool, B: FileBackend>(
     Ok(())
 }
 
-/// A committed WAL transaction located by offsets only; page bytes stay in the file.
+/// A committed transaction with page images referenced by WAL offsets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalTransaction {
     pub txid: u64,
@@ -156,16 +155,14 @@ pub struct WalTransaction {
 
 const PAGE_IMAGE_PAYLOAD_LEN: usize = WAL_PAGE_IMAGE_BODY_HEADER_SIZE + PAGE_SIZE;
 
-/// Scans records through bounded, sequential read buffers. Header and payload
-/// share their buffered bytes; only records crossing a chunk boundary are copied.
-/// Returned transaction/page descriptors still grow with the committed log.
+/// Scans the committed log with bounded sequential read buffers.
+/// Only records across chunk boundaries are copied. Returned descriptors grow
+/// with the committed log.
 ///
-/// A record that fails its checksum, a truncated record and an incomplete batch
-/// mark the end of the durable log. A committed batch whose contents are
-/// impossible (bad page image, page id out of range, txids going backwards) is
-/// corruption: the writer never produces it, so it is not silently dropped.
-/// Page images are judged only once their commit record is seen; an
-/// uncommitted tail is never applied, so its contents do not matter.
+/// Checksum failures, truncated records, and incomplete batches end the log.
+/// Invalid committed page images, out-of-range page ids, or non-increasing
+/// transaction ids are corruption. Page validation errors are reported only
+/// after a matching commit. An uncommitted tail is never applied.
 pub fn scan_wal_index<B: FileBackend>(wal: &B) -> Result<Vec<WalTransaction>> {
     let mut committed = Vec::new();
     #[cfg(test)]
@@ -188,8 +185,8 @@ pub fn scan_wal_index<B: FileBackend>(wal: &B) -> Result<Vec<WalTransaction>> {
     Ok(committed)
 }
 
-/// Visits fully validated commits; an unfinished tail is never passed on.
-/// The visitor may take the page buffer for collection or leave it for reuse.
+/// Visits validated transactions. Does not visit an unfinished tail.
+/// The visitor may take the page offsets or leave the buffer for reuse.
 pub(crate) fn visit_wal_transactions<B: FileBackend>(
     wal: &B,
     mut on_commit: impl FnMut(CommitRecord, &mut Vec<(u64, u64)>, u64) -> Result<()>,
@@ -317,9 +314,8 @@ fn wal_corruption(offset: u64, message: &str) -> EngineError {
     EngineError::Corruption(format!("wal record at offset {offset}: {message}"))
 }
 
-/// Writes the newest image of every page touched by `txs` into the main file.
-/// Older images of the same page are skipped, so replay cost is bounded by the
-/// number of distinct pages, not the log length.
+/// Writes only the latest image of each page touched by `txs`.
+/// Page reads and writes scale with the number of distinct pages.
 pub fn replay_wal_index<B: FileBackend>(
     pager: &mut Pager<B>,
     wal: &B,
@@ -376,8 +372,8 @@ fn replay_page_batch<B: FileBackend>(
         {
             end += 1;
         }
-        // Consecutive images in WAL have record headers between them. Reading
-        // the bounded span amortizes backend crossings without reading gaps.
+        // WAL record headers separate adjacent page images.
+        // A bounded span reduces backend calls without reading unrelated records.
         let source_len = (end - start - 1) * record_len + PAGE_SIZE;
         let source_offset = locations[start].1;
         source_offset
@@ -391,8 +387,7 @@ fn replay_page_batch<B: FileBackend>(
             for (index, (page_id, _)) in locations[start..end].iter().enumerate() {
                 let local = index * record_len;
                 let remaining = source.get(local..).unwrap_or_default();
-                // Let the original page validator classify short or oversized
-                // buffers, after any earlier invalid image in this source run.
+                // Preserve page validation order and errors for short or oversized reads.
                 let bytes = if index + 1 == end - start {
                     remaining
                 } else {
@@ -407,7 +402,7 @@ fn replay_page_batch<B: FileBackend>(
     pager.write_page_images(images, buffer)
 }
 
-/// Materializing variant of [`scan_wal_index`], kept for tools and tests.
+/// Returns [`scan_wal_index`] transactions with page bytes loaded.
 pub fn scan_wal<B: FileBackend>(wal: &B) -> Result<Vec<ReplayTransaction>> {
     scan_wal_index(wal)?
         .into_iter()
@@ -473,8 +468,8 @@ fn encode_page_image_record_into<const GENERATED: bool>(
     };
     out.extend_from_slice(body_header.as_bytes());
     let checksum = if GENERATED {
-        // The record checksum field is still zero. The engine has not changed
-        // these generated page bytes since their page checksum was computed.
+        // The record checksum is zero. Generated page bytes must be unchanged
+        // since their page checksum was computed.
         Some(crc32_with_generated_page(
             &out[record_start..],
             read_u32_le(bytes, PAGE_HEADER_CHECKSUM_OFFSET)?,

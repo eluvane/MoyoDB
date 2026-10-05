@@ -159,26 +159,23 @@ pub const WAL_RECORD_HEADER_SIZE: usize = size_of::<WalRecordHeader>();
 pub const WAL_PAGE_IMAGE_BODY_HEADER_SIZE: usize = size_of::<WalPageImageBodyHeader>();
 pub const WAL_COMMIT_BODY_SIZE: usize = size_of::<WalCommitBody>();
 
-pub fn unsafe_read_struct<T: Copy>(bytes: &[u8]) -> Result<T> {
-    if bytes.len() < size_of::<T>() {
-        return Err(EngineError::Serialization(format!(
-            "short struct read: need {}, got {}",
-            size_of::<T>(),
-            bytes.len()
-        )));
-    }
-    let mut value = std::mem::MaybeUninit::<T>::uninit();
-    // SAFETY: the length guard above ensures that `bytes` contains enough bytes
-    // to initialize `T`; all call sites use plain #[repr(C)]/integer layout
-    // structs that are `Copy`, so this is a byte-level decode boundary.
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            value.as_mut_ptr() as *mut u8,
-            size_of::<T>(),
-        );
-        Ok(value.assume_init())
-    }
+/// Reads a plain-data value from a byte prefix, without requiring alignment.
+/// Types with restricted bit patterns cannot be decoded through this safe API.
+///
+/// ```compile_fail
+/// use moyodb_engine::layout::unsafe_read_struct;
+/// let _decode: fn(&[u8]) -> moyodb_engine::Result<bool> = unsafe_read_struct::<bool>;
+/// ```
+pub fn unsafe_read_struct<T: FromBytes + Copy>(bytes: &[u8]) -> Result<T> {
+    T::read_from_prefix(bytes)
+        .map(|(value, _)| value)
+        .map_err(|_| {
+            EngineError::Serialization(format!(
+                "short struct read: need {}, got {}",
+                size_of::<T>(),
+                bytes.len()
+            ))
+        })
 }
 
 pub fn encode_superblock_slot(state: &SuperblockState) -> [u8; SUPERBLOCK_SLOT_SIZE] {

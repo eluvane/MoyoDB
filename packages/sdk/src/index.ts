@@ -218,7 +218,10 @@ class TransactionImpl implements Transaction {
 class DBImpl implements DB {
     #entry: RegistryEntry;
     #closed = false;
+    #closePromise: Promise<void> | null = null;
     #transactions = new Set<TransactionImpl>();
+    #pendingBegins = new Set<Promise<TransactionImpl>>();
+    #transactionGeneration = 0;
     #subscriptions: SubscriptionHub;
     #unsubscribeTxInvalidated: (() => void) | null = null;
     #unsubscribeHandleInvalidated: (() => void) | null = null;
@@ -279,14 +282,31 @@ class DBImpl implements DB {
     }
     async #beginImpl(mode: TxMode): Promise<TransactionImpl> {
         this.#ensureOpen();
-        return callProxy(async () => {
+        const generation = this.#transactionGeneration;
+        const pending = callProxy(async () => {
             const txId = await this.#entry.proxy.begin(mode);
             const tx = new TransactionImpl(this.#entry, txId, mode, () => {
                 this.#transactions.delete(tx);
             });
             this.#transactions.add(tx);
+            if (this.#closed || this.#entry.invalidated) {
+                if (this.#entry.invalidated) {
+                    tx.forceClose();
+                }
+                throw new DatabaseClosedError();
+            }
+            if (generation !== this.#transactionGeneration) {
+                await tx.rollbackIfOpen();
+                throw new TransactionClosedError();
+            }
             return tx;
         });
+        this.#pendingBegins.add(pending);
+        try {
+            return await pending;
+        } finally {
+            this.#pendingBegins.delete(pending);
+        }
     }
     async createStore(name: string, options: CreateStoreOptions = {}): Promise<void> {
         assertPublicStoreName(name);
@@ -324,7 +344,7 @@ class DBImpl implements DB {
         assertPublicStoreName(store);
         return this.#autocommit('readonly', 'scan', [store, range]);
     }
-    /** Begin, run and commit (or release) a single operation in one worker round trip. */
+    /** The transaction boundary stays in the worker, so one round trip is enough. */
     async #autocommit<M extends AutocommitCommand>(
         mode: TxMode,
         command: M,
@@ -342,6 +362,7 @@ class DBImpl implements DB {
     }
     async importSnapshot(data: Uint8Array): Promise<void> {
         this.#ensureOpen();
+        invalidateTransactions(this.#entry);
         return callProxy(() => {
             const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
             return this.#entry.proxy.importSnapshot(bytes);
@@ -425,13 +446,21 @@ class DBImpl implements DB {
             'watch() expects one of: (callback), (storeName, callback), (storeName, keyPrefix, callback)'
         );
     }
-    async close(): Promise<void> {
+    close(): Promise<void> {
+        if (this.#closePromise !== null) {
+            return this.#closePromise;
+        }
         if (this.#closed) {
-            return;
+            return Promise.resolve();
         }
         this.#closed = true;
         this.#disposeRegistrySubscriptions();
         this.#subscriptions.close();
+        this.#closePromise = this.#finishClose();
+        return this.#closePromise;
+    }
+    async #finishClose(): Promise<void> {
+        await Promise.allSettled(Array.from(this.#pendingBegins));
         let rollbackError: Error | null = null;
         const txs = Array.from(this.#transactions);
         if (txs.length > 0) {
@@ -458,6 +487,7 @@ class DBImpl implements DB {
         this.#unsubscribeHandleInvalidated = null;
     }
     #forceCloseTransactions() {
+        this.#transactionGeneration += 1;
         for (const tx of Array.from(this.#transactions)) {
             tx.forceClose();
         }
@@ -865,7 +895,17 @@ export async function openDB(name: string, options: OpenOptions = {}): Promise<D
             );
         }
         const targetIndexes = requestedIndexes ?? currentIndexes;
-        await db.runSchemaMigration(currentVersion, requestedVersion, migrate, toPublicIndexDefinitions(targetIndexes));
+        entry.schemaMigrationInProgress = true;
+        try {
+            await db.runSchemaMigration(
+                currentVersion,
+                requestedVersion,
+                migrate,
+                toPublicIndexDefinitions(targetIndexes)
+            );
+        } finally {
+            entry.schemaMigrationInProgress = false;
+        }
         return db;
     } catch (error) {
         try {

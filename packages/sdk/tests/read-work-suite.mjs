@@ -1,5 +1,5 @@
-// Portable read-work oracles. The engine returns independently owned objects
-// as wasm-bindgen does; the production compression module is never stubbed.
+// Fixture results model the independent ownership of wasm-bindgen values.
+// Compression uses the production module.
 export function createReadSuite({ runtime, compression }) {
     const tests = [];
     const test = (name, run, structural = false) => tests.push({ name, run, structural });

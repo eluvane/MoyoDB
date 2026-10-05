@@ -6,15 +6,15 @@ use crate::layout::{
     SUPERBLOCK_SLOT_SIZE,
 };
 use crate::pager::Pager;
-use crate::storage::backend::FileBackend;
+use crate::storage::backend::{ensure_exact_len, FileBackend};
 use crate::wal::{replay_latest_pages, visit_wal_transactions};
 use std::collections::BTreeMap;
 
-/// Publication protocol shared with the JS control file (`root-manifest.bin`):
-/// two fixed-size slots, magic then checksum then version. A slot that fails
-/// magic or checksum is torn and ignored; a checksummed slot with an unknown
-/// version is corruption. A zero-length file is absent; a non-empty file with
-/// no valid slot is corruption, never a fresh database.
+/// Shares the publication protocol with `root-manifest.bin`.
+/// Both use two fixed-size slots. Check magic, checksum, then version.
+/// Ignore slots with invalid magic or checksum. A valid checksum with an
+/// unknown version is corruption. An empty file is absent. A nonempty file
+/// with no valid slot is corruption.
 pub fn select_superblock<B: FileBackend>(manifest: &B) -> Result<Option<SuperblockState>> {
     let len = manifest.len()?;
     if len == 0 {
@@ -40,7 +40,13 @@ fn read_slot<B: FileBackend>(manifest: &B, index: usize, len: u64) -> Result<Vec
         return Ok(Vec::new());
     }
     let available = (len - offset).min(SUPERBLOCK_SLOT_SIZE as u64) as usize;
-    manifest.read_at(offset, available)
+    // Short backend reads must not hide a durable newer slot.
+    // Only the file length can identify a truncated slot.
+    ensure_exact_len(
+        manifest.read_at(offset, available)?,
+        available,
+        "superblock slot read",
+    )
 }
 
 pub fn initialize_empty_db<B: FileBackend>(
@@ -130,8 +136,8 @@ pub fn recover_if_needed<B: FileBackend>(
     Ok(recovered)
 }
 
-/// Writes one slot, flushes, and reads it back. A short or lost write is a
-/// storage error here instead of a silently stale superblock on next open.
+/// Flushes a slot and verifies it by reading it back.
+/// Readback mismatches return a storage error.
 pub fn write_superblock<B: FileBackend>(manifest: &mut B, state: &SuperblockState) -> Result<()> {
     let slot = encode_superblock_slot(state);
     let offset = (state.active_slot * SUPERBLOCK_SLOT_SIZE) as u64;
@@ -250,8 +256,6 @@ mod tests {
         expected.last_replayed_wal_offset = offset;
         oracle_manifest[SUPERBLOCK_SLOT_SIZE..].copy_from_slice(&encode_superblock_slot(&expected));
 
-        // Previous recovery retained this collecting API's history until
-        // replay. Measure that representation before the streaming path.
         scan_work::reset();
         let collecting = {
             let transactions = scan_wal_index(&wal)?;

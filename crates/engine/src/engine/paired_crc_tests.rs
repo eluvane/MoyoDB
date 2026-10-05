@@ -103,7 +103,7 @@ fn complete_commit_bytes() -> Result<Vec<Vec<u8>>> {
     )?;
     for (name, flags) in names.iter().zip(flags) {
         engine.create_store(setup, name)?;
-        // Exercise a legacy raw store as well as existing compression flags.
+        // Use legacy raw values as well as the supported compression formats.
         engine
             .txns
             .get_mut(&setup)
@@ -160,7 +160,7 @@ fn complete_commit_bytes() -> Result<Vec<Vec<u8>>> {
     let mut images = vec![bundle.wal.durable_snapshot().unwrap()];
 
     let tx = engine.begin_tx(TxMode::Readwrite)?;
-    // TTL upgrades a legacy raw store and exercises the streaming full rewrite.
+    // A TTL write to a legacy raw store requires a full rewrite.
     engine.put_with_ttl(tx, &names[0], &keys[4], &vec![0x91; 8192], Some(60_000))?;
     fix_expiry(&mut engine, tx, &names[0], &keys[4])?;
     for name in &names[..2] {
@@ -198,8 +198,8 @@ fn stock_hash_work(count: usize, value_len: usize, batch_size: usize) -> Result<
     let setup = engine.begin_tx(TxMode::Readwrite)?;
     engine.create_store(setup, "kv")?;
     engine.commit_tx(setup)?;
-    // Match bench/workloads.ts keyBytes/valueBytes and the stock transaction
-    // boundaries. Generation and setup are outside this work-accounting scope.
+    // Match bench/workloads.ts keyBytes/valueBytes and transaction sizes.
+    // Measure checksum work only after data generation and database setup.
     let entries: Vec<_> = (0..count)
         .map(|index| {
             let key = format!("k{index:012x}___").into_bytes();

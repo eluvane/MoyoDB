@@ -4,9 +4,9 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import ts from 'typescript';
 import { createSuite } from '../tests/minimum-work-suite.mjs';
-// Isolated SDK work-accounting tests, not a substitute for WASM/OPFS e2e.
-// Only the transport and compression boundaries are replaced. Index codecs,
-// metadata ownership, mutation planning and paging execute production code.
+// Measures SDK work with transport and compression fixtures. Index codecs,
+// metadata ownership, mutation planning and paging use production code.
+// WASM and OPFS end-to-end behavior are outside its scope.
 const here = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
 const value = (flag) => {

@@ -36,8 +36,6 @@ export interface BenchmarkStorageCleanupResult {
     errors: string[];
 }
 
-// MoyoDB commits become durable at the WAL flush. Bounded checkpoints install
-// pages in the main file and flush the manifest. IndexedDB defaults to `strict`.
 const MOYODB_DURABILITY =
     'strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest';
 
@@ -278,7 +276,7 @@ type EngineBuildModule = {
     buildProfile?: () => string;
 };
 
-/** Asks the same engine artifact the SDK worker loads whether it was built with debug assertions. */
+// Probe the same engine artifact that the SDK Worker loads.
 async function detectWasmBuildProfile(): Promise<string> {
     try {
         const moduleUrl = new URL('/engine/moyodb_engine.js', window.location.href).href;

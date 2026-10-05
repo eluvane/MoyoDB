@@ -55,8 +55,7 @@ function collectSources(directory) {
 }
 
 function heron(paths, input) {
-    // --all also adds reversible refactor actions (e.g. flipping an if). All 22
-    // checks, including informational checks, are enabled without that flag.
+    // --all adds refactor actions. The default scan enables all checks, including informational checks.
     const { stdout, stderr } = run(['exe', 'heron-scan', '--per-file', '--json', ...paths], { input });
     if (stderr.trim()) throw new Error(`Heron could not inspect every input:\n${stderr}`);
     const findings = JSON.parse(stdout);
@@ -171,8 +170,8 @@ function main() {
     process.stdout.write(builtin.stdout + builtin.stderr);
     selfTest();
     const failures = [];
-    // Lean resets initializer execution after importing a file's environment.
-    // A fresh process per file avoids Heron's multi-file per-file import failure.
+    // Lean resets initializer execution after each environment import.
+    // Use one process per file to avoid Heron's multi-file import failure.
     for (const path of sources) {
         try {
             denyHeron(heron([relative(proofRoot, path).replaceAll('\\', '/')]));
@@ -181,8 +180,8 @@ function main() {
         }
     }
     process.stdout.write(`Heron: inspected ${sources.length} source files.\n`);
-    // Import every module, grouping by its source root so shared proofs are not
-    // repeatedly audited. Executable roots with separate `main`s stay separate.
+    // Group related modules to avoid repeated audits of shared proofs.
+    // Keep executable roots separate because each defines main.
     const groups = Map.groupBy(modules, (module) => module.split('.')[0]);
     for (const [prefix, group] of groups) {
         try {

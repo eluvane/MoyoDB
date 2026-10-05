@@ -106,8 +106,8 @@ fn bench_catalog_scaling(c: &mut Criterion) {
             ("one_store_commit_live_reader", false, true),
         ] {
             group.bench_function(BenchmarkId::new(name, count), |b| {
-                // Setup and teardown both stay outside the measured operation.
-                // PerIteration bounds fixture memory for the largest catalog.
+                // Exclude fixture setup and teardown from timing. PerIteration
+                // limits fixture memory for the largest catalog.
                 b.iter_batched_ref(
                     || {
                         let mut engine = seed_catalog(count, feed);

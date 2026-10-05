@@ -364,8 +364,8 @@ fn short_source_reads_preserve_page_corruption_error() -> Result<()> {
         let txs = scan_wal_index(&fixture.wal)?;
         fixture.wal.arm(Fault::ShortRead(1));
         let (page_id, offset) = txs[0].pages[0];
-        // Before batching, replay passed each raw PAGE_SIZE read straight to
-        // verify_page_image. Materialized replay invokes that same validator.
+        // Materialized replay validates each page independently. Its short-read
+        // error is the oracle for batched replay.
         let old_page = PageImageRecord {
             txid: txs[0].txid,
             page_id,
@@ -517,8 +517,8 @@ fn recovery_faults_retry_to_the_same_durable_bytes() -> Result<()> {
     let images = adjacent_images()?;
     let fixture = Fixture::new(std::slice::from_ref(&images), 66)?;
     let second_replay_read = (fixture.wal_end as usize).div_ceil(64 * 1024) + 2;
-    // The scan has completed before these read faults. Both source batches,
-    // installation and publication are covered without a large database.
+    // Read faults occur after the WAL scan, in the second source batch.
+    // Other faults cover main-file installation, publication, and WAL cleanup.
     let faults = [
         (0, Fault::ReadError(second_replay_read)),
         (0, Fault::ShortRead(second_replay_read)),

@@ -1,8 +1,11 @@
-use moyodb_engine::bytes::MAX_KEY_BYTES;
+use moyodb_engine::bytes::{MAX_KEY_BYTES, MAX_VALUE_BYTES};
 use moyodb_engine::snapshot::{
     decode_snapshot, encode_snapshot, SnapshotContents, SnapshotEntry, SnapshotStore,
     SNAPSHOT_BODY_PREFIX_SIZE, SNAPSHOT_CHECKSUM_OFFSET, SNAPSHOT_ENTRY_HEADER_SIZE,
     SNAPSHOT_HEADER_SIZE, SNAPSHOT_STORE_HEADER_SIZE,
+};
+use moyodb_engine::value::{
+    StoredValue, STORE_FLAG_VALUE_ENVELOPE_V1, VALUE_ENVELOPE_HEADER_SIZE, VALUE_ENVELOPE_MAGIC,
 };
 use moyodb_engine::EngineError;
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -165,8 +168,8 @@ fn valid_checksum_duplicates_keep_value_validation_and_checksum_order() {
         EngineError::Corruption("duplicate snapshot key in store kv".into())
     );
 
-    // The second key is duplicate, but its value cannot be read. Existing
-    // value validation runs before inserting the key into the uniqueness set.
+    // The duplicate key also has a truncated value. Value validation must
+    // fail before the duplicate-key check.
     bytes[second_entry + 4..second_entry + 8].copy_from_slice(&1u32.to_le_bytes());
     reseal(&mut bytes);
     assert_eq!(
@@ -202,4 +205,77 @@ fn valid_checksum_duplicate_store_names_keep_the_original_error() {
             contents.stores[0].name
         ))
     );
+}
+
+#[test]
+fn oversized_snapshot_value_is_rejected_before_copying_payload() {
+    let contents = SnapshotContents {
+        source_last_committed_txid: 1,
+        schema_version: 0,
+        stores: vec![SnapshotStore {
+            name: "kv".into(),
+            flags: 0,
+            entries: vec![SnapshotEntry {
+                key: Vec::new(),
+                value: Vec::new(),
+                expires_at_ms: None,
+            }],
+        }],
+    };
+    let mut bytes = encode_snapshot(&contents).unwrap();
+    let entry_start = SNAPSHOT_HEADER_SIZE
+        + SNAPSHOT_BODY_PREFIX_SIZE
+        + SNAPSHOT_STORE_HEADER_SIZE
+        + contents.stores[0].name.len();
+    let value_len = MAX_VALUE_BYTES + 1;
+    bytes.resize(bytes.len() + value_len, 0x42);
+    bytes[entry_start + 4..entry_start + 8].copy_from_slice(&(value_len as u32).to_le_bytes());
+    let body_len = bytes.len() - SNAPSHOT_HEADER_SIZE;
+    bytes[16..24].copy_from_slice(&(body_len as u64).to_le_bytes());
+    reseal(&mut bytes);
+
+    ALLOCATED_BYTES.with(|work| assert!(work.replace(Some(0)).is_none()));
+    let decoded = decode_snapshot(&bytes);
+    let allocated = ALLOCATED_BYTES.with(|work| work.replace(None).unwrap());
+    assert_eq!(
+        decoded.unwrap_err(),
+        EngineError::Corruption(format!("value too large: {value_len} bytes"))
+    );
+    assert!(
+        allocated < MAX_VALUE_BYTES,
+        "rejected snapshot allocated {allocated} bytes for its oversized payload"
+    );
+
+    bytes.truncate(bytes.len() - 1);
+    bytes[entry_start + 4..entry_start + 8]
+        .copy_from_slice(&(MAX_VALUE_BYTES as u32).to_le_bytes());
+    bytes[16..24].copy_from_slice(&((body_len - 1) as u64).to_le_bytes());
+    reseal(&mut bytes);
+    let decoded = decode_snapshot(&bytes).unwrap();
+    assert_eq!(decoded.stores[0].entries[0].value.len(), MAX_VALUE_BYTES);
+    assert!(decoded.stores[0].entries[0]
+        .value
+        .iter()
+        .all(|byte| *byte == 0x42));
+}
+
+#[test]
+fn oversized_envelope_value_is_rejected_before_copying_payload() {
+    let value_len = MAX_VALUE_BYTES + 1;
+    let mut bytes = vec![0; VALUE_ENVELOPE_HEADER_SIZE + value_len];
+    bytes[..VALUE_ENVELOPE_MAGIC.len()].copy_from_slice(&VALUE_ENVELOPE_MAGIC);
+
+    ALLOCATED_BYTES.with(|work| assert!(work.replace(Some(0)).is_none()));
+    let decoded = StoredValue::decode_for_store(STORE_FLAG_VALUE_ENVELOPE_V1, &bytes);
+    let allocated = ALLOCATED_BYTES.with(|work| work.replace(None).unwrap());
+    assert_eq!(decoded.unwrap_err(), EngineError::ValueTooLarge(value_len));
+    assert!(
+        allocated < MAX_VALUE_BYTES,
+        "rejected envelope allocated {allocated} bytes for its oversized payload"
+    );
+
+    bytes.truncate(bytes.len() - 1);
+    let decoded = StoredValue::decode_for_store(STORE_FLAG_VALUE_ENVELOPE_V1, &bytes).unwrap();
+    assert_eq!(decoded.value.len(), MAX_VALUE_BYTES);
+    assert_eq!(decoded.expires_at_ms, None);
 }

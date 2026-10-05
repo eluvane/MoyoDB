@@ -194,8 +194,8 @@ mod wasm_impl {
     impl FileBackend for OpfsBackend {
         fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
             let mut bytes = vec![0u8; len];
-            // An outgoing mutable slice is a synchronous view of this owned
-            // WASM buffer. The shim must not retain it or call back into WASM.
+            // The slice borrows this WASM buffer for the synchronous call only.
+            // The shim must not retain the view or call back into WASM.
             let read = opfsReadAtInto(self.session_id, self.file_kind, offset, &mut bytes)
                 .map_err(js_err)?;
             if read as usize > len {
