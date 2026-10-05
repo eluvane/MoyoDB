@@ -1,0 +1,45 @@
+{
+  "version": "1.2.0",
+  "packagesDir": ".lake/packages",
+  "packages": [
+    {
+      "url": "https://github.com/leanprover-community/batteries",
+      "type": "git",
+      "subDir": null,
+      "scope": "",
+      "rev": "fa08db58b30eb033edcdab331bba000827f9f785",
+      "name": "batteries",
+      "manifestFile": "lake-manifest.json",
+      "inputRev": "fa08db58b30eb033edcdab331bba000827f9f785",
+      "inherited": false,
+      "configFile": "lakefile.toml"
+    },
+    {
+      "url": "https://github.com/junk-values/junk-value-linter",
+      "type": "git",
+      "subDir": null,
+      "scope": "",
+      "rev": "bf2e7937c9a327f7d7b075c18830423c332b4d4b",
+      "name": "JunkLinter",
+      "manifestFile": "lake-manifest.json",
+      "inputRev": "bf2e7937c9a327f7d7b075c18830423c332b4d4b",
+      "inherited": false,
+      "configFile": "lakefile.toml"
+    },
+    {
+      "url": "https://github.com/wvhulle/heron",
+      "type": "git",
+      "subDir": null,
+      "scope": "",
+      "rev": "1b8526c644a49572a0a63f1176fc5ac2e1c96eea",
+      "name": "heron",
+      "manifestFile": "lake-manifest.json",
+      "inputRev": "1b8526c644a49572a0a63f1176fc5ac2e1c96eea",
+      "inherited": false,
+      "configFile": "lakefile.toml"
+    }
+  ],
+  "name": "moyodb_proofs",
+  "lakeDir": ".lake",
+  "fixedToolchain": false
+}

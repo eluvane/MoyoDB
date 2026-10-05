@@ -1,0 +1,65 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '04:00'
+      timezone: Europe/Helsinki
+    open-pull-requests-limit: 5
+    versioning-strategy: increase
+    groups:
+      sdk-and-tooling-minor-patch:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+      major-upgrades:
+        patterns:
+          - '*'
+        update-types:
+          - major
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '04:20'
+      timezone: Europe/Helsinki
+    open-pull-requests-limit: 5
+    groups:
+      rust-minor-patch:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+      rust-major-upgrades:
+        patterns:
+          - '*'
+        update-types:
+          - major
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '04:40'
+      timezone: Europe/Helsinki
+    open-pull-requests-limit: 5
+    groups:
+      actions-minor-patch:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+      actions-major-upgrades:
+        patterns:
+          - '*'
+        update-types:
+          - major

@@ -1,0 +1,242 @@
+use crate::catalog::{CatalogMap, ChangeFeedPolicy};
+use crate::error::{EngineError, Result};
+use crate::layout::StoreMetadata;
+use crate::value::StoredValue;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TxMode {
+    Readonly,
+    Readwrite,
+}
+
+impl TxMode {
+    pub fn parse(mode: &str) -> Result<Self> {
+        match mode {
+            "readonly" => Ok(TxMode::Readonly),
+            "readwrite" => Ok(TxMode::Readwrite),
+            other => Err(EngineError::Internal(format!("unknown tx mode {other}"))),
+        }
+    }
+}
+
+impl std::str::FromStr for TxMode {
+    type Err = EngineError;
+
+    fn from_str(mode: &str) -> Result<Self> {
+        Self::parse(mode)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub schema_version: u64,
+    pub catalog_root_page_id: u64,
+    pub last_committed_txid: u64,
+    /// Shared immutable metadata. Serde serializes it as a map.
+    pub catalog: Arc<CatalogMap>,
+}
+
+impl Snapshot {
+    pub fn new(
+        schema_version: u64,
+        catalog_root_page_id: u64,
+        last_committed_txid: u64,
+        catalog: &CatalogMap,
+    ) -> Self {
+        Self {
+            schema_version,
+            catalog_root_page_id,
+            last_committed_txid,
+            catalog: Arc::new(catalog.clone()),
+        }
+    }
+
+    pub(crate) fn new_shared(
+        schema_version: u64,
+        catalog_root_page_id: u64,
+        last_committed_txid: u64,
+        catalog: &Arc<CatalogMap>,
+    ) -> Self {
+        Self {
+            schema_version,
+            catalog_root_page_id,
+            last_committed_txid,
+            catalog: Arc::clone(catalog),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MutationValue {
+    Put(StoredValue),
+    Delete,
+}
+
+impl MutationValue {
+    pub fn is_delete(&self) -> bool {
+        matches!(self, MutationValue::Delete)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum BatchOp {
+    Put { key: Vec<u8>, value: Vec<u8> },
+    Delete { key: Vec<u8> },
+}
+
+/// Borrows [`BatchOp`] data or packed payload bytes without copying keys or values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchOpRef<'a> {
+    Put { key: &'a [u8], value: &'a [u8] },
+    Delete { key: &'a [u8] },
+}
+
+impl<'a> From<&'a BatchOp> for BatchOpRef<'a> {
+    fn from(op: &'a BatchOp) -> Self {
+        match op {
+            BatchOp::Put { key, value } => BatchOpRef::Put { key, value },
+            BatchOp::Delete { key } => BatchOpRef::Delete { key },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum BatchOpOutcome {
+    Put { baseline_exists: bool },
+    Delete { deleted: bool },
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StagedStore {
+    pub base_meta: Option<StoreMetadata>,
+    pub mutations: BTreeMap<Vec<u8>, MutationValue>,
+    pub created: bool,
+    pub dropped: bool,
+    pub cleared: bool,
+    pub flags: u64,
+    pub force_full_rewrite: bool,
+    /// `None` means unknown, including after deserialization.
+    /// Only engine-owned empty stages can start with `Some(false)`.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub has_expiring_mutations: Option<bool>,
+}
+
+impl StagedStore {
+    pub(crate) fn created(flags: u64) -> Self {
+        Self {
+            created: true,
+            flags,
+            has_expiring_mutations: Some(false),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn existing(base_meta: StoreMetadata) -> Self {
+        let flags = base_meta.flags;
+        Self {
+            base_meta: Some(base_meta),
+            flags,
+            has_expiring_mutations: Some(false),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn dropped_existing(base_meta: StoreMetadata) -> Self {
+        Self {
+            dropped: true,
+            ..Self::existing(base_meta)
+        }
+    }
+
+    pub fn visible(&self) -> bool {
+        !self.dropped
+    }
+
+    pub fn has_changes(&self) -> bool {
+        self.created
+            || self.dropped
+            || self.cleared
+            || self.force_full_rewrite
+            || !self.mutations.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadonlyTx {
+    pub snapshot: Snapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadwriteTx {
+    pub snapshot: Snapshot,
+    pub stores: BTreeMap<String, StagedStore>,
+    pub staged_schema_version: Option<u64>,
+    pub staged_change_feed_policy: Option<ChangeFeedPolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TxInner {
+    Readonly(ReadonlyTx),
+    Readwrite(ReadwriteTx),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransactionState {
+    pub id: u64,
+    pub mode: TxMode,
+    pub closed: bool,
+    pub inner: TxInner,
+}
+
+impl TransactionState {
+    pub fn new_readonly(id: u64, snapshot: Snapshot) -> Self {
+        Self {
+            id,
+            mode: TxMode::Readonly,
+            closed: false,
+            inner: TxInner::Readonly(ReadonlyTx { snapshot }),
+        }
+    }
+
+    pub fn new_readwrite(id: u64, snapshot: Snapshot) -> Self {
+        Self {
+            id,
+            mode: TxMode::Readwrite,
+            closed: false,
+            inner: TxInner::Readwrite(ReadwriteTx {
+                snapshot,
+                stores: BTreeMap::new(),
+                staged_schema_version: None,
+                staged_change_feed_policy: None,
+            }),
+        }
+    }
+
+    pub fn ensure_open(&self) -> Result<()> {
+        if self.closed {
+            return Err(EngineError::TransactionClosed);
+        }
+        Ok(())
+    }
+
+    pub fn snapshot(&self) -> &Snapshot {
+        match &self.inner {
+            TxInner::Readonly(tx) => &tx.snapshot,
+            TxInner::Readwrite(tx) => &tx.snapshot,
+        }
+    }
+
+    pub fn readwrite_mut(&mut self) -> Result<&mut ReadwriteTx> {
+        self.ensure_open()?;
+        match &mut self.inner {
+            TxInner::Readwrite(tx) => Ok(tx),
+            TxInner::Readonly(_) => Err(EngineError::ReadonlyTransaction),
+        }
+    }
+}

@@ -1,0 +1,14 @@
+.git/
+.tmp/
+node_modules/
+target/
+**/.lake/
+packages/sdk/dist/
+packages/sdk/public/engine/
+packages/sdk/playwright-report/
+packages/sdk/test-results/
+packages/sdk/bench/results/
+.benchmark/current/
+.benchmark/previous/
+.benchmark/comparison/
+.benchmark/smoke/

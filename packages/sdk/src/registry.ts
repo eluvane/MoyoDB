@@ -1,0 +1,376 @@
+import { WorkerProtocolClient } from './worker-client';
+import type { ChangeFeedSettings, DebugFailpoint, OpenOptions } from './types';
+import { DatabaseBusyError, DatabaseClosedError, InvalidOpenOptionsError, normalizeError } from './errors';
+import { isRecord, withTimeout } from './internal';
+const VALID_FAILPOINTS = new Set<Exclude<DebugFailpoint, null>>([
+    'after_wal_flush',
+    'after_main_flush',
+    'before_superblock_flush'
+]);
+const PERSISTENCE_BRIDGE_INIT = 'moyodb:persistence-bridge:init';
+const PERSISTENCE_BRIDGE_REQUEST = 'moyodb:persistence-bridge:request';
+const PERSISTENCE_BRIDGE_RESPONSE = 'moyodb:persistence-bridge:response';
+type PersistenceBridgeOperation = 'persist' | 'persisted';
+interface PersistenceBridgeRequest {
+    type: typeof PERSISTENCE_BRIDGE_REQUEST;
+    id: number;
+    op: PersistenceBridgeOperation;
+}
+interface PersistenceBridgeResponse {
+    type: typeof PERSISTENCE_BRIDGE_RESPONSE;
+    id: number;
+    granted: boolean;
+}
+function isPersistenceBridgeRequest(value: unknown): value is PersistenceBridgeRequest {
+    return (
+        isRecord(value) &&
+        value.type === PERSISTENCE_BRIDGE_REQUEST &&
+        typeof value.id === 'number' &&
+        (value.op === 'persist' || value.op === 'persisted')
+    );
+}
+interface MainThreadPersistenceBridge {
+    close(): void;
+}
+export interface NormalizedOpenOptions {
+    createIfMissing: boolean;
+    ownerWaitMs: number;
+    requestPersistence: boolean;
+    cachePages: number;
+    debugFailpoint: DebugFailpoint;
+    changeFeed: Required<ChangeFeedSettings> | null;
+}
+const DEFAULT_CHANGE_FEED_RETAIN_TXIDS = 100_000;
+export interface RegistryEntry {
+    dbName: string;
+    refs: number;
+    worker: Worker;
+    proxy: WorkerProtocolClient;
+    persistenceBridge: MainThreadPersistenceBridge;
+    options: NormalizedOpenOptions;
+    invalidated: boolean;
+    schemaMigrationInProgress: boolean;
+    txInvalidationListeners: Set<() => void>;
+    handleInvalidationListeners: Set<() => void>;
+}
+const registry = new Map<string, RegistryEntry>();
+const lifecycleOperations = new Map<string, Promise<void>>();
+function queueLifecycleOperation<T>(dbName: string, operation: () => Promise<T>): Promise<T> {
+    const previous = lifecycleOperations.get(dbName) ?? Promise.resolve();
+    const result = previous.then(operation);
+    const settled = result.then(
+        () => undefined,
+        () => undefined
+    );
+    lifecycleOperations.set(dbName, settled);
+    void settled.then(() => {
+        if (lifecycleOperations.get(dbName) === settled) {
+            lifecycleOperations.delete(dbName);
+        }
+    });
+    return result;
+}
+function requirePlainOptionsObject(options: unknown): asserts options is OpenOptions {
+    if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+        throw new InvalidOpenOptionsError('open options must be an object');
+    }
+}
+function normalizeBoolean(value: unknown, field: string, defaultValue: boolean): boolean {
+    if (value === undefined) {
+        return defaultValue;
+    }
+    if (typeof value !== 'boolean') {
+        throw new InvalidOpenOptionsError(`${field} must be a boolean`);
+    }
+    return value;
+}
+function normalizeNonNegativeInteger(value: unknown, field: string, defaultValue: number): number {
+    if (value === undefined) {
+        return defaultValue;
+    }
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+        throw new InvalidOpenOptionsError(`${field} must be a non-negative safe integer`);
+    }
+    return value;
+}
+function normalizeCachePages(value: unknown): number {
+    return Math.max(1, normalizeNonNegativeInteger(value, 'cachePages', 256));
+}
+function normalizeFailpoint(value: unknown): DebugFailpoint {
+    if (value === undefined || value === null) {
+        return null;
+    }
+    if (typeof value !== 'string' || !VALID_FAILPOINTS.has(value as Exclude<DebugFailpoint, null>)) {
+        throw new InvalidOpenOptionsError(`debugFailpoint must be one of: ${Array.from(VALID_FAILPOINTS).join(', ')}`);
+    }
+    return value as Exclude<DebugFailpoint, null>;
+}
+function normalizeChangeFeed(value: unknown): Required<ChangeFeedSettings> | null {
+    if (value === undefined) {
+        return null;
+    }
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+        throw new InvalidOpenOptionsError('changeFeed must be an object');
+    }
+    const settings = value as ChangeFeedSettings;
+    const enabled = normalizeBoolean(settings.enabled, 'changeFeed.enabled', true);
+    let retainTxids: number | null = DEFAULT_CHANGE_FEED_RETAIN_TXIDS;
+    if (settings.retainTxids === null) {
+        retainTxids = null;
+    } else if (settings.retainTxids !== undefined) {
+        retainTxids = normalizeNonNegativeInteger(settings.retainTxids, 'changeFeed.retainTxids', 0);
+        if (retainTxids === 0) {
+            throw new InvalidOpenOptionsError('changeFeed.retainTxids must be positive; disable the feed instead');
+        }
+    }
+    return { enabled, retainTxids };
+}
+function normalizeOptions(options: OpenOptions = {}): NormalizedOpenOptions {
+    requirePlainOptionsObject(options);
+    return {
+        createIfMissing: normalizeBoolean(options.createIfMissing, 'createIfMissing', true),
+        ownerWaitMs: normalizeNonNegativeInteger(options.ownerWaitMs, 'ownerWaitMs', 0),
+        requestPersistence: normalizeBoolean(options.requestPersistence, 'requestPersistence', true),
+        cachePages: normalizeCachePages(options.cachePages),
+        debugFailpoint: normalizeFailpoint(options.debugFailpoint),
+        changeFeed: normalizeChangeFeed(options.changeFeed)
+    };
+}
+function sameChangeFeed(left: NormalizedOpenOptions['changeFeed'], right: NormalizedOpenOptions['changeFeed']) {
+    return left?.enabled === right?.enabled && left?.retainTxids === right?.retainTxids;
+}
+function assertCompatibleOptions(dbName: string, current: NormalizedOpenOptions, next: NormalizedOpenOptions) {
+    if (current.cachePages !== next.cachePages) {
+        throw new InvalidOpenOptionsError(
+            `database ${dbName} is already open in this tab with cachePages=${current.cachePages}; requested cachePages=${next.cachePages}`
+        );
+    }
+    if (next.changeFeed !== null && !sameChangeFeed(current.changeFeed, next.changeFeed)) {
+        throw new InvalidOpenOptionsError(
+            `database ${dbName} is already open in this tab with a different changeFeed policy`
+        );
+    }
+}
+async function queryPersistentStorageState(): Promise<boolean> {
+    const storage = globalThis.navigator.storage;
+    if (typeof storage.persisted !== 'function') {
+        return false;
+    }
+    return await withTimeout(storage.persisted(), 1000, false);
+}
+async function requestPersistentStorageGrant(): Promise<boolean> {
+    const storage = globalThis.navigator.storage;
+    if (typeof storage.persist !== 'function') {
+        return false;
+    }
+    return await withTimeout(storage.persist(), 1000, false);
+}
+async function handlePersistenceBridgeRequest(port: MessagePort, request: PersistenceBridgeRequest): Promise<void> {
+    const granted =
+        request.op === 'persist' ? await requestPersistentStorageGrant() : await queryPersistentStorageState();
+    const response: PersistenceBridgeResponse = {
+        type: PERSISTENCE_BRIDGE_RESPONSE,
+        id: request.id,
+        granted
+    };
+    port.postMessage(response);
+}
+function createMainThreadPersistenceBridge(worker: Worker): MainThreadPersistenceBridge {
+    const channel = new MessageChannel();
+    const port = channel.port1;
+    port.addEventListener('message', (event: MessageEvent<unknown>) => {
+        const data = event.data;
+        if (!isPersistenceBridgeRequest(data)) {
+            return;
+        }
+        void handlePersistenceBridgeRequest(port, data);
+    });
+    port.start();
+    worker.postMessage({ type: PERSISTENCE_BRIDGE_INIT }, [channel.port2]);
+    return {
+        close() {
+            port.close();
+        }
+    };
+}
+function createWorker(): {
+    worker: Worker;
+    proxy: WorkerProtocolClient;
+    persistenceBridge: MainThreadPersistenceBridge;
+} {
+    const worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
+    const proxy = new WorkerProtocolClient(worker);
+    const persistenceBridge = createMainThreadPersistenceBridge(worker);
+    return { worker, proxy, persistenceBridge };
+}
+function createEntry(
+    dbName: string,
+    worker: Worker,
+    proxy: WorkerProtocolClient,
+    persistenceBridge: MainThreadPersistenceBridge,
+    options: NormalizedOpenOptions
+): RegistryEntry {
+    const entry: RegistryEntry = {
+        dbName,
+        refs: 1,
+        worker,
+        proxy,
+        persistenceBridge,
+        options,
+        invalidated: false,
+        schemaMigrationInProgress: false,
+        txInvalidationListeners: new Set(),
+        handleInvalidationListeners: new Set()
+    };
+    proxy.setFatalHandler(() => {
+        const current = registry.get(dbName);
+        if (current !== entry || entry.invalidated) {
+            return;
+        }
+        registry.delete(dbName);
+        entry.refs = 0;
+        invalidateEntry(entry);
+        entry.persistenceBridge.close();
+        entry.worker.terminate();
+    });
+    return entry;
+}
+function emitListeners(listeners: Iterable<() => void>) {
+    for (const listener of Array.from(listeners)) {
+        listener();
+    }
+}
+export function subscribeTransactionsInvalidated(entry: RegistryEntry, listener: () => void): () => void {
+    entry.txInvalidationListeners.add(listener);
+    return () => {
+        entry.txInvalidationListeners.delete(listener);
+    };
+}
+export function subscribeHandleInvalidated(entry: RegistryEntry, listener: () => void): () => void {
+    entry.handleInvalidationListeners.add(listener);
+    return () => {
+        entry.handleInvalidationListeners.delete(listener);
+    };
+}
+export function invalidateTransactions(entry: RegistryEntry): void {
+    emitListeners(entry.txInvalidationListeners);
+}
+function invalidateEntry(entry: RegistryEntry): void {
+    if (entry.invalidated) {
+        return;
+    }
+    entry.invalidated = true;
+    invalidateTransactions(entry);
+    emitListeners(entry.handleInvalidationListeners);
+}
+export function unsafeDebugCrashWorker(dbName: string): boolean {
+    const current = registry.get(dbName);
+    if (!current) {
+        return false;
+    }
+    registry.delete(dbName);
+    invalidateEntry(current);
+    current.refs = 0;
+    current.persistenceBridge.close();
+    current.proxy.dispose(new Error('worker was terminated by unsafeDebugCrashWorker'));
+    current.worker.terminate();
+    return true;
+}
+export async function acquireDbWorker(dbName: string, options: OpenOptions = {}): Promise<RegistryEntry> {
+    const normalized = normalizeOptions(options);
+    return queueLifecycleOperation(dbName, async () => {
+        const existing = registry.get(dbName);
+        if (existing) {
+            if (existing.invalidated) {
+                registry.delete(dbName);
+            } else {
+                if (existing.schemaMigrationInProgress) {
+                    throw new DatabaseBusyError(`database ${dbName} is migrating; wait for openDB() to resolve`);
+                }
+                assertCompatibleOptions(dbName, existing.options, normalized);
+                if (normalized.debugFailpoint !== null) {
+                    try {
+                        await existing.proxy.setFailpoint(normalized.debugFailpoint);
+                    } catch (error) {
+                        throw normalizeError(error);
+                    }
+                }
+                existing.refs += 1;
+                return existing;
+            }
+        }
+        const { worker, proxy, persistenceBridge } = createWorker();
+        const entry = createEntry(dbName, worker, proxy, persistenceBridge, normalized);
+        try {
+            await proxy.open({
+                dbName,
+                options: normalized
+            });
+            registry.set(dbName, entry);
+            return entry;
+        } catch (error) {
+            persistenceBridge.close();
+            proxy.dispose(new Error('worker open failed'));
+            worker.terminate();
+            throw normalizeError(error);
+        }
+    });
+}
+export async function releaseDbWorker(entry: RegistryEntry): Promise<void> {
+    return queueLifecycleOperation(entry.dbName, async () => {
+        if (entry.invalidated || registry.get(entry.dbName) !== entry) {
+            return;
+        }
+        entry.refs -= 1;
+        if (entry.refs > 0) {
+            return;
+        }
+        registry.delete(entry.dbName);
+        try {
+            await entry.proxy.close();
+        } finally {
+            entry.persistenceBridge.close();
+            entry.proxy.dispose(new Error('worker was released'));
+            entry.worker.terminate();
+        }
+    });
+}
+export async function destroyDbWorker(entry: RegistryEntry): Promise<void> {
+    return queueLifecycleOperation(entry.dbName, () => destroyEntry(entry));
+}
+async function destroyEntry(entry: RegistryEntry): Promise<void> {
+    if (entry.invalidated || registry.get(entry.dbName) !== entry) {
+        throw new DatabaseClosedError();
+    }
+    registry.delete(entry.dbName);
+    invalidateEntry(entry);
+    entry.refs = 0;
+    try {
+        await entry.proxy.destroy();
+    } catch (error) {
+        throw normalizeError(error);
+    } finally {
+        entry.persistenceBridge.close();
+        entry.proxy.dispose(new Error('worker was released'));
+        entry.worker.terminate();
+    }
+}
+export async function deleteDbByName(dbName: string): Promise<void> {
+    return queueLifecycleOperation(dbName, async () => {
+        const current = registry.get(dbName);
+        if (current) {
+            await destroyEntry(current);
+            return;
+        }
+        const { worker, proxy, persistenceBridge } = createWorker();
+        try {
+            await proxy.deleteDB(dbName);
+        } catch (error) {
+            throw normalizeError(error);
+        } finally {
+            persistenceBridge.close();
+            proxy.dispose(new Error('temporary worker was terminated'));
+            worker.terminate();
+        }
+    });
+}

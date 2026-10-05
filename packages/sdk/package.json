@@ -1,0 +1,76 @@
+{
+  "name": "@moyodb/sdk",
+  "version": "1.0.1",
+  "private": false,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build:wasm": "npm run build:wasm:release",
+    "build:wasm:release": "wasm-pack build ../../crates/engine --release --target web --out-dir ../../packages/sdk/public/engine --out-name moyodb_engine",
+    "build:wasm:dev": "wasm-pack build ../../crates/engine --dev --target web --out-dir ../../packages/sdk/public/engine --out-name moyodb_engine",
+    "build": "npm run build:wasm:release && vite build && npm run build:types && npm run prepare:dist",
+    "dev": "npm run build:wasm:release && vite --host 127.0.0.1 --port 4173",
+    "dev:test": "npm run build:wasm:release && vite --host 127.0.0.1 --port 4173",
+    "test:minimum-work": "node scripts/test-minimum-work.mjs && node scripts/test-read-work.mjs && node scripts/test-transport-work.mjs && node scripts/test-startup-work.mjs && node scripts/test-sdk-lifecycle.mjs && node scripts/test-codec-index-work.mjs",
+    "bench:minimum-work": "node scripts/bench-minimum-work.mjs",
+    "test:e2e": "npm run test:minimum-work && npm run build:wasm:release && playwright test",
+    "build:types": "tsc -p tsconfig.build.json",
+    "bench:browser": "node scripts/run-playwright-env.mjs bench:browser",
+    "bench:indexeddb": "node scripts/run-playwright-env.mjs bench:indexeddb",
+    "bench:opfs": "node scripts/run-playwright-env.mjs bench:opfs",
+    "bench:report": "node bench/generate-report.mjs",
+    "test:soak": "node scripts/run-playwright-env.mjs test:soak",
+    "test:browser:soak": "npm run test:soak",
+    "prepare:dist": "node scripts/prepare-dist.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@typescript/native": "npm:typescript@7.0.2",
+    "typescript": "npm:@typescript/typescript6@6.0.2",
+    "vite": "8.3.0"
+  },
+  "description": "Experimental Rust/WASM transactional key-value storage engine SDK for browser apps, backed by OPFS.",
+  "license": "SEE LICENSE IN LICENSE",
+  "author": "Eluvane <keiko1337@proton.me>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/eluvane/MoyoDB.git"
+  },
+  "keywords": [
+    "moyodb",
+    "rust",
+    "wasm",
+    "webassembly",
+    "database",
+    "storage-engine",
+    "browser",
+    "opfs",
+    "local-first",
+    "key-value",
+    "typescript",
+    "transactions",
+    "wal",
+    "web-worker"
+  ],
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/moyodb-sdk.js"
+    }
+  },
+  "types": "./dist/index.d.ts",
+  "homepage": "https://github.com/eluvane/MoyoDB#readme",
+  "bugs": {
+    "url": "https://github.com/eluvane/MoyoDB/issues"
+  },
+  "engines": {
+    "node": "^22.22.2 || >=24.15.0",
+    "npm": ">=10.0.0"
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "scenarios": [
+    {
+      "name": "crash_before_wal_flush",
+      "failpoint": null,
+      "expect_after": false,
+      "note": "tx not even staged to wal in this harness"
+    },
+    {
+      "name": "crash_after_wal_flush_before_main_flush",
+      "failpoint": "after_wal_flush",
+      "expect_after": true
+    },
+    {
+      "name": "crash_after_main_flush_before_superblock_flush",
+      "failpoint": "after_main_flush",
+      "expect_after": true
+    },
+    {
+      "name": "crash_before_superblock_flush",
+      "failpoint": "before_superblock_flush",
+      "expect_after": true
+    },
+    {
+      "name": "clean_commit",
+      "failpoint": null,
+      "expect_after": true
+    },
+    {
+      "name": "incomplete_wal_tail_ignored",
+      "failpoint": "manual_incomplete_tail",
+      "expect_after": false
+    },
+    {
+      "name": "commit_page_count_mismatch_ignored",
+      "failpoint": "manual_page_count_mismatch",
+      "expect_after": false
+    }
+  ]
+}

@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>MoyoDB browser benchmark</title>
+        <style>
+            body {
+                font-family: system-ui, sans-serif;
+                line-height: 1.45;
+                margin: 2rem;
+                max-width: 1080px;
+            }
+            button,
+            select,
+            input {
+                font: inherit;
+                margin: 0.25rem;
+            }
+            pre {
+                background: #111827;
+                color: #e5e7eb;
+                overflow: auto;
+                padding: 1rem;
+                white-space: pre-wrap;
+            }
+            table {
+                border-collapse: collapse;
+                width: 100%;
+                margin-top: 1rem;
+            }
+            th,
+            td {
+                border: 1px solid #d1d5db;
+                padding: 0.4rem;
+                text-align: left;
+            }
+            .warning {
+                color: #92400e;
+                background: #fef3c7;
+                padding: 0.75rem;
+            }
+        </style>
+    </head>
+    <body>
+        <main>
+            <h1>MoyoDB browser benchmark</h1>
+            <p class="warning">
+                Results vary by browser, device, quota state, cache state, batch size, and transaction boundaries. Keep
+                raw JSON and avoid single-run performance claims.
+            </p>
+            <form id="bench-controls">
+                <label
+                    >Profile
+                    <select id="profile">
+                        <option value="smoke" selected>smoke</option>
+                        <option value="standard">standard</option>
+                        <option value="full">full</option>
+                    </select>
+                </label>
+                <label
+                    >Engine
+                    <select id="engine">
+                        <option value="all" selected>MoyoDB + IndexedDB</option>
+                        <option value="moyodb">MoyoDB only</option>
+                        <option value="indexeddb">IndexedDB only</option>
+                    </select>
+                </label>
+                <label
+                    >Warmups
+                    <input id="warmups" type="number" min="0" step="1" placeholder="default" />
+                </label>
+                <label
+                    >Samples
+                    <input id="samples" type="number" min="1" step="1" placeholder="default" />
+                </label>
+                <label
+                    >Timeout ms
+                    <input id="timeout-ms" type="number" min="1000" step="1000" placeholder="default" />
+                </label>
+                <button id="run" type="submit">Run benchmark</button>
+                <button id="clear-storage" type="button">Clear benchmark storage</button>
+                <button id="download-json" type="button" disabled>Export raw JSON</button>
+                <button id="download-md" type="button" disabled>Export markdown report</button>
+            </form>
+            <p id="status">Idle.</p>
+            <div id="summary"></div>
+            <pre id="output"></pre>
+        </main>
+        <script type="module">
+            import {
+                runBenchmarkSuite,
+                clearBenchmarkStorage,
+                serializeReport,
+                reportToMarkdown
+            } from './bench-runner.ts';
+
+            let lastReport = null;
+            const status = document.getElementById('status');
+            const output = document.getElementById('output');
+            const summary = document.getElementById('summary');
+            const clearStorageButton = document.getElementById('clear-storage');
+            const jsonButton = document.getElementById('download-json');
+            const mdButton = document.getElementById('download-md');
+
+            document.getElementById('bench-controls').addEventListener('submit', async (event) => {
+                event.preventDefault();
+                const profile = document.getElementById('profile').value;
+                const engine = document.getElementById('engine').value;
+                const engines = engine === 'all' ? ['moyodb', 'indexeddb'] : [engine];
+                status.textContent = 'Running...';
+                output.textContent = '';
+                summary.innerHTML = '';
+                jsonButton.disabled = true;
+                mdButton.disabled = true;
+                try {
+                    const warmupCountOverride = readOptionalInteger('warmups', 0);
+                    const sampleCountOverride = readOptionalInteger('samples', 1);
+                    const workloadTimeoutMs = readOptionalInteger('timeout-ms', 1000);
+                    lastReport = await runBenchmarkSuite({
+                        profile,
+                        engines,
+                        warmupCountOverride,
+                        sampleCountOverride,
+                        workloadTimeoutMs
+                    });
+                    status.textContent = `Done: ${lastReport.results.filter((r) => r.status === 'ok').length} completed result(s).`;
+                    output.textContent = serializeReport(lastReport);
+                    renderSummary(lastReport);
+                    jsonButton.disabled = false;
+                    mdButton.disabled = false;
+                } catch (error) {
+                    status.textContent = 'Benchmark failed.';
+                    output.textContent =
+                        error instanceof Error
+                            ? `${error.name}: ${error.message}\n${error.stack ?? ''}`
+                            : String(error);
+                }
+            });
+
+            clearStorageButton.addEventListener('click', async () => {
+                clearStorageButton.disabled = true;
+                status.textContent = 'Clearing benchmark storage...';
+                output.textContent = '';
+                summary.innerHTML = '';
+                try {
+                    const result = await clearBenchmarkStorage();
+                    status.textContent = `Storage cleanup done: ${result.indexedDbDeleted.length} IndexedDB item(s), ${result.opfsDeleted.length} OPFS item(s).`;
+                    output.textContent = JSON.stringify(result, null, 2);
+                } catch (error) {
+                    status.textContent = 'Storage cleanup failed.';
+                    output.textContent =
+                        error instanceof Error
+                            ? `${error.name}: ${error.message}\n${error.stack ?? ''}`
+                            : String(error);
+                } finally {
+                    clearStorageButton.disabled = false;
+                }
+            });
+
+            jsonButton.addEventListener('click', () => {
+                if (lastReport)
+                    downloadText('moyodb-browser-bench.json', serializeReport(lastReport), 'application/json');
+            });
+
+            mdButton.addEventListener('click', () => {
+                if (lastReport) downloadText('moyodb-browser-bench.md', reportToMarkdown(lastReport), 'text/markdown');
+            });
+
+            function renderSummary(report) {
+                const rows = report.results
+                    .map((result) => {
+                        const stats = result.stats;
+                        return `<tr><td>${result.engine}</td><td>${result.workloadName}</td><td>${result.status}</td><td>${stats ? stats.p50.toFixed(2) : 'n/a'}</td><td>${stats ? stats.p95.toFixed(2) : 'n/a'}</td><td>${escapeHtml(result.error ?? result.notes)}</td></tr>`;
+                    })
+                    .join('');
+                summary.innerHTML = `<table><thead><tr><th>Engine</th><th>Workload</th><th>Status</th><th>p50 ms</th><th>p95 ms</th><th>Notes</th></tr></thead><tbody>${rows}</tbody></table>`;
+            }
+
+            function downloadText(filename, text, type) {
+                const blob = new Blob([text], { type });
+                const url = URL.createObjectURL(blob);
+                const anchor = document.createElement('a');
+                anchor.href = url;
+                anchor.download = filename;
+                document.body.append(anchor);
+                anchor.click();
+                anchor.remove();
+                URL.revokeObjectURL(url);
+            }
+
+            function escapeHtml(value) {
+                return value.replace(
+                    /[&<>"]/g,
+                    (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[char]
+                );
+            }
+
+            function readOptionalInteger(id, min) {
+                const input = document.getElementById(id);
+                const value = input.value.trim();
+                if (value === '') return undefined;
+                const parsed = Number(value);
+                if (!Number.isSafeInteger(parsed) || parsed < min) {
+                    throw new Error(
+                        `${input.closest('label')?.firstChild?.textContent?.trim() ?? id} must be an integer >= ${min}`
+                    );
+                }
+                return parsed;
+            }
+        </script>
+    </body>
+</html>

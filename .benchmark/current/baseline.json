@@ -1,0 +1,553 @@
+{
+  "schemaVersion": 1,
+  "project": "MoyoDB",
+  "generatedAt": "2026-09-24T10:00:17.476Z",
+  "mode": "full",
+  "runtime": {
+    "node": "v24.5.0",
+    "platform": "win32",
+    "arch": "x64"
+  },
+  "benchmarkSuites": [
+    {
+      "id": "rust-criterion",
+      "command": "npm run bench:rust",
+      "smokeCommand": "npm run bench:rust:compile",
+      "scope": "Native Rust storage engine microbenchmarks for BTree, WAL, recovery and transaction paths."
+    },
+    {
+      "id": "browser-sdk-wasm-opfs",
+      "command": "npm run bench:browser",
+      "smokeCommand": "npm run bench:collect:smoke",
+      "scope": "Browser SDK, Web Worker, WASM, OPFS and IndexedDB comparison workloads."
+    },
+    {
+      "id": "benchmark-compare",
+      "command": "npm run bench:compare",
+      "smokeCommand": "npm run bench:compare -- --current .benchmark/current/baseline.json",
+      "scope": "Regression visibility against a prior benchmark-baseline artifact."
+    }
+  ],
+  "commands": [
+    "cargo bench --workspace",
+    "npm run bench:browser --workspace @moyodb/sdk",
+    "npm run bench:report --workspace @moyodb/sdk"
+  ],
+  "notes": [
+    "Native Rust Criterion timings and browser SDK/OPFS timings measure different layers and must not be compared as equivalent paths.",
+    "Browser rows are normalized from packages/sdk/bench/results raw JSON; skipped rows are omitted from regression comparison metrics.",
+    "The Rust step is a benchmark compile gate by default; pass --run-rust when a local machine is intended to execute Criterion timings."
+  ],
+  "suites": [
+    {
+      "suite": "browser-sdk-wasm-opfs",
+      "description": "Browser SDK, Worker, WASM, OPFS and IndexedDB comparison rows from packages/sdk/bench.",
+      "cases": [
+        {
+          "id": "moyodb:noop_js_loop_1m",
+          "label": "moyodb / noop_js_loop_1m",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 320.5128204056664,
+            "avgLatencyMs": 3.1200000010430813,
+            "p50LatencyMs": 3.100000001490116,
+            "p95LatencyMs": 3.300000000745058,
+            "p99LatencyMs": 3.300000000745058
+          }
+        },
+        {
+          "id": "moyodb:noop_worker_roundtrip_10k",
+          "label": "moyodb / noop_worker_roundtrip_10k",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 5.467468562055768,
+            "avgLatencyMs": 182.9,
+            "p50LatencyMs": 181.19999999925494,
+            "p95LatencyMs": 193.40000000223517,
+            "p99LatencyMs": 193.40000000223517
+          }
+        },
+        {
+          "id": "moyodb:worker_roundtrip_noop",
+          "label": "moyodb / worker_roundtrip_noop",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 5.527304886128414,
+            "avgLatencyMs": 180.92000000029802,
+            "p50LatencyMs": 181.10000000149012,
+            "p95LatencyMs": 184.5,
+            "p99LatencyMs": 184.5
+          }
+        },
+        {
+          "id": "moyodb:worker_roundtrip_small_payload",
+          "label": "moyodb / worker_roundtrip_small_payload",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 4.258218361426767,
+            "avgLatencyMs": 234.84000000059604,
+            "p50LatencyMs": 235.80000000074506,
+            "p95LatencyMs": 238.80000000074506,
+            "p99LatencyMs": 238.80000000074506
+          }
+        },
+        {
+          "id": "moyodb:worker_roundtrip_256b_payload",
+          "label": "moyodb / worker_roundtrip_256b_payload",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 4.114549045427144,
+            "avgLatencyMs": 243.03999999985098,
+            "p50LatencyMs": 236.89999999850988,
+            "p95LatencyMs": 261.0999999977648,
+            "p99LatencyMs": 261.0999999977648
+          }
+        },
+        {
+          "id": "moyodb:worker_roundtrip_64kb_payload",
+          "label": "moyodb / worker_roundtrip_64kb_payload",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 56.75368898882441,
+            "avgLatencyMs": 17.620000000298024,
+            "p50LatencyMs": 18.900000002235174,
+            "p95LatencyMs": 20.199999999254942,
+            "p99LatencyMs": 20.199999999254942
+          }
+        },
+        {
+          "id": "moyodb:worker_binary_transfer_64kb",
+          "label": "moyodb / worker_binary_transfer_64kb",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 164.47368421858832,
+            "avgLatencyMs": 6.079999999701977,
+            "p50LatencyMs": 5,
+            "p95LatencyMs": 10.300000000745058,
+            "p99LatencyMs": 10.300000000745058
+          }
+        },
+        {
+          "id": "moyodb:noop_wasm_call_100k",
+          "label": "moyodb / noop_wasm_call_100k",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 162.1621621948163,
+            "avgLatencyMs": 6.166666665424903,
+            "p50LatencyMs": 5.899999998509884,
+            "p95LatencyMs": 7.699999999254942,
+            "p99LatencyMs": 7.699999999254942
+          }
+        },
+        {
+          "id": "moyodb:encode_decode_10k_256b",
+          "label": "moyodb / encode_decode_10k_256b",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 65.18904824052893,
+            "avgLatencyMs": 15.339999999850988,
+            "p50LatencyMs": 14.300000000745058,
+            "p95LatencyMs": 18.900000002235174,
+            "p99LatencyMs": 18.900000002235174
+          }
+        },
+        {
+          "id": "moyodb:opfs_raw_write_100mb",
+          "label": "moyodb / opfs_raw_write_100mb",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 2.9714738510366896,
+            "avgLatencyMs": 336.53333333258826,
+            "p50LatencyMs": 336.3999999985099,
+            "p95LatencyMs": 337.69999999925494,
+            "p99LatencyMs": 337.69999999925494
+          }
+        },
+        {
+          "id": "moyodb:opfs_raw_read_random_10k",
+          "label": "moyodb / opfs_raw_read_random_10k",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 0.8616232982938015,
+            "avgLatencyMs": 1160.6000000002484,
+            "p50LatencyMs": 1181,
+            "p95LatencyMs": 1219.800000000745,
+            "p99LatencyMs": 1219.800000000745
+          }
+        },
+        {
+          "id": "moyodb:sdk_put_1k_single_calls",
+          "label": "moyodb / sdk_put_1k_single_calls",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 1.529051987767584,
+            "avgLatencyMs": 654,
+            "p50LatencyMs": 654,
+            "p95LatencyMs": 654,
+            "p99LatencyMs": 654
+          }
+        },
+        {
+          "id": "moyodb:sdk_bulk_put_10k",
+          "label": "moyodb / sdk_bulk_put_10k",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 14.096419509326163,
+            "avgLatencyMs": 70.94000000059604,
+            "p50LatencyMs": 68.10000000149012,
+            "p95LatencyMs": 78.40000000223517,
+            "p99LatencyMs": 78.40000000223517
+          }
+        },
+        {
+          "id": "moyodb:engine_stage_put_10k_rollback",
+          "label": "moyodb / engine_stage_put_10k_rollback",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 101.69491526707942,
+            "avgLatencyMs": 9.83333333209157,
+            "p50LatencyMs": 10,
+            "p95LatencyMs": 10.199999999254942,
+            "p99LatencyMs": 10.199999999254942
+          }
+        },
+        {
+          "id": "moyodb:engine_bulk_put_10k",
+          "label": "moyodb / engine_bulk_put_10k",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 16.602102933448904,
+            "avgLatencyMs": 60.23333333184322,
+            "p50LatencyMs": 59.899999998509884,
+            "p95LatencyMs": 60.899999998509884,
+            "p99LatencyMs": 60.899999998509884
+          }
+        },
+        {
+          "id": "indexeddb:indexeddb_bulk_put_10k",
+          "label": "indexeddb / indexeddb_bulk_put_10k",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 6.2956434147924245,
+            "avgLatencyMs": 158.83999999910594,
+            "p50LatencyMs": 158.80000000074506,
+            "p95LatencyMs": 161.39999999850988,
+            "p99LatencyMs": 161.39999999850988
+          }
+        },
+        {
+          "id": "moyodb:open_empty_db",
+          "label": "moyodb / open_empty_db",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 30.450669914876293,
+            "avgLatencyMs": 32.83999999985099,
+            "p50LatencyMs": 32.5,
+            "p95LatencyMs": 36.099999997764826,
+            "p99LatencyMs": 36.099999997764826
+          }
+        },
+        {
+          "id": "indexeddb:open_empty_db",
+          "label": "indexeddb / open_empty_db",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 1315.789474716147,
+            "avgLatencyMs": 0.7599999994039536,
+            "p50LatencyMs": 0.6999999992549419,
+            "p95LatencyMs": 1,
+            "p99LatencyMs": 1
+          }
+        },
+        {
+          "id": "moyodb:bulk_insert_10k",
+          "label": "moyodb / bulk_insert_10k",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 5.108817819521551,
+            "avgLatencyMs": 195.74000000134112,
+            "p50LatencyMs": 194.90000000223517,
+            "p95LatencyMs": 199.60000000149012,
+            "p99LatencyMs": 199.60000000149012
+          }
+        },
+        {
+          "id": "indexeddb:bulk_insert_10k",
+          "label": "indexeddb / bulk_insert_10k",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 6.562541015894185,
+            "avgLatencyMs": 152.37999999970197,
+            "p50LatencyMs": 151.5,
+            "p95LatencyMs": 159.89999999850988,
+            "p99LatencyMs": 159.89999999850988
+          }
+        },
+        {
+          "id": "moyodb:point_get_random_10k",
+          "label": "moyodb / point_get_random_10k",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 1.1537485289718157,
+            "avgLatencyMs": 866.739999999106,
+            "p50LatencyMs": 855.2999999970198,
+            "p95LatencyMs": 908.5,
+            "p99LatencyMs": 908.5
+          }
+        },
+        {
+          "id": "indexeddb:point_get_random_10k",
+          "label": "indexeddb / point_get_random_10k",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 2.224397188364903,
+            "avgLatencyMs": 449.55999999940394,
+            "p50LatencyMs": 451.19999999925494,
+            "p95LatencyMs": 466.5,
+            "p99LatencyMs": 466.5
+          }
+        },
+        {
+          "id": "moyodb:point_get_random_10k_pipelined",
+          "label": "moyodb / point_get_random_10k_pipelined",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 1.5908873969889097,
+            "avgLatencyMs": 628.5800000004471,
+            "p50LatencyMs": 627.6000000014901,
+            "p95LatencyMs": 635.5,
+            "p99LatencyMs": 635.5
+          }
+        },
+        {
+          "id": "indexeddb:point_get_random_10k_pipelined",
+          "label": "indexeddb / point_get_random_10k_pipelined",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 8.15793767337601,
+            "avgLatencyMs": 122.57999999970198,
+            "p50LatencyMs": 123.09999999776483,
+            "p95LatencyMs": 125.69999999925494,
+            "p99LatencyMs": 125.69999999925494
+          }
+        },
+        {
+          "id": "moyodb:point_get_random_10k_bulk",
+          "label": "moyodb / point_get_random_10k_bulk",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 1.976284584986057,
+            "avgLatencyMs": 505.9999999985099,
+            "p50LatencyMs": 507.79999999701977,
+            "p95LatencyMs": 510.19999999925494,
+            "p99LatencyMs": 510.19999999925494
+          }
+        },
+        {
+          "id": "moyodb:range_scan_100",
+          "label": "moyodb / range_scan_100",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 735.2941175664946,
+            "avgLatencyMs": 1.3600000001490116,
+            "p50LatencyMs": 1.300000000745058,
+            "p95LatencyMs": 1.5,
+            "p99LatencyMs": 1.5
+          }
+        },
+        {
+          "id": "indexeddb:range_scan_100",
+          "label": "indexeddb / range_scan_100",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 1111.111111111111,
+            "avgLatencyMs": 0.9,
+            "p50LatencyMs": 1,
+            "p95LatencyMs": 1,
+            "p99LatencyMs": 1
+          }
+        },
+        {
+          "id": "moyodb:reverse_scan_limit_1",
+          "label": "moyodb / reverse_scan_limit_1",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 1666.6666645970608,
+            "avgLatencyMs": 0.6000000007450581,
+            "p50LatencyMs": 0.6000000014901161,
+            "p95LatencyMs": 0.6999999992549419,
+            "p99LatencyMs": 0.6999999992549419
+          }
+        },
+        {
+          "id": "indexeddb:reverse_scan_limit_1",
+          "label": "indexeddb / reverse_scan_limit_1",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 4166.666669253674,
+            "avgLatencyMs": 0.23999999985098838,
+            "p50LatencyMs": 0.19999999925494194,
+            "p95LatencyMs": 0.30000000074505806,
+            "p99LatencyMs": 0.30000000074505806
+          }
+        },
+        {
+          "id": "moyodb:range_scan_1000",
+          "label": "moyodb / range_scan_1000",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 160.77170415310323,
+            "avgLatencyMs": 6.220000001043081,
+            "p50LatencyMs": 6.100000001490116,
+            "p95LatencyMs": 6.800000000745058,
+            "p99LatencyMs": 6.800000000745058
+          }
+        },
+        {
+          "id": "indexeddb:range_scan_1000",
+          "label": "indexeddb / range_scan_1000",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 167.22408029672715,
+            "avgLatencyMs": 5.979999998956918,
+            "p50LatencyMs": 5.699999999254942,
+            "p95LatencyMs": 7,
+            "p99LatencyMs": 7
+          }
+        },
+        {
+          "id": "moyodb:range_scan_10000",
+          "label": "moyodb / range_scan_10000",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 19.157088122878797,
+            "avgLatencyMs": 52.19999999925494,
+            "p50LatencyMs": 52,
+            "p95LatencyMs": 52.80000000074506,
+            "p99LatencyMs": 52.80000000074506
+          }
+        },
+        {
+          "id": "indexeddb:range_scan_10000",
+          "label": "indexeddb / range_scan_10000",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 23.67797947922369,
+            "avgLatencyMs": 42.23333333308498,
+            "p50LatencyMs": 42.19999999925494,
+            "p95LatencyMs": 43,
+            "p99LatencyMs": 43
+          }
+        },
+        {
+          "id": "moyodb:small_tx_1000_commits",
+          "label": "moyodb / small_tx_1000_commits",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 2.0601565718899777,
+            "avgLatencyMs": 485.4000000022352,
+            "p50LatencyMs": 485.4000000022352,
+            "p95LatencyMs": 485.4000000022352,
+            "p99LatencyMs": 485.4000000022352
+          }
+        },
+        {
+          "id": "indexeddb:small_tx_1000_commits",
+          "label": "indexeddb / small_tx_1000_commits",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 8.467400507937194,
+            "avgLatencyMs": 118.10000000149012,
+            "p50LatencyMs": 118.10000000149012,
+            "p95LatencyMs": 118.10000000149012,
+            "p99LatencyMs": 118.10000000149012
+          }
+        },
+        {
+          "id": "moyodb:large_value_64kb",
+          "label": "moyodb / large_value_64kb",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 0.1001075154716225,
+            "avgLatencyMs": 9989.259999999404,
+            "p50LatencyMs": 10158.099999997765,
+            "p95LatencyMs": 10196.39999999851,
+            "p99LatencyMs": 10196.39999999851
+          }
+        },
+        {
+          "id": "indexeddb:large_value_64kb",
+          "label": "indexeddb / large_value_64kb",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 16.077170418006432,
+            "avgLatencyMs": 62.2,
+            "p50LatencyMs": 64,
+            "p95LatencyMs": 65.89999999850988,
+            "p99LatencyMs": 65.89999999850988
+          }
+        },
+        {
+          "id": "moyodb:large_value_1mb",
+          "label": "moyodb / large_value_1mb",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 0.11755071333690181,
+            "avgLatencyMs": 8506.966666667411,
+            "p50LatencyMs": 8451.699999999255,
+            "p95LatencyMs": 9153,
+            "p99LatencyMs": 9153
+          }
+        },
+        {
+          "id": "indexeddb:large_value_1mb",
+          "label": "indexeddb / large_value_1mb",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 13.617793917569605,
+            "avgLatencyMs": 73.43333333233993,
+            "p50LatencyMs": 69.5,
+            "p95LatencyMs": 81.59999999776483,
+            "p99LatencyMs": 81.59999999776483
+          }
+        },
+        {
+          "id": "moyodb:recovery_after_dirty_close",
+          "label": "moyodb / recovery_after_dirty_close",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 0.8828774742645863,
+            "avgLatencyMs": 1132.659999999404,
+            "p50LatencyMs": 1136.5,
+            "p95LatencyMs": 1141.6000000014901,
+            "p99LatencyMs": 1141.6000000014901
+          }
+        },
+        {
+          "id": "moyodb:snapshot_export_import",
+          "label": "moyodb / snapshot_export_import",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 4.114210483005788,
+            "avgLatencyMs": 243.06000000014902,
+            "p50LatencyMs": 241.5,
+            "p95LatencyMs": 255.39999999850988,
+            "p99LatencyMs": 255.39999999850988
+          }
+        },
+        {
+          "id": "moyodb:worker_roundtrip_overhead",
+          "label": "moyodb / worker_roundtrip_overhead",
+          "source": "browser-bench-chromium-all-full.json",
+          "metrics": {
+            "opsPerSec": 3.5481124042122203,
+            "avgLatencyMs": 281.83999999910594,
+            "p50LatencyMs": 282.5999999977648,
+            "p95LatencyMs": 295.80000000074506,
+            "p99LatencyMs": 295.80000000074506
+          }
+        }
+      ]
+    }
+  ]
+}
