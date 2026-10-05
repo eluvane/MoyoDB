@@ -195,6 +195,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@v7
         with:
@@ -224,8 +225,7 @@ jobs:
         uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          args: detect --no-git --source . --config .config/moyo/security/gitleaks.toml --redact --verbose
+          GITLEAKS_CONFIG: .config/moyo/security/gitleaks.toml
       - name: GitHub dependency review
         if: github.event_name == 'pull_request'
         uses: actions/dependency-review-action@v5
@@ -255,6 +255,8 @@ jobs:
         run: cargo install --locked wasm-pack --version 0.15.0
       - name: Install Playwright browsers
         run: npm exec --workspace @moyodb/sdk -- playwright install --with-deps
+      - name: Run repository tooling tests
+        run: npm run test:tooling
       - name: Run Rust tests
         run: npm run test:rust
       - name: Run OPFS shim tests
