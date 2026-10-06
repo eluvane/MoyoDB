@@ -1,5 +1,6 @@
 mod common;
 
+use moyodb_engine::change_feed::{decode_change_record_payload, encode_change_record_payload};
 use moyodb_engine::engine::TxMode;
 use moyodb_engine::{ChangeFeedOptions, ChangeKind, EngineError};
 
@@ -210,4 +211,14 @@ fn disabled_change_feed_keeps_no_history() {
         .changes_since(disabled_txid, ChangeFeedOptions::default())
         .unwrap();
     assert!(empty.changes.is_empty());
+}
+
+#[test]
+fn unknown_change_log_flags_are_rejected() {
+    let mut payload =
+        encode_change_record_payload("docs", b"a", ChangeKind::Put, Some(b"v")).unwrap();
+    payload[5] = 1;
+    let err = decode_change_record_payload(1, &payload).unwrap_err();
+    assert_eq!(err.code(), "CorruptionError");
+    assert!(err.to_string().contains("unsupported change log flags 1"));
 }

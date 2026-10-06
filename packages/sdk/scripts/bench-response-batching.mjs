@@ -184,6 +184,14 @@ async function sample(connection, spec) {
     return { elapsedMs, requestMessages, ...counts };
 }
 
+function median(sorted) {
+    const mid = Math.floor(sorted.length / 2);
+    if (sorted.length % 2 === 1) {
+        return sorted[mid];
+    }
+    return (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
 function summarize(samples) {
     const times = samples.map((item) => item.elapsedMs).sort((left, right) => left - right);
     const first = samples[0];
@@ -195,7 +203,7 @@ function summarize(samples) {
     return {
         ...first,
         elapsedMs: undefined,
-        medianMs: times[Math.floor(times.length / 2)],
+        medianMs: median(times),
         p95Ms: times[Math.ceil(times.length * 0.95) - 1],
         samplesMs: samples.map((item) => item.elapsedMs)
     };
@@ -243,7 +251,12 @@ async function main() {
             }
             const before = summarize(measured.before);
             const after = summarize(measured.after);
-            results.push({ ...spec, before, after, speedup: before.medianMs / after.medianMs });
+            results.push({
+                ...spec,
+                before,
+                after,
+                speedup: after.medianMs > 0 ? before.medianMs / after.medianMs : null
+            });
         }
         console.log(
             JSON.stringify(

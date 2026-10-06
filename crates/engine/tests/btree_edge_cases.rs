@@ -1,6 +1,10 @@
 mod common;
 
-use moyodb_engine::btree::{build_tree, load_all_entries, lookup, scan, RangeSpec};
+use moyodb_engine::btree::{
+    apply_mutations, build_tree, load_all_entries, lookup, scan, PageAllocator, RangeSpec,
+};
+use moyodb_engine::layout::ValueKind;
+use moyodb_engine::page::{encode_internal_page, encode_leaf_page, InternalCell, LeafCell};
 use moyodb_engine::pager::Pager;
 use moyodb_engine::storage::memory::MemoryBackend;
 use moyodb_engine::EngineError;
@@ -115,4 +119,149 @@ fn collapsed_exclusive_range_is_rejected() {
     )
     .unwrap_err();
     assert!(matches!(err, EngineError::InvalidRange(_)));
+}
+
+fn inline_cell(key: &[u8]) -> LeafCell {
+    LeafCell {
+        key: key.to_vec(),
+        value: b"v".to_vec(),
+        value_kind: ValueKind::Inline,
+        total_value_len: 1,
+        overflow_head_page_id: 0,
+    }
+}
+
+/// Images written through a pager stay cached and skip load-time checks. A new
+/// pager over the same backend reads them back the way a reopened file would.
+fn reload(pager: Pager<MemoryBackend>) -> Pager<MemoryBackend> {
+    Pager::new(pager.into_inner(), 4)
+}
+
+fn corruption_message(error: EngineError) -> String {
+    match error {
+        EngineError::Corruption(message) => message,
+        other => panic!("expected corruption, got {other}"),
+    }
+}
+
+#[test]
+fn unsorted_leaf_is_rejected_before_binary_search_can_miss_a_key() {
+    let page = encode_leaf_page(
+        1,
+        0,
+        0,
+        &[inline_cell(b"a"), inline_cell(b"c"), inline_cell(b"b")],
+    )
+    .unwrap();
+    let mut pager = Pager::new(MemoryBackend::new(), 4);
+    pager.write_page_image(1, &page).unwrap();
+    let mut pager = reload(pager);
+
+    let lookup_error = lookup(&mut pager, 1, b"b").unwrap_err();
+    assert_eq!(
+        corruption_message(lookup_error),
+        "leaf page 1 keys are not strictly increasing"
+    );
+    let scan_error = scan(&mut pager, 1, &RangeSpec::default()).unwrap_err();
+    assert_eq!(
+        corruption_message(scan_error),
+        "leaf page 1 keys are not strictly increasing"
+    );
+}
+
+#[test]
+fn repeated_internal_child_is_rejected_before_copy_on_write_retires_it() {
+    let root = encode_internal_page(
+        1,
+        1,
+        0,
+        &[
+            InternalCell {
+                separator: b"a".to_vec(),
+                child_page_id: 2,
+            },
+            InternalCell {
+                separator: b"m".to_vec(),
+                child_page_id: 2,
+            },
+        ],
+    )
+    .unwrap();
+    let leaf = encode_leaf_page(2, 0, 0, &[inline_cell(b"a"), inline_cell(b"m")]).unwrap();
+    let mut pager = Pager::new(MemoryBackend::new(), 4);
+    pager.write_page_image(1, &root).unwrap();
+    pager.write_page_image(2, &leaf).unwrap();
+    let mut pager = reload(pager);
+
+    assert_eq!(
+        corruption_message(lookup(&mut pager, 1, b"a").unwrap_err()),
+        "internal page 1 repeats child page 2"
+    );
+    assert_eq!(
+        corruption_message(scan(&mut pager, 1, &RangeSpec::default()).unwrap_err()),
+        "internal page 1 repeats child page 2"
+    );
+    let mut alloc = PageAllocator::new(3);
+    let error = apply_mutations(
+        &mut pager,
+        1,
+        &[(b"a".as_slice(), Some(b"n".as_slice()))],
+        &mut alloc,
+    )
+    .unwrap_err();
+    assert_eq!(
+        corruption_message(error),
+        "internal page 1 repeats child page 2"
+    );
+    assert!(
+        alloc.freed().is_empty(),
+        "the shared child must stay allocated when routing is rejected"
+    );
+}
+
+#[test]
+fn repeated_overflow_head_is_rejected_before_one_cell_can_retire_it() {
+    let page = encode_leaf_page(
+        1,
+        0,
+        0,
+        &[
+            LeafCell {
+                key: b"a".to_vec(),
+                value: Vec::new(),
+                value_kind: ValueKind::Overflow,
+                total_value_len: 4,
+                overflow_head_page_id: 2,
+            },
+            LeafCell {
+                key: b"b".to_vec(),
+                value: Vec::new(),
+                value_kind: ValueKind::Overflow,
+                total_value_len: 4,
+                overflow_head_page_id: 2,
+            },
+        ],
+    )
+    .unwrap();
+    let mut pager = Pager::new(MemoryBackend::new(), 4);
+    pager.write_page_image(1, &page).unwrap();
+    let mut pager = reload(pager);
+
+    assert_eq!(
+        corruption_message(lookup(&mut pager, 1, b"b").unwrap_err()),
+        "leaf page 1 repeats overflow head 2"
+    );
+    let mut alloc = PageAllocator::new(3);
+    let error = apply_mutations(
+        &mut pager,
+        1,
+        &[(b"a".as_slice(), Some(b"n".as_slice()))],
+        &mut alloc,
+    )
+    .unwrap_err();
+    assert_eq!(
+        corruption_message(error),
+        "leaf page 1 repeats overflow head 2"
+    );
+    assert!(alloc.freed().is_empty());
 }

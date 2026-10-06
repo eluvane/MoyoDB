@@ -685,7 +685,9 @@ impl<B: FileBackend> Engine<B> {
         compression: StoreCompression,
     ) -> Result<()> {
         validate_store_name(name)?;
-        if name.as_bytes().first() == Some(&0xff) {
+        // Other `__browserdb:` names are real stores. This one is the change
+        // log: an enabled feed appends to it on later commits.
+        if name.as_bytes().first() == Some(&0xff) || name == SYSTEM_CHANGELOG_STORE_NAME {
             return Err(EngineError::ReservedStoreName(name.into()));
         }
         let mut tx = self.take_tx(tx_id)?;
@@ -1390,11 +1392,13 @@ impl<B: FileBackend> Engine<B> {
         let mut stores = CatalogMap::new();
         let mut page_batch = Vec::with_capacity(crate::pager::PAGE_WRITE_BATCH_PAGES);
         let mut page_buffer = Vec::new();
-        // Retain internal stores unless explicitly skipped. Always omit the
-        // change log. The target feed floor excludes the source history.
+        // Retain internal stores unless explicitly skipped. Omit the system
+        // change log. A user store that only shares its name is ordinary data.
+        // The target feed floor excludes the source history.
         for (name, meta) in self.catalog.iter() {
-            if name.as_str() == SYSTEM_CHANGELOG_STORE_NAME
-                || skipped_stores.contains(name.as_str())
+            if skipped_stores.contains(name.as_str())
+                || (name.as_str() == SYSTEM_CHANGELOG_STORE_NAME
+                    && store_uses_system_raw_values(meta.flags))
             {
                 continue;
             }
@@ -1830,6 +1834,16 @@ fn plan_commit<B: FileBackend>(
         let log_meta = catalog_delta
             .get(view.catalog, SYSTEM_CHANGELOG_STORE_NAME)
             .cloned();
+        // A legacy user store can already occupy the log name. Appending here
+        // would reinterpret its tree and replace its flags.
+        if log_meta
+            .as_ref()
+            .is_some_and(|meta| !store_uses_system_raw_values(meta.flags))
+        {
+            return Err(EngineError::ReservedStoreName(
+                SYSTEM_CHANGELOG_STORE_NAME.into(),
+            ));
+        }
         let mut prune_keys = Vec::new();
         if let (Some(meta), Some(retain)) = (log_meta.as_ref(), final_policy.retain_txids) {
             let target = new_txid.saturating_sub(retain);

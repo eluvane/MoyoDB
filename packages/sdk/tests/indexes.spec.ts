@@ -83,6 +83,33 @@ test('managed indexes are hidden from catalog and support exact + range lookups'
     expect(result.changeStores).toEqual(['users']);
     expect(result.changeCount).toBe(3);
 });
+test('getByIndex matches the exact index key and ignores longer keys sharing its bytes', async ({ page }) => {
+    const dbName = uniqueDbName('indexes-exact-key');
+    await prepareMoyoDbPage(page);
+    const result = await page.evaluate(async (name) => {
+        const db = await window.moyodb.openDB(name, {
+            version: 1,
+            indexes: [{ store: 'docs', name: 'byTag', keyPath: 'tag' }],
+            migrate: async ({ db }) => {
+                await db.createStore('docs');
+            }
+        });
+        try {
+            await db.put('docs', window.moyodb.utf8Encode('d:1'), window.moyodb.jsonEncode({ tag: 'GA' }));
+            const tx = await db.begin('readonly');
+            try {
+                const shorter = await tx.getByIndex('docs', 'byTag', window.moyodb.indexKey('G'));
+                const exact = await tx.getByIndex('docs', 'byTag', window.moyodb.indexKey('GA'));
+                return { shorter: shorter === null, exact: exact !== null };
+            } finally {
+                await tx.rollback();
+            }
+        } finally {
+            await db.close();
+        }
+    }, dbName);
+    expect(result).toEqual({ shorter: true, exact: true });
+});
 test('managed indexes follow createStore, put, clearStore, and dropStore semantics', async ({ page }) => {
     const dbName = uniqueDbName('indexes-store-lifecycle');
     await prepareMoyoDbPage(page);

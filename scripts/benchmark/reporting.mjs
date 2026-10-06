@@ -3,7 +3,14 @@ import path from 'node:path';
 
 export function readCliOption(argv, flag) {
     const index = argv.indexOf(flag);
-    return index < 0 ? undefined : argv[index + 1];
+    if (index < 0) {
+        return undefined;
+    }
+    const value = argv[index + 1];
+    if (value === undefined || value.startsWith('--')) {
+        throw new Error(`${flag} requires a value`);
+    }
+    return value;
 }
 
 const comparisonFields = [
@@ -48,6 +55,12 @@ export function formatNumber(value, fractionDigits = 2) {
 }
 
 export function formatDeltaPercent(value) {
+    if (value === Number.POSITIVE_INFINITY) {
+        return '+Infinity%';
+    }
+    if (value === Number.NEGATIVE_INFINITY) {
+        return '-Infinity%';
+    }
     if (!Number.isFinite(value)) {
         return 'n/a';
     }

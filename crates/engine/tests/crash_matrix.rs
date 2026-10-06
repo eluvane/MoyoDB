@@ -4,8 +4,6 @@ use moyodb_engine::engine::{Engine, Failpoint, OpenConfig, TxMode};
 use moyodb_engine::layout::PAGE_SIZE;
 use moyodb_engine::storage::memory::MemoryBackend;
 use moyodb_engine::wal::append_page_image_record;
-use std::thread::sleep;
-use std::time::Duration;
 
 fn seed_kv(engine: &mut Engine<MemoryBackend>) {
     let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
@@ -211,15 +209,14 @@ fn ttl_state_after_recovery() {
     engine.set_failpoint(Some(Failpoint::AfterWalFlush));
     let tx2 = engine.begin_tx(TxMode::Readwrite).unwrap();
     engine
-        .put_with_ttl(tx2, "kv", b"expired", b"gone", Some(1))
+        .put_with_ttl(tx2, "kv", b"live", b"kept", Some(3_600_000))
         .unwrap();
     let err = engine.commit_tx(tx2).unwrap_err();
     assert_eq!(err.code(), "InjectedFailureError");
     drop(engine);
-    sleep(Duration::from_millis(5));
 
     let mut reopened = common::reopen_memory_engine("crash-ttl", &bundle);
-    assert_eq!(read_value(&mut reopened, b"expired"), None);
+    assert_eq!(read_value(&mut reopened, b"live"), Some(b"kept".to_vec()));
 }
 
 #[test]

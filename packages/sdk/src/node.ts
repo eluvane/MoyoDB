@@ -1,11 +1,17 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, realpath } from 'node:fs/promises';
+import { realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { openDBWithWorker } from './index';
 import { assertCompatibleOptions, invalidateTransactions, normalizeOptions, type RegistryEntry } from './registry';
-import { DatabaseBusyError, DatabaseClosedError, InvalidOpenOptionsError, normalizeError } from './errors';
+import {
+    DatabaseBusyError,
+    DatabaseClosedError,
+    InvalidOpenOptionsError,
+    StorageError,
+    normalizeError
+} from './errors';
 import { NodeWorkerTransport } from './node-worker-client';
-import { releaseNodeStorageLease } from './node-storage.mjs';
+import { MISSING_DATABASE_MESSAGE, ensureStorageRoot, releaseNodeStorageLease } from './node-storage.mjs';
 import { workerProtocolError } from './worker-protocol';
 import type { DB, OpenOptions } from './types';
 
@@ -61,12 +67,19 @@ function validateDirectoryOptions(options: unknown): asserts options is NodeDele
 
 async function databaseLocation(
     name: string,
-    options: NodeDeleteOptions
+    options: NodeDeleteOptions & { createIfMissing?: boolean }
 ): Promise<{
     directory: string;
     registryKey: string;
 }> {
-    await mkdir(options.directory, { recursive: true });
+    try {
+        ensureStorageRoot(options.directory, options.createIfMissing !== false);
+    } catch (error) {
+        if (error instanceof Error && error.name === 'StorageError') {
+            throw new StorageError(error.message || MISSING_DATABASE_MESSAGE);
+        }
+        throw error;
+    }
     const root = await realpath(options.directory);
     const directory = join(root, 'stackdb', Buffer.from(name, 'utf8').toString('hex'));
     const registryKey = process.platform === 'win32' ? directory.toLowerCase() : directory;
@@ -99,7 +112,8 @@ function createEntry(dbName: string, directory: string, registryKey: string, opt
             channelName,
             lockToken,
             ownerWaitMs: normalized.ownerWaitMs,
-            encodedDbName: Buffer.from(dbName, 'utf8').toString('hex')
+            encodedDbName: Buffer.from(dbName, 'utf8').toString('hex'),
+            createIfMissing: normalized.createIfMissing
         },
         () => {
             releaseNodeStorageLease(directory, lockToken);

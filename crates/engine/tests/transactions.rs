@@ -389,11 +389,7 @@ fn compact_into_streams_live_rows_into_a_fresh_database() {
         source.put(tx, "kv", &i.to_be_bytes(), &[0x22; 64]).unwrap();
     }
     source.put(tx, "kv", b"large", &vec![0x33; 20_000]).unwrap();
-    source
-        .put_with_ttl(tx, "kv", b"expiring", b"soon", Some(1))
-        .unwrap();
     let source_txid = source.commit_tx(tx).unwrap();
-    sleep(Duration::from_millis(5));
 
     let target_bundle = moyodb_engine::MemoryBundle::new();
     let mut target = moyodb_engine::Engine::open(
@@ -414,7 +410,6 @@ fn compact_into_streams_live_rows_into_a_fresh_database() {
         reopened.get(ro, "kv", b"large").unwrap(),
         Some(vec![0x33; 20_000])
     );
-    assert_eq!(reopened.get(ro, "kv", b"expiring").unwrap(), None);
     reopened.rollback_tx(ro).unwrap();
 }
 

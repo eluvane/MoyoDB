@@ -4,8 +4,15 @@ import { dirname, join, normalize } from 'node:path';
 
 const rootPackage = JSON.parse(readFileSync('package.json', 'utf8'));
 const sdkPackage = JSON.parse(readFileSync('packages/sdk/package.json', 'utf8'));
+const qualityReadmePath = '.config/moyo/README.md';
+const qualityReadme = existsSync(qualityReadmePath) ? readFileSync(qualityReadmePath, 'utf8') : '';
 const commandsDocPath = 'docs/COMMANDS.md';
 const commandsDoc = existsSync(commandsDocPath) ? readFileSync(commandsDocPath, 'utf8') : '';
+
+function documentsCommand(text, script) {
+    const body = script.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`npm run ${body}(?![\\w:-])`, 'u').test(text);
+}
 
 const requiredDocs = ['README.md', '.config/moyo/README.md'];
 
@@ -33,12 +40,16 @@ for (const script of requiredRootScripts) {
     if (!rootPackage.scripts?.[script]) {
         failures.push(`Root package.json is missing script ${script}.`);
     }
-    if (commandsDoc && !commandsDoc.includes(`npm run ${script}`)) {
+    if (qualityReadme && !documentsCommand(qualityReadme, script)) {
+        failures.push(`.config/moyo/README.md does not document root command: npm run ${script}`);
+    }
+    if (commandsDoc && !documentsCommand(commandsDoc, script)) {
         failures.push(`docs/COMMANDS.md does not document root command: npm run ${script}`);
     }
 }
+// docs/COMMANDS.md is optional. When present, it must name SDK scripts exactly.
 for (const script of Object.keys(sdkPackage.scripts ?? {})) {
-    if (commandsDoc && !commandsDoc.includes(`npm run ${script}`)) {
+    if (commandsDoc && !documentsCommand(commandsDoc, script)) {
         failures.push(`docs/COMMANDS.md does not document SDK command: npm run ${script}`);
     }
 }
@@ -70,8 +81,5 @@ for (const file of collectMarkdown('.')) {
 if (failures.length > 0) {
     console.error(failures.join('\n'));
     process.exit(1);
-}
-if (!commandsDoc) {
-    console.warn('Documentation command coverage skipped: docs/COMMANDS.md is not present.');
 }
 console.log('Documentation command/link policy passed.');

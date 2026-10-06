@@ -29,5 +29,5 @@ test('key, JSON, index and compression codecs preserve boundary contracts', asyn
         });
     });
     expect(result.results.filter((entry) => !entry.passed)).toEqual([]);
-    expect(result.passed).toBe(22);
+    expect(result.passed).toBe(23);
 });

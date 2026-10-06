@@ -318,14 +318,15 @@ export function decodeIndexedDocument(bytes: Uint8Array): unknown {
 function resolveKeyPath(root: unknown, keyPath: string): unknown {
     let current: unknown = root;
     for (const segment of keyPath.split('.')) {
-        if (current === null || current === undefined) {
+        // JSON strings and numbers have no nested fields. Boxing them would index
+        // UTF-16 code units and string length, which JSON.stringify does not preserve.
+        if (current === null || typeof current !== 'object') {
             return MISSING;
         }
-        const target = Object(current) as Record<string, unknown>;
-        if (!Object.hasOwn(target, segment)) {
+        if (!Object.hasOwn(current, segment)) {
             return MISSING;
         }
-        current = Reflect.get(target, segment);
+        current = Reflect.get(current, segment);
     }
     return current;
 }

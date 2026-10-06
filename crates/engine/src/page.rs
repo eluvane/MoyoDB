@@ -1,5 +1,5 @@
 use crate::bytes::{
-    read_u16_le, read_u32_le, read_u64_le, write_u16_le, write_u32_le, write_u64_le,
+    compare_keys, read_u16_le, read_u32_le, read_u64_le, write_u16_le, write_u32_le, write_u64_le,
 };
 use crate::checksum::{checksum_with_zeroed_region, crc32_with_generated_overflow};
 use crate::error::{EngineError, Result};
@@ -9,6 +9,7 @@ use crate::layout::{
 };
 use crate::prepared_value::ValueParts;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use zerocopy::IntoBytes;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -152,7 +153,7 @@ pub(crate) fn decode_leaf_cell_ref<'a>(bytes: &'a [u8], slot: usize) -> Result<L
     let value_start = key_end;
     let value_end = value_start
         .checked_add(inline_value_len)
-        .ok_or_else(|| EngineError::Corruption("leaf cell value length overflow".into()))?;
+        .ok_or_else(|| EngineError::Corruption("leaf cell value out of bounds".into()))?;
     let key = bytes
         .get(key_start..key_end)
         .ok_or_else(|| EngineError::Corruption("leaf cell key out of bounds".into()))?;
@@ -228,6 +229,7 @@ pub fn decode_page(bytes: &[u8]) -> Result<DecodedPage> {
     let slots = read_cell_slots(bytes, &header_info)?;
     match header_info.page_kind {
         PageKind::Leaf => {
+            validate_leaf_page(bytes, &header_info)?;
             let mut leaf_cells = Vec::with_capacity(slots.len());
             for slot in slots {
                 leaf_cells.push(decode_leaf_cell(&bytes[slot..])?);
@@ -240,6 +242,7 @@ pub fn decode_page(bytes: &[u8]) -> Result<DecodedPage> {
             })
         }
         PageKind::Internal => {
+            validate_internal_page(bytes, &header_info)?;
             let mut internal_cells = Vec::with_capacity(slots.len());
             for slot in slots {
                 internal_cells.push(decode_internal_cell(&bytes[slot..])?);
@@ -473,64 +476,15 @@ fn encode_leaf_cell_into(dst: &mut [u8], cell: &LeafCell) -> Result<()> {
 }
 
 fn decode_leaf_cell(bytes: &[u8]) -> Result<LeafCell> {
-    let key_len = read_u16_le(bytes, 0)? as usize;
-    let value_kind = ValueKind::from_u8(
-        *bytes
-            .get(2)
-            .ok_or_else(|| EngineError::Corruption("leaf cell kind".into()))?,
-    )?;
-    let total_value_len = read_u32_le(bytes, 4)?;
-    let overflow_head_page_id = read_u64_le(bytes, 8)?;
-    let inline_value_len = read_u32_le(bytes, 16)? as usize;
-    let key_start = 20;
-    let key_end = key_start + key_len;
-    let value_start = key_end;
-    let value_end = value_start + inline_value_len;
-    let key = bytes
-        .get(key_start..key_end)
-        .ok_or_else(|| EngineError::Corruption("leaf cell key out of bounds".into()))?
-        .to_vec();
-    let value = bytes
-        .get(value_start..value_end)
-        .ok_or_else(|| EngineError::Corruption("leaf cell value out of bounds".into()))?
-        .to_vec();
-    match value_kind {
-        ValueKind::Inline => {
-            if overflow_head_page_id != 0 {
-                return Err(EngineError::Corruption(
-                    "inline leaf cell unexpectedly references overflow pages".into(),
-                ));
-            }
-            if inline_value_len != total_value_len as usize {
-                return Err(EngineError::Corruption(
-                    "inline leaf cell length metadata mismatch".into(),
-                ));
-            }
-        }
-        ValueKind::Overflow => {
-            if inline_value_len != 0 {
-                return Err(EngineError::Corruption(
-                    "overflow leaf cell unexpectedly stores inline bytes".into(),
-                ));
-            }
-            if overflow_head_page_id == 0 {
-                return Err(EngineError::Corruption(
-                    "overflow leaf cell is missing head page id".into(),
-                ));
-            }
-            if total_value_len == 0 {
-                return Err(EngineError::Corruption(
-                    "overflow leaf cell has zero total length".into(),
-                ));
-            }
-        }
-    }
+    // The owned decoder used to add the u32 value length with unchecked
+    // arithmetic. Delegating keeps hostile lengths on the checked path.
+    let cell = decode_leaf_cell_ref(bytes, 0)?;
     Ok(LeafCell {
-        key,
-        value,
-        value_kind,
-        total_value_len,
-        overflow_head_page_id,
+        key: cell.key.to_vec(),
+        value: cell.inline_value.to_vec(),
+        value_kind: cell.value_kind,
+        total_value_len: cell.total_value_len,
+        overflow_head_page_id: cell.overflow_head_page_id,
     })
 }
 
@@ -543,21 +497,144 @@ fn encode_internal_cell_into(dst: &mut [u8], cell: &InternalCell) -> Result<()> 
 }
 
 fn decode_internal_cell(bytes: &[u8]) -> Result<InternalCell> {
-    let sep_len = read_u16_le(bytes, 0)? as usize;
-    let child_page_id = read_u64_le(bytes, 4)?;
-    if child_page_id == 0 {
-        return Err(EngineError::Corruption(
-            "internal cell has child_page_id=0".into(),
-        ));
-    }
-    let separator = bytes
-        .get(12..12 + sep_len)
-        .ok_or_else(|| EngineError::Corruption("internal cell separator out of bounds".into()))?
-        .to_vec();
+    let cell = decode_internal_cell_ref(bytes, 0)?;
     Ok(InternalCell {
-        separator,
-        child_page_id,
+        separator: cell.separator.to_vec(),
+        child_page_id: cell.child_page_id,
     })
+}
+
+/// Largest leaf cell count that can be stored without overlap: a 20-byte cell
+/// plus its 2-byte slot, inside the bytes that follow the page header.
+const MAX_PACKED_LEAF_CELLS: usize = (PAGE_SIZE - PAGE_HEADER_SIZE) / 22;
+/// Largest internal cell count: a 12-byte cell plus its 2-byte slot.
+const MAX_PACKED_INTERNAL_CELLS: usize = (PAGE_SIZE - PAGE_HEADER_SIZE) / 14;
+
+/// Structural checks that a valid checksum does not imply. They cost one pass
+/// over the cells, so run them when a page enters the cache, not per traversal.
+pub(crate) fn validate_tree_page(bytes: &[u8], header: &PageHeaderInfo) -> Result<()> {
+    match header.page_kind {
+        PageKind::Leaf => validate_leaf_page(bytes, header),
+        PageKind::Internal => validate_internal_page(bytes, header),
+        PageKind::Overflow => Ok(()),
+    }
+}
+
+/// Leaf order is a search invariant. Overlapping spans and a repeated overflow
+/// head are rejected here so a later copy cannot retire a chain that another
+/// cell on the page still references.
+pub(crate) fn validate_leaf_page(bytes: &[u8], header: &PageHeaderInfo) -> Result<()> {
+    debug_assert_eq!(
+        MAX_PACKED_LEAF_CELLS,
+        (PAGE_SIZE - PAGE_HEADER_SIZE) / (leaf_cell_size(0, 0, true) + 2)
+    );
+    let count = header.cell_count as usize;
+    let mut spans = [(0usize, 0usize); MAX_PACKED_LEAF_CELLS];
+    let mut heads = [0u64; MAX_PACKED_LEAF_CELLS];
+    let mut head_count = 0usize;
+    for index in 0..count {
+        let slot = read_cell_slot(bytes, header, index)?;
+        let cell = decode_leaf_cell_ref(bytes, slot)?;
+        if index > 0 {
+            let previous_slot = read_cell_slot(bytes, header, index - 1)?;
+            let previous = decode_leaf_cell_ref(bytes, previous_slot)?;
+            if compare_keys(previous.key, cell.key) != Ordering::Less {
+                return Err(EngineError::Corruption(format!(
+                    "leaf page {} keys are not strictly increasing",
+                    header.page_id
+                )));
+            }
+        }
+        if cell.value_kind == ValueKind::Overflow {
+            if heads[..head_count].contains(&cell.overflow_head_page_id) {
+                return Err(EngineError::Corruption(format!(
+                    "leaf page {} repeats overflow head {}",
+                    header.page_id, cell.overflow_head_page_id
+                )));
+            }
+            if head_count < heads.len() {
+                heads[head_count] = cell.overflow_head_page_id;
+                head_count += 1;
+            }
+        }
+        if index < spans.len() {
+            spans[index] = (slot, slot + 20 + cell.key.len() + cell.inline_value.len());
+        }
+    }
+    if count > MAX_PACKED_LEAF_CELLS {
+        return Err(EngineError::Corruption(format!(
+            "leaf page {} cells overlap",
+            header.page_id
+        )));
+    }
+    reject_overlapping_spans(&spans[..count], header.page_id, "leaf")
+}
+
+/// Internal binary search and copy-on-write both assume strictly increasing
+/// separators and a private child page per slot.
+pub(crate) fn validate_internal_page(bytes: &[u8], header: &PageHeaderInfo) -> Result<()> {
+    debug_assert_eq!(
+        MAX_PACKED_INTERNAL_CELLS,
+        (PAGE_SIZE - PAGE_HEADER_SIZE) / (internal_cell_size(0) + 2)
+    );
+    let count = header.cell_count as usize;
+    let mut spans = [(0usize, 0usize); MAX_PACKED_INTERNAL_CELLS];
+    let mut children = [0u64; MAX_PACKED_INTERNAL_CELLS];
+    for index in 0..count {
+        let slot = read_cell_slot(bytes, header, index)?;
+        let cell = decode_internal_cell_ref(bytes, slot)?;
+        if index > 0 {
+            let previous_slot = read_cell_slot(bytes, header, index - 1)?;
+            let previous = decode_internal_cell_ref(bytes, previous_slot)?;
+            if compare_keys(previous.separator, cell.separator) != Ordering::Less {
+                return Err(EngineError::Corruption(format!(
+                    "internal page {} separators are not strictly increasing",
+                    header.page_id
+                )));
+            }
+        }
+        if index < children.len() && children[..index].contains(&cell.child_page_id) {
+            return Err(EngineError::Corruption(format!(
+                "internal page {} repeats child page {}",
+                header.page_id, cell.child_page_id
+            )));
+        }
+        if index < spans.len() {
+            children[index] = cell.child_page_id;
+            spans[index] = (slot, slot + 12 + cell.separator.len());
+        }
+    }
+    if count > MAX_PACKED_INTERNAL_CELLS {
+        return Err(EngineError::Corruption(format!(
+            "internal page {} cells overlap",
+            header.page_id
+        )));
+    }
+    reject_overlapping_spans(&spans[..count], header.page_id, "internal")
+}
+
+fn reject_overlapping_spans(spans: &[(usize, usize)], page_id: u64, kind: &str) -> Result<()> {
+    let mut order = [0usize; MAX_PACKED_INTERNAL_CELLS];
+    let count = spans.len();
+    if count > order.len() {
+        return Err(EngineError::Corruption(format!(
+            "{kind} page {page_id} cells overlap"
+        )));
+    }
+    for (index, slot) in order.iter_mut().enumerate().take(count) {
+        *slot = index;
+    }
+    order[..count].sort_unstable_by_key(|&index| spans[index].0);
+    for pair in order[..count].windows(2) {
+        let left = spans[pair[0]];
+        let right = spans[pair[1]];
+        if left.1 > right.0 {
+            return Err(EngineError::Corruption(format!(
+                "{kind} page {page_id} cells overlap"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_page_bounds(header: &PageHeaderInfo) -> Result<()> {

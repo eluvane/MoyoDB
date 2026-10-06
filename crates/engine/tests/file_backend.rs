@@ -516,6 +516,72 @@ fn malformed_and_live_shared_leases_are_not_removed() {
     assert_eq!(fs::read_dir(&db_path).unwrap().count(), 1);
 }
 
+#[cfg(windows)]
+#[test]
+fn shared_lease_recovers_an_exited_process_while_its_handle_is_open() {
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+
+    struct StopChild(Option<Child>);
+    impl Drop for StopChild {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let directory = TestDirectory::new();
+    let db_path = directory.db_path("lease");
+    fs::create_dir(&db_path).unwrap();
+    let mut child = StopChild(Some(
+        Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    ));
+    let pid = child.0.as_ref().unwrap().id();
+    // Keep a process object after exit. OpenProcess still succeeds until this
+    // handle is closed, which is not the same as the process still running.
+    // SAFETY: The access mask and pid are values. The handle is closed below.
+    let held = unsafe { OpenProcess(0x1000, 0, pid) };
+    assert!(
+        !held.is_null(),
+        "probe handle: {}",
+        std::io::Error::last_os_error()
+    );
+    let lock = db_path.join(".moyodb.lock");
+    fs::create_dir(&lock).unwrap();
+    let token = "11111111-2222-3333-4444-555555555555";
+    let record = lock.join(format!("{token}.json"));
+    fs::write(
+        &record,
+        serde_json::to_vec(&serde_json::json!({"pid": pid, "token": token})).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        NativeFileBackend::open_db(directory.path(), "lease", true),
+        Err(EngineError::DatabaseBusy(_))
+    ));
+    assert!(record.exists());
+    let mut exited = child.0.take().unwrap();
+    exited.kill().unwrap();
+    exited.wait().unwrap();
+    let files = NativeFileBackend::open_db(directory.path(), "lease", true).unwrap();
+    assert!(!record.exists());
+    drop(files);
+    // SAFETY: `held` came from OpenProcess and is closed exactly once.
+    assert_ne!(unsafe { CloseHandle(held) }, 0);
+}
+
 #[test]
 fn shared_lease_recovers_a_proven_dead_owner_and_an_interrupted_empty_release() {
     let directory = TestDirectory::new();

@@ -39,7 +39,7 @@ import {
     type WorkerProtocolRequestBatchMessage,
     type WorkerProtocolRequestMessage
 } from './worker-protocol';
-import { isRecord } from './internal';
+import { clampTimerDelayMs, isRecord } from './internal';
 
 interface PendingRequest {
     /** Response command; autocommit replies use the inner command's format. */
@@ -58,6 +58,7 @@ interface QueuedRequest {
 function clearPendingTimeout(pending: PendingRequest): void {
     if (pending.timeout) {
         clearTimeout(pending.timeout);
+        pending.timeout = null;
     }
 }
 
@@ -110,15 +111,16 @@ export class WorkerProtocolClient implements WorkerApi {
         private readonly worker: WorkerTransport,
         options: WorkerProtocolClientOptions = {}
     ) {
-        this.requestTimeoutMs = options.requestTimeoutMs ?? 0;
+        this.requestTimeoutMs = clampTimerDelayMs(options.requestTimeoutMs ?? 0);
         this.ready = new Promise<void>((resolve, reject) => {
             this.readyResolve = resolve;
             this.readyReject = reject;
         });
-        if ((options.readyTimeoutMs ?? 0) > 0) {
+        const readyTimeoutMs = clampTimerDelayMs(options.readyTimeoutMs ?? 0);
+        if (readyTimeoutMs > 0) {
             this.readyTimeout = setTimeout(() => {
                 this.fail(workerProtocolError('WorkerReadyTimeoutError', 'worker did not become ready'));
-            }, options.readyTimeoutMs);
+            }, readyTimeoutMs);
         }
         void this.ready.catch(() => undefined);
         this.worker.addEventListener('message', this.handleMessage as EventListener);
@@ -343,7 +345,12 @@ export class WorkerProtocolClient implements WorkerApi {
             const timeout =
                 this.requestTimeoutMs > 0
                     ? setTimeout(() => {
+                          const current = this.pending.get(id);
+                          if (!current || current.timeout === null) {
+                              return;
+                          }
                           this.pending.delete(id);
+                          current.timeout = null;
                           reject(
                               workerProtocolError(
                                   'WorkerRequestTimeoutError',
@@ -448,6 +455,14 @@ export class WorkerProtocolClient implements WorkerApi {
         }
         if (isWorkerProtocolReadyEnvelope(data)) {
             this.fail(workerProtocolError('WorkerProtocolError', 'incompatible worker protocol ready message'));
+            return;
+        }
+        if (
+            isRecord(data) &&
+            (data.type === WORKER_PROTOCOL_RESPONSE || data.type === WORKER_PROTOCOL_RESPONSE_BATCH) &&
+            data.version !== WORKER_PROTOCOL_VERSION
+        ) {
+            this.fail(workerProtocolError('WorkerProtocolError', 'incompatible worker protocol response'));
             return;
         }
         if (isWorkerProtocolResponseBatchMessage(data)) {

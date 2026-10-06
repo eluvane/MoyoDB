@@ -35,19 +35,42 @@ function checkUsesPinned(file, text) {
     }
 }
 
-function checkCheckoutPolicy(file, text) {
-    const checkoutSteps = text.split(/\n\s*-\s+uses:\s+actions\/checkout@/u).length - 1;
-    if (checkoutSteps > 0) {
-        const credentialPins = text.split(/persist-credentials:\s*false/u).length - 1;
-        if (credentialPins < checkoutSteps) {
-            fail(file, 'every actions/checkout step must set persist-credentials: false');
+function collectRunCommands(lines) {
+    const commands = [];
+    for (const [index, line] of lines.entries()) {
+        if (/^[\t ]*(?:-[\t ]*)?run:[\t ]*[|>][\t ]*$/.test(line)) {
+            const baseIndent = line.match(/^\s*/)?.[0].length ?? 0;
+            for (let next = index + 1; next < lines.length; next += 1) {
+                const candidate = lines[next];
+                if (candidate.trim() === '') continue;
+                const indent = candidate.match(/^\s*/)?.[0].length ?? 0;
+                if (indent <= baseIndent) break;
+                commands.push(candidate.trim());
+            }
+            continue;
+        }
+        const single = line.match(/^[\t ]*(?:-[\t ]*)?run:[\t ]*(\S.*)$/);
+        if (single) commands.push(single[1].trim());
+    }
+    return commands;
+}
+
+function checkCheckoutPolicy(file, lines) {
+    for (const [index, line] of lines.entries()) {
+        if (!/^[\t ]*(?:-[\t ]*)?uses:[\t ]*["']?actions\/checkout@/u.test(line)) continue;
+        const step = [line];
+        for (let next = index + 1; next < lines.length; next += 1) {
+            if (/^[\t ]*-[\t ]+\S/u.test(lines[next])) break;
+            step.push(lines[next]);
+        }
+        if (!step.some((candidate) => /persist-credentials:\s*false/u.test(candidate))) {
+            fail(file, `actions/checkout step at line ${index + 1} must set persist-credentials: false`);
         }
     }
 }
 
-function checkInstallPolicy(file, text) {
-    for (const match of text.matchAll(/^[\t ]*(?:-[\t ]*)?run:[\t ]*(\S.*)$/gm)) {
-        const command = match[1].trim();
+function checkInstallPolicy(file, lines) {
+    for (const command of collectRunCommands(lines)) {
         if (/\bnpm\s+ci\b/.test(command)) {
             for (const flag of ['--ignore-scripts', '--no-audit', '--no-fund']) {
                 if (!command.includes(flag)) {
@@ -106,8 +129,8 @@ function checkWorkflow(file, text) {
         fail(file, 'remote shell-pipe install patterns are forbidden');
     }
     checkUsesPinned(file, text);
-    checkCheckoutPolicy(file, text);
-    checkInstallPolicy(file, text);
+    checkCheckoutPolicy(file, lines);
+    checkInstallPolicy(file, lines);
     checkMultilineShellPolicy(file, lines);
 }
 

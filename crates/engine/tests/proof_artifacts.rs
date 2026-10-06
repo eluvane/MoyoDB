@@ -3,8 +3,8 @@ mod common;
 use moyodb_engine::bytes::{MAX_KEY_BYTES, MAX_STORE_NAME_BYTES, MAX_VALUE_BYTES};
 use moyodb_engine::engine::{Failpoint, TxMode};
 use moyodb_engine::layout::{
-    INLINE_VALUE_LIMIT, MAIN_FILE_KIND, MANIFEST_FILE_KIND, PAGE_SIZE, SUPERBLOCK_SLOT_SIZE,
-    WAL_FILE_KIND,
+    PageKind, ValueKind, WalTag, INLINE_VALUE_LIMIT, MAIN_FILE_KIND, MANIFEST_FILE_KIND, PAGE_SIZE,
+    SUPERBLOCK_SLOT_SIZE, WAL_FILE_KIND,
 };
 use moyodb_engine::page::encode_leaf_page;
 use moyodb_engine::wal::{append_commit_record, append_page_image_record, CommitRecord};
@@ -38,6 +38,34 @@ fn derived_constants_match_runtime_values() {
     assert_eq!(
         value["file_kinds"]["wal"].as_u64().unwrap(),
         WAL_FILE_KIND as u64
+    );
+    assert_eq!(
+        value["page_kinds"]["leaf"].as_u64().unwrap(),
+        u64::from(PageKind::Leaf as u8)
+    );
+    assert_eq!(
+        value["page_kinds"]["internal"].as_u64().unwrap(),
+        u64::from(PageKind::Internal as u8)
+    );
+    assert_eq!(
+        value["page_kinds"]["overflow"].as_u64().unwrap(),
+        u64::from(PageKind::Overflow as u8)
+    );
+    assert_eq!(
+        value["value_kinds"]["inline"].as_u64().unwrap(),
+        u64::from(ValueKind::Inline as u8)
+    );
+    assert_eq!(
+        value["value_kinds"]["overflow"].as_u64().unwrap(),
+        u64::from(ValueKind::Overflow as u8)
+    );
+    assert_eq!(
+        value["record_tags"]["page_image"].as_u64().unwrap(),
+        u64::from(WalTag::PageImage as u8)
+    );
+    assert_eq!(
+        value["record_tags"]["commit"].as_u64().unwrap(),
+        u64::from(WalTag::Commit as u8)
     );
     assert_eq!(
         value["limits"]["store_name_bytes"].as_u64().unwrap(),

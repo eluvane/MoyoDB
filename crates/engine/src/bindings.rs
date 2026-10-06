@@ -371,11 +371,12 @@ mod wasm {
     use crate::change_feed::ChangeFeedOptions;
     use crate::engine::{DbStats, Engine, Failpoint, OpenConfig};
     use crate::error::EngineError;
+    use crate::storage::backend::database_name_from_utf16;
     use crate::storage::backend::FileSet;
     use crate::storage::opfs::OpfsBackend;
     use crate::txn::{BatchOp, BatchOpOutcome, BatchOpRef, TxMode};
     use crate::value::StoreCompression;
-    use js_sys::{Array, Object, Reflect, Uint8Array};
+    use js_sys::{Array, JsString, Object, Reflect, Uint8Array};
     use serde::{Deserialize, Serialize};
     use wasm_bindgen::prelude::*;
 
@@ -528,13 +529,27 @@ mod wasm {
         inner: Option<Engine<OpfsBackend>>,
     }
 
+    fn js_database_name(name: &JsString) -> std::result::Result<String, JsValue> {
+        // Each UTF-16 unit becomes at least one UTF-8 byte, so a longer JS
+        // string cannot satisfy the 127-byte limit. Skip the unit copy.
+        if name.length() > 127 {
+            return Err(js_error(EngineError::Storage(
+                "database name must contain 1 to 127 UTF-8 bytes".into(),
+            )));
+        }
+        let units: Vec<u16> = name.iter().collect();
+        database_name_from_utf16(&units).map_err(js_error)
+    }
+
     #[wasm_bindgen(js_name = deleteDB)]
-    pub async fn delete_db(name: String) -> std::result::Result<(), JsValue> {
+    pub async fn delete_db(name: &JsString) -> std::result::Result<(), JsValue> {
+        let name = js_database_name(name)?;
         OpfsBackend::remove_db(&name).await.map_err(js_error)
     }
 
     #[wasm_bindgen(js_name = prepareRebuildTarget)]
-    pub async fn prepare_rebuild_target(name: String) -> std::result::Result<JsValue, JsValue> {
+    pub async fn prepare_rebuild_target(name: &JsString) -> std::result::Result<JsValue, JsValue> {
+        let name = js_database_name(name)?;
         let generation_name = OpfsBackend::prepare_rebuild_target(&name)
             .await
             .map_err(js_error)?;
@@ -546,10 +561,11 @@ mod wasm {
     /// Verifies the written control file before returning.
     #[wasm_bindgen(js_name = swapActiveGeneration)]
     pub async fn swap_active_generation(
-        name: String,
+        name: &JsString,
         generation_name: String,
         expected_current: Option<String>,
     ) -> std::result::Result<(), JsValue> {
+        let name = js_database_name(name)?;
         OpfsBackend::swap_active_generation(&name, &generation_name, expected_current)
             .await
             .map_err(js_error)
@@ -559,7 +575,8 @@ mod wasm {
     /// A corrupt control file permits legacy fallback only while legacy data
     /// files remain. Otherwise it is an error.
     #[wasm_bindgen(js_name = readActiveGeneration)]
-    pub async fn read_active_generation(name: String) -> std::result::Result<JsValue, JsValue> {
+    pub async fn read_active_generation(name: &JsString) -> std::result::Result<JsValue, JsValue> {
+        let name = js_database_name(name)?;
         Ok(OpfsBackend::read_active_generation(&name)
             .await
             .map_err(js_error)?
@@ -568,14 +585,16 @@ mod wasm {
     }
 
     #[wasm_bindgen(js_name = cleanupInactiveEntries)]
-    pub async fn cleanup_inactive_entries(name: String) -> std::result::Result<(), JsValue> {
+    pub async fn cleanup_inactive_entries(name: &JsString) -> std::result::Result<(), JsValue> {
+        let name = js_database_name(name)?;
         OpfsBackend::cleanup_inactive_entries(&name)
             .await
             .map_err(js_error)
     }
 
     #[wasm_bindgen(js_name = dbDirectorySize)]
-    pub async fn db_directory_size(name: String) -> std::result::Result<f64, JsValue> {
+    pub async fn db_directory_size(name: &JsString) -> std::result::Result<f64, JsValue> {
+        let name = js_database_name(name)?;
         Ok(OpfsBackend::db_directory_size(&name)
             .await
             .map_err(js_error)? as f64)
@@ -630,10 +649,11 @@ mod wasm {
         #[wasm_bindgen]
         pub async fn open(
             &mut self,
-            name: String,
+            name: &JsString,
             options: JsValue,
         ) -> std::result::Result<(), JsValue> {
             self.ensure_not_open()?;
+            let name = js_database_name(name)?;
             let open: WasmOpenOptions = parse_optional_options(options)?;
             let files = OpfsBackend::open_db(&name, open.config().create_if_missing)
                 .await
@@ -644,11 +664,12 @@ mod wasm {
         #[wasm_bindgen(js_name = openGeneration)]
         pub async fn open_generation(
             &mut self,
-            name: String,
+            name: &JsString,
             generation_name: String,
             options: JsValue,
         ) -> std::result::Result<(), JsValue> {
             self.ensure_not_open()?;
+            let name = js_database_name(name)?;
             let open: WasmOpenOptions = parse_optional_options(options)?;
             let files = OpfsBackend::open_generation(
                 &name,

@@ -117,7 +117,10 @@ export function bindSqlParameters(parsed: SqlParseResult, parameters: readonly u
             return value;
         }
         if (typeof value === 'number') {
-            if (!Number.isFinite(value) || (Number.isInteger(value) && !Number.isSafeInteger(value))) {
+            if (
+                !Number.isFinite(value) ||
+                (Number.isInteger(value) && !Number.isSafeInteger(value) && fitsSigned64(value))
+            ) {
                 throw new RangeError(
                     `SQL parameter ${index + 1} must be finite; use bigint for integers outside the safe range`
                 );
@@ -618,6 +621,14 @@ function tokenize(sql: string): Token[] {
     return tokens;
 }
 
+function fitsSigned64(value: number): boolean {
+    if (!Number.isInteger(value)) {
+        return false;
+    }
+    const integer = BigInt(value);
+    return integer >= SQL_INTEGER_MIN && integer <= SQL_INTEGER_MAX;
+}
+
 function parseNumber(text: string, position: number): number | bigint {
     if (/^[+-]?\d+$/u.test(text)) {
         const integer = BigInt(text);
@@ -629,7 +640,8 @@ function parseNumber(text: string, position: number): number | bigint {
             : integer;
     }
     const value = Number(text);
-    if (!Number.isFinite(value) || (Number.isInteger(value) && !Number.isSafeInteger(value))) {
+    // Magnitudes at or above 2^63 are finite REAL values and do not fit in INTEGER.
+    if (!Number.isFinite(value) || (Number.isInteger(value) && !Number.isSafeInteger(value) && fitsSigned64(value))) {
         throw new SqlSyntaxError('REAL literal must be finite; use integer notation for large integers', position);
     }
     const [mantissa, exponentText = '0'] = text.toLowerCase().split('e');

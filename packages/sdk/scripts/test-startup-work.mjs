@@ -187,6 +187,12 @@ const openRequest = (name, create = true) => ({
 });
 
 try {
+    const supportSource = await readFile(new URL('../tests/support.ts', import.meta.url), 'utf8');
+    assert.equal(supportSource.includes('probe.bin'), false, 'browser capability probes must not share one OPFS file');
+    assert.ok(
+        supportSource.includes('...launchOptions'),
+        'persistent contexts must use the project browser launch options'
+    );
     await mkdir(output, { recursive: true });
     for (const name of ['worker', 'worker-protocol', 'indexing', 'codec', 'errors', 'internal', 'compression']) {
         const input = await readFile(join(source, `${name}.ts`), 'utf8');

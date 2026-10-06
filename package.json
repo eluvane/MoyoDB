@@ -1,6 +1,6 @@
 {
   "name": "moyodb-repo",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "private": true,
   "description": "Repository-level quality gates for the MoyoDB mixed TypeScript/Rust/Lean workspace.",
   "license": "SEE LICENSE IN LICENSE",
@@ -47,7 +47,7 @@
     "security:gitleaks": "gitleaks detect --no-git --source . --config .config/moyo/security/gitleaks.toml --redact --verbose",
     "security:semgrep": "semgrep scan --config .config/moyo/security/semgrep.yml --error --no-git-ignore .",
     "test": "npm run test:tooling && npm run test:rust && npm run test:shim && npm run test:sdk",
-    "test:tooling": "node --test --test-isolation=none .config/moyo/quality/tooling-tests.mjs .config/moyo/quality/eslint-rules-tests.mjs",
+    "test:tooling": "node --test --test-isolation=none .config/moyo/quality/tooling-tests.mjs .config/moyo/quality/eslint-rules-tests.mjs scripts/benchmark/governance-checks.mjs",
     "test:rust": "cargo test --workspace --all-targets",
     "test:btree-proof": "node .config/moyo/quality/check-btree-pages.mjs",
     "test:shim": "node --test crates/engine/js/opfs_shim.test.mjs",

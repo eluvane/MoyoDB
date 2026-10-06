@@ -719,6 +719,12 @@ function normalizeDatabaseName(value: unknown, method: 'openDB' | 'deleteDB' | '
     if (typeof value !== 'string' || value.length === 0) {
         throw new TypeError(`${method}() database name must be a non-empty string`);
     }
+    if (/[\uD800-\uDFFF]/u.test(value)) {
+        throw new TypeError(`${method}() database name must contain valid Unicode`);
+    }
+    if (new TextEncoder().encode(value).length > 127) {
+        throw new TypeError(`${method}() database name must contain at most 127 UTF-8 bytes`);
+    }
     return value;
 }
 type ErrorFactory = (message: string) => Error;

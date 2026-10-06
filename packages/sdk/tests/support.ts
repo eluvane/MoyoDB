@@ -8,7 +8,7 @@ export interface PersistentContextFactory {
 export const persistentContextTest = test.extend<{
     persistentContextFactory: PersistentContextFactory;
 }>({
-    persistentContextFactory: async ({ browserName, playwright }, use, testInfo) => {
+    persistentContextFactory: async ({ browserName, playwright, launchOptions, headless, channel }, use, testInfo) => {
         const userDataDir = testInfo.outputPath(`persistent-user-data-${browserName}`);
         const contexts = new Set<BrowserContext>();
         const baseURL =
@@ -24,7 +24,12 @@ export const persistentContextTest = test.extend<{
         const factory: PersistentContextFactory = {
             userDataDir,
             async launch() {
-                const context = await browserType.launchPersistentContext(userDataDir, { baseURL });
+                const context = await browserType.launchPersistentContext(userDataDir, {
+                    ...launchOptions,
+                    headless,
+                    channel,
+                    baseURL
+                });
                 contexts.add(context);
                 context.on('close', () => contexts.delete(context));
                 return context;
@@ -39,15 +44,19 @@ export const persistentContextTest = test.extend<{
 });
 
 export async function requireMoyoDbCapabilities(page: Page) {
-    const capabilities = await page.evaluate(async () => {
+    // Sync access handles are exclusive. Parallel pages in one profile must not share a file,
+    // or a lock error is reported as a missing browser primitive and the test skips.
+    const probeFile = `${uniqueDbName('moyodb-support')}.bin`;
+    const capabilities = await page.evaluate(async (probeFile) => {
         async function hasSyncAccessHandle(): Promise<boolean> {
             try {
                 const source = `
-self.onmessage = async () => {
+self.onmessage = async (event) => {
+  const fileName = String(event.data);
   try {
     const root = await navigator.storage.getDirectory();
     const dir = await root.getDirectoryHandle('__moyodb_support__', { create: true });
-    const file = await dir.getFileHandle('probe.bin', { create: true });
+    const file = await dir.getFileHandle(fileName, { create: true });
     if (typeof file.createSyncAccessHandle !== 'function') {
       self.postMessage(false);
       return;
@@ -72,7 +81,7 @@ self.onmessage = async () => {
                             clearTimeout(timeout);
                             resolve(false);
                         };
-                        worker.postMessage(null);
+                        worker.postMessage(probeFile);
                     });
                 } finally {
                     worker.terminate();
@@ -93,20 +102,20 @@ self.onmessage = async () => {
         };
         if (result.getDirectory) {
             result.syncHandle = await hasSyncAccessHandle();
+            try {
+                const root = await navigator.storage.getDirectory();
+                const dir = await root.getDirectoryHandle('__moyodb_support__');
+                await dir.removeEntry(probeFile);
+            } catch {
+                // A leftover unique file must not change the capability result.
+            }
         }
         return result;
-    });
-    test.skip(
-        !(
-            capabilities.secure &&
-            capabilities.storage &&
-            capabilities.getDirectory &&
-            capabilities.locks &&
-            capabilities.broadcast &&
-            capabilities.syncHandle
-        ),
-        'browser lacks required MoyoDB primitives'
-    );
+    }, probeFile);
+    const missing = Object.entries(capabilities)
+        .filter(([, present]) => !present)
+        .map(([name]) => name);
+    test.skip(missing.length > 0, `browser lacks required MoyoDB primitives: ${missing.join(', ')}`);
 }
 
 export function uniqueDbName(prefix: string): string {

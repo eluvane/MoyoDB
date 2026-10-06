@@ -1,6 +1,6 @@
 use crate::error::{EngineError, Result};
 use crate::layout::{page_offset, PAGE_SIZE};
-use crate::page::verify_page_image;
+use crate::page::{validate_tree_page, verify_page_image};
 use crate::storage::backend::FileBackend;
 use std::collections::{HashMap, VecDeque};
 
@@ -18,8 +18,8 @@ struct CacheEntry {
     dirty: bool,
 }
 
-// Main-file reads are verified once. Image-write callers must supply valid bytes,
-// because cached images bypass checksum verification.
+// Main-file reads are verified once: checksum plus cell structure. Image-write
+// callers must supply valid bytes, because cached images bypass both checks.
 #[derive(Debug)]
 pub struct Pager<B: FileBackend> {
     main: B,
@@ -86,7 +86,8 @@ impl<B: FileBackend> Pager<B> {
                 )));
             }
             let bytes = self.main.read_at(page_offset(page_id), PAGE_SIZE)?;
-            verify_page_image(&bytes, page_id)?;
+            let header = verify_page_image(&bytes, page_id)?;
+            validate_tree_page(&bytes, &header)?;
             self.insert_cache(page_id, bytes, false);
         } else {
             self.touch(page_id);

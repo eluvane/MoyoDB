@@ -137,7 +137,7 @@ function installEnvironment(exposeWorkerApi, protocol) {
                 },
                 begin: async (mode) => {
                     if (mode === 'readwrite' && [...this.transactions.values()].some((tx) => tx.mode === mode)) {
-                        throw namedError('WriteTransactionBusyError');
+                        throw namedError('WriteTransactionAlreadyOpenError');
                     }
                     const id = this.nextTx++;
                     this.transactions.set(id, {
@@ -381,6 +381,13 @@ try {
         assert.equal(deleted.status, 'fulfilled');
         await assert.rejects(opened.value.listStores(), { name: 'DatabaseClosedError' });
         assert.equal(env.workers.size, 0);
+    });
+    test('overlapping writers surface WriteTransactionAlreadyOpenError', async () => {
+        const db = await open('two-writers');
+        const writer = await db.begin('readwrite');
+        await assert.rejects(db.begin('readwrite'), { name: 'WriteTransactionAlreadyOpenError' });
+        await writer.rollback();
+        await db.close();
     });
     test('opening another handle cannot bypass an in-progress migration', async () => {
         const entered = deferred();

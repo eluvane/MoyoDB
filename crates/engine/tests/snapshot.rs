@@ -3,7 +3,10 @@ mod common;
 use moyodb_engine::bytes::write_u32_le;
 use moyodb_engine::checksum::checksum_with_zeroed_region;
 use moyodb_engine::engine::TxMode;
-use moyodb_engine::snapshot::{SNAPSHOT_CHECKSUM_OFFSET, SNAPSHOT_HEADER_SIZE, SNAPSHOT_VERSION};
+use moyodb_engine::snapshot::{
+    encode_snapshot, SnapshotContents, SnapshotEntry, SnapshotStore, SNAPSHOT_BODY_PREFIX_SIZE,
+    SNAPSHOT_CHECKSUM_OFFSET, SNAPSHOT_HEADER_SIZE, SNAPSHOT_STORE_HEADER_SIZE, SNAPSHOT_VERSION,
+};
 use moyodb_engine::EngineError;
 
 fn seed_source(engine: &mut moyodb_engine::engine::Engine<moyodb_engine::MemoryBackend>) {
@@ -133,6 +136,61 @@ fn snapshot_version_mismatch_is_rejected() {
     let err = target.get(ro, "alpha", b"a").unwrap_err();
     assert!(matches!(err, EngineError::StoreNotFound(_)));
     target.rollback_tx(ro).unwrap();
+}
+
+fn reseal_snapshot(bytes: &mut [u8]) {
+    let checksum = checksum_with_zeroed_region(bytes, SNAPSHOT_CHECKSUM_OFFSET, 4);
+    write_u32_le(bytes, SNAPSHOT_CHECKSUM_OFFSET, checksum).unwrap();
+}
+
+#[test]
+fn unknown_snapshot_flags_fail_before_import() {
+    let encoded = encode_snapshot(&SnapshotContents {
+        source_last_committed_txid: 1,
+        schema_version: 3,
+        stores: vec![SnapshotStore {
+            name: "kv".into(),
+            flags: 0,
+            entries: vec![SnapshotEntry {
+                key: b"a".to_vec(),
+                value: b"b".to_vec(),
+                expires_at_ms: None,
+            }],
+        }],
+    })
+    .unwrap();
+    let entry = SNAPSHOT_HEADER_SIZE + SNAPSHOT_BODY_PREFIX_SIZE + SNAPSHOT_STORE_HEADER_SIZE + 2;
+    let patches = [
+        (12usize, 1u8, "unsupported snapshot header flags"),
+        (28, 1, "unsupported snapshot header flags"),
+        (
+            SNAPSHOT_HEADER_SIZE + 20,
+            1,
+            "unsupported snapshot directory flags",
+        ),
+        (entry + 2, 2, "unsupported snapshot entry flags"),
+    ];
+
+    for (offset, byte, message) in patches {
+        let mut snapshot = encoded.clone();
+        snapshot[offset] = byte;
+        reseal_snapshot(&mut snapshot);
+
+        let (_target_bundle, mut target) =
+            common::open_memory_engine("snapshot-target-unknown-flags");
+        seed_target_with_old_state(&mut target);
+        let stats_before = target.stats().unwrap();
+        let err = target.import_snapshot(&snapshot).unwrap_err();
+        assert_eq!(err.code(), "CorruptionError");
+        assert!(err.to_string().contains(message), "{err}");
+        assert_eq!(
+            target.stats().unwrap().last_committed_txid,
+            stats_before.last_committed_txid
+        );
+        let ro = target.begin_tx(TxMode::Readonly).unwrap();
+        assert_eq!(target.get(ro, "junk", b"x").unwrap(), Some(b"old".to_vec()));
+        target.rollback_tx(ro).unwrap();
+    }
 }
 
 #[test]
