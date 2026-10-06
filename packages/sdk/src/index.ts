@@ -317,20 +317,17 @@ class DBImpl implements DB {
         }
     }
     async listStores(): Promise<string[]> {
-        this.#ensureOpen();
-        return callProxy(() => this.#entry.proxy.listStores());
+        return this.#call(() => this.#entry.proxy.listStores());
     }
     async listIndexes(): Promise<IndexDef[]> {
         this.#ensureOpen();
         return callProxy(() => this.#entry.proxy.getIndexes());
     }
     async getVersion(): Promise<number> {
-        this.#ensureOpen();
-        return callProxy(() => this.#entry.proxy.getVersion());
+        return this.#call(() => this.#entry.proxy.getVersion());
     }
     async changesSince(txid: TxId, options: ChangeFeedOptions = {}): Promise<ChangeFeed> {
-        this.#ensureOpen();
-        return callProxy(() =>
+        return this.#call(() =>
             this.#entry.proxy.changesSince(normalizeTxId(txid), normalizeChangeFeedOptions(options))
         );
     }
@@ -448,54 +445,40 @@ class DBImpl implements DB {
         return callProxy(() => this.#entry.proxy.autocommit(mode, command, args));
     }
     async exportSnapshot(options: ExportSnapshotOptions = {}): Promise<Uint8Array> {
-        this.#ensureOpen();
-        return callProxy(async () => {
+        return this.#call(async () => {
             const bytes = await this.#entry.proxy.exportSnapshot(normalizeExportSnapshotOptions(options));
             return bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
         });
     }
     async importSnapshot(data: Uint8Array): Promise<void> {
-        this.#ensureOpen();
-        invalidateTransactions(this.#entry);
-        return callProxy(() => {
+        return this.#callAfterTxInvalidation(() => {
             const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
             return this.#entry.proxy.importSnapshot(bytes);
         });
     }
     async reset(): Promise<void> {
-        this.#ensureOpen();
-        invalidateTransactions(this.#entry);
-        return callProxy(() => this.#entry.proxy.reset());
+        return this.#callAfterTxInvalidation(() => this.#entry.proxy.reset());
     }
     async compact(): Promise<CompactionResult> {
-        this.#ensureOpen();
-        invalidateTransactions(this.#entry);
-        return callProxy(() => this.#entry.proxy.compact());
+        return this.#callAfterTxInvalidation(() => this.#entry.proxy.compact());
     }
     async rebuild(): Promise<CompactionResult> {
-        this.#ensureOpen();
-        invalidateTransactions(this.#entry);
-        return callProxy(() => this.#entry.proxy.rebuild());
+        return this.#callAfterTxInvalidation(() => this.#entry.proxy.rebuild());
     }
     async stats() {
-        this.#ensureOpen();
-        return callProxy(() => this.#entry.proxy.stats());
+        return this.#call(() => this.#entry.proxy.stats());
     }
     async storageInfo(): Promise<StorageInfo> {
-        this.#ensureOpen();
-        return callProxy(() => this.#entry.proxy.storageInfo());
+        return this.#call(() => this.#entry.proxy.storageInfo());
     }
     async requestPersistence(): Promise<boolean> {
-        this.#ensureOpen();
-        return callProxy(() => this.#entry.proxy.requestPersistence());
+        return this.#call(() => this.#entry.proxy.requestPersistence());
     }
     async destroy(): Promise<void> {
-        this.#ensureOpen();
-        return callProxy(() => this.#entry.destroy?.() ?? destroyDbWorker(this.#entry));
+        return this.#call(() => this.#entry.destroy?.() ?? destroyDbWorker(this.#entry));
     }
     async setFailpoint(failpoint: DebugFailpoint): Promise<void> {
-        this.#ensureOpen();
-        return callProxy(() => this.#entry.proxy.setFailpoint(failpoint));
+        return this.#call(() => this.#entry.proxy.setFailpoint(failpoint));
     }
     subscribe(callback: DbSubscriptionCallback): Unsubscribe;
     subscribe(storeName: string, callback: DbSubscriptionCallback): Unsubscribe;
@@ -602,6 +585,15 @@ class DBImpl implements DB {
         this.#disposeRegistrySubscriptions();
         this.#forceCloseTransactions();
         this.#subscriptions.close();
+    }
+    #call<T>(run: () => Promise<T>): Promise<T> {
+        this.#ensureOpen();
+        return callProxy(run);
+    }
+    #callAfterTxInvalidation<T>(run: () => Promise<T>): Promise<T> {
+        this.#ensureOpen();
+        invalidateTransactions(this.#entry);
+        return callProxy(run);
     }
     #ensureOpen() {
         if (this.#closed || this.#entry.invalidated) {

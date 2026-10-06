@@ -30,23 +30,27 @@ fn leaf_image(page_id: u64, marker: u8) -> Vec<u8> {
     .unwrap()
 }
 
+fn commit_record(
+    txid: u64,
+    new_catalog_root_page_id: u64,
+    new_next_page_id: u64,
+    changed_page_count: u32,
+) -> CommitRecord {
+    CommitRecord {
+        txid,
+        new_catalog_root_page_id,
+        new_next_page_id,
+        changed_page_count,
+    }
+}
+
 #[test]
 fn wal_append_scan_and_replay() {
     let mut wal = MemoryBackend::new();
     let mut offset = 0u64;
     let page = leaf_image(3, 7);
     append_page_image_record(&mut wal, &mut offset, 1, 3, &page).unwrap();
-    append_commit_record(
-        &mut wal,
-        &mut offset,
-        CommitRecord {
-            txid: 1,
-            new_catalog_root_page_id: 3,
-            new_next_page_id: 4,
-            changed_page_count: 1,
-        },
-    )
-    .unwrap();
+    append_commit_record(&mut wal, &mut offset, commit_record(1, 3, 4, 1)).unwrap();
     wal.flush().unwrap();
 
     let txs = scan_wal(&wal).unwrap();
@@ -71,12 +75,7 @@ fn wal_batch_append_matches_page_count() {
         &mut offset,
         7,
         &[(11, page)],
-        &CommitRecord {
-            txid: 7,
-            new_catalog_root_page_id: 11,
-            new_next_page_id: 12,
-            changed_page_count: 2,
-        },
+        &commit_record(7, 11, 12, 2),
     )
     .unwrap_err();
     assert_eq!(err.code(), "SerializationError");
@@ -88,17 +87,7 @@ fn wal_commit_with_mismatched_page_count_is_ignored() {
     let mut offset = 0u64;
     let page = leaf_image(3, 5);
     append_page_image_record(&mut wal, &mut offset, 1, 3, &page).unwrap();
-    append_commit_record(
-        &mut wal,
-        &mut offset,
-        CommitRecord {
-            txid: 1,
-            new_catalog_root_page_id: 3,
-            new_next_page_id: 4,
-            changed_page_count: 2,
-        },
-    )
-    .unwrap();
+    append_commit_record(&mut wal, &mut offset, commit_record(1, 3, 4, 2)).unwrap();
     wal.flush().unwrap();
 
     let txs = scan_wal(&wal).unwrap();
@@ -110,17 +99,7 @@ fn checksummed_garbage_page_image_is_corruption() {
     let mut wal = MemoryBackend::new();
     let mut offset = 0u64;
     append_page_image_record(&mut wal, &mut offset, 1, 3, &vec![7u8; PAGE_SIZE]).unwrap();
-    append_commit_record(
-        &mut wal,
-        &mut offset,
-        CommitRecord {
-            txid: 1,
-            new_catalog_root_page_id: 3,
-            new_next_page_id: 4,
-            changed_page_count: 1,
-        },
-    )
-    .unwrap();
+    append_commit_record(&mut wal, &mut offset, commit_record(1, 3, 4, 1)).unwrap();
 
     assert_eq!(scan_wal(&wal).unwrap_err().code(), "CorruptionError");
 }
@@ -130,17 +109,7 @@ fn page_image_beyond_next_page_id_is_corruption() {
     let mut wal = MemoryBackend::new();
     let mut offset = 0u64;
     append_page_image_record(&mut wal, &mut offset, 1, 9, &leaf_image(9, 1)).unwrap();
-    append_commit_record(
-        &mut wal,
-        &mut offset,
-        CommitRecord {
-            txid: 1,
-            new_catalog_root_page_id: 9,
-            new_next_page_id: 5,
-            changed_page_count: 1,
-        },
-    )
-    .unwrap();
+    append_commit_record(&mut wal, &mut offset, commit_record(1, 9, 5, 1)).unwrap();
 
     assert_eq!(scan_wal(&wal).unwrap_err().code(), "CorruptionError");
 }
@@ -150,17 +119,7 @@ fn page_image_with_foreign_page_id_is_corruption() {
     let mut wal = MemoryBackend::new();
     let mut offset = 0u64;
     append_page_image_record(&mut wal, &mut offset, 1, 3, &leaf_image(4, 1)).unwrap();
-    append_commit_record(
-        &mut wal,
-        &mut offset,
-        CommitRecord {
-            txid: 1,
-            new_catalog_root_page_id: 3,
-            new_next_page_id: 8,
-            changed_page_count: 1,
-        },
-    )
-    .unwrap();
+    append_commit_record(&mut wal, &mut offset, commit_record(1, 3, 8, 1)).unwrap();
 
     assert_eq!(scan_wal(&wal).unwrap_err().code(), "CorruptionError");
 }
@@ -184,12 +143,7 @@ fn non_increasing_txids_are_corruption() {
             &mut offset,
             5,
             &[(3, leaf_image(3, 1))],
-            &CommitRecord {
-                txid: 5,
-                new_catalog_root_page_id: 3,
-                new_next_page_id: 4,
-                changed_page_count: 1,
-            },
+            &commit_record(5, 3, 4, 1),
         )
         .unwrap();
     }
@@ -206,12 +160,7 @@ fn torn_tail_after_valid_commit_is_dropped() {
         &mut offset,
         1,
         &[(3, leaf_image(3, 1))],
-        &CommitRecord {
-            txid: 1,
-            new_catalog_root_page_id: 3,
-            new_next_page_id: 4,
-            changed_page_count: 1,
-        },
+        &commit_record(1, 3, 4, 1),
     )
     .unwrap();
     let mut second = MemoryBackend::new();
@@ -221,12 +170,7 @@ fn torn_tail_after_valid_commit_is_dropped() {
         &mut second_offset,
         2,
         &[(3, leaf_image(3, 2))],
-        &CommitRecord {
-            txid: 2,
-            new_catalog_root_page_id: 3,
-            new_next_page_id: 4,
-            changed_page_count: 1,
-        },
+        &commit_record(2, 3, 4, 1),
     )
     .unwrap();
     let torn = second.read_at(0, second_offset as usize - 7).unwrap();

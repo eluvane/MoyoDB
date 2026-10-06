@@ -67,6 +67,16 @@ pub fn write_u64_le(dst: &mut [u8], offset: usize, value: u64) -> Result<()> {
     Ok(())
 }
 
+#[inline]
+pub(crate) fn try_u16_len(len: usize, what: &str) -> Result<u16> {
+    u16::try_from(len).map_err(|_| EngineError::Serialization(format!("{what}: {len}")))
+}
+
+#[inline]
+pub(crate) fn try_u32_len(len: usize, what: &str) -> Result<u32> {
+    u32::try_from(len).map_err(|_| EngineError::Serialization(format!("{what}: {len}")))
+}
+
 pub fn compare_keys(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     a.cmp(b)
 }

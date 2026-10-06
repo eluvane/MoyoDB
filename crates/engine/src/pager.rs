@@ -67,6 +67,17 @@ pub struct Pager<B: FileBackend> {
     lru_entries_examined: usize,
 }
 
+#[inline]
+fn require_page_image_size(len: usize) -> Result<()> {
+    if len != PAGE_SIZE {
+        return Err(EngineError::Serialization(format!(
+            "page image wrong size: {}",
+            len
+        )));
+    }
+    Ok(())
+}
+
 impl<B: FileBackend> Pager<B> {
     pub fn new(main: B, cache_pages: usize) -> Self {
         Self {
@@ -142,12 +153,7 @@ impl<B: FileBackend> Pager<B> {
     }
 
     pub fn write_page_image(&mut self, page_id: u64, bytes: &[u8]) -> Result<()> {
-        if bytes.len() != PAGE_SIZE {
-            return Err(EngineError::Serialization(format!(
-                "page image wrong size: {}",
-                bytes.len()
-            )));
-        }
+        require_page_image_size(bytes.len())?;
         self.main.write_at(page_offset(page_id), bytes)?;
         self.store_cached_page(page_id, bytes.to_vec(), false);
         Ok(())
@@ -222,12 +228,7 @@ impl<B: FileBackend> Pager<B> {
             ));
         }
         for (_, bytes) in images.iter() {
-            if bytes.len() != PAGE_SIZE {
-                return Err(EngineError::Serialization(format!(
-                    "page image wrong size: {}",
-                    bytes.len()
-                )));
-            }
+            require_page_image_size(bytes.len())?;
         }
         let offset = page_offset(images[0].0);
         if images.len() == 1 {
@@ -251,12 +252,7 @@ impl<B: FileBackend> Pager<B> {
         if page_id == 0 {
             return Err(EngineError::Corruption("page id 0 is invalid".into()));
         }
-        if bytes.len() != PAGE_SIZE {
-            return Err(EngineError::Serialization(format!(
-                "page image wrong size: {}",
-                bytes.len()
-            )));
-        }
+        require_page_image_size(bytes.len())?;
         self.store_cached_page(page_id, bytes, true);
         Ok(())
     }

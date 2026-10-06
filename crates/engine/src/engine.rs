@@ -663,6 +663,32 @@ impl<B: FileBackend> Engine<B> {
         })
     }
 
+    /// Next superblock image. Callers still choose when to write it.
+    /// Generation overflow stays `Internal`; recovery uses `Corruption`.
+    #[inline]
+    fn next_published_superblock(
+        current: &SuperblockState,
+        catalog_root_page_id: u64,
+        next_page_id: u64,
+        last_committed_txid: u64,
+        last_replayed_wal_offset: u64,
+    ) -> Result<SuperblockState> {
+        let generation = current
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| EngineError::Internal("superblock generation overflow".into()))?;
+        Ok(SuperblockState {
+            generation,
+            db_id: current.db_id,
+            page_size: current.page_size,
+            catalog_root_page_id,
+            next_page_id,
+            last_committed_txid,
+            last_replayed_wal_offset,
+            active_slot: if current.active_slot == 0 { 1 } else { 0 },
+        })
+    }
+
     fn checkpoint_inner(&mut self, known_wal_len: Option<u64>) -> Result<()> {
         self.promote_free_pages();
         if !self.pager.has_dirty() && self.checkpoint_txid == self.superblock.last_committed_txid {
@@ -685,25 +711,13 @@ impl<B: FileBackend> Engine<B> {
             Some(len) => len,
             None => self.wal.len()?,
         };
-        let generation = self
-            .superblock
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| EngineError::Internal("superblock generation overflow".into()))?;
-        let published = SuperblockState {
-            generation,
-            db_id: self.superblock.db_id,
-            page_size: self.superblock.page_size,
-            catalog_root_page_id: self.superblock.catalog_root_page_id,
-            next_page_id: self.superblock.next_page_id,
-            last_committed_txid: self.superblock.last_committed_txid,
-            last_replayed_wal_offset: wal_len,
-            active_slot: if self.superblock.active_slot == 0 {
-                1
-            } else {
-                0
-            },
-        };
+        let published = Self::next_published_superblock(
+            &self.superblock,
+            self.superblock.catalog_root_page_id,
+            self.superblock.next_page_id,
+            self.superblock.last_committed_txid,
+            wal_len,
+        )?;
         write_superblock(&mut self.manifest, &published)?;
         self.superblock.generation = published.generation;
         self.superblock.active_slot = published.active_slot;
@@ -906,15 +920,15 @@ impl<B: FileBackend> Engine<B> {
         let now_ms = now_unix_ms()?;
         let mut tx = self.take_tx(tx_id)?;
         let result = match &mut tx.inner {
-            TxInner::Readonly(readonly) => match readonly.snapshot.catalog.get(store) {
-                Some(meta) => get_committed_visible(
+            TxInner::Readonly(readonly) => match store_meta(&readonly.snapshot.catalog, store) {
+                Ok(meta) => get_committed_visible(
                     &mut self.pager,
                     meta.store_root_page_id,
                     meta.flags,
                     key,
                     now_ms,
                 ),
-                None => Err(EngineError::StoreNotFound(store.into())),
+                Err(error) => Err(error),
             },
             TxInner::Readwrite(rw) => get_with_staged(&mut self.pager, rw, store, key, now_ms),
         };
@@ -929,15 +943,15 @@ impl<B: FileBackend> Engine<B> {
         let now_ms = now_unix_ms()?;
         let mut tx = self.take_tx(tx_id)?;
         let result = match &mut tx.inner {
-            TxInner::Readonly(readonly) => match readonly.snapshot.catalog.get(store) {
-                Some(meta) => exists_committed_visible(
+            TxInner::Readonly(readonly) => match store_meta(&readonly.snapshot.catalog, store) {
+                Ok(meta) => exists_committed_visible(
                     &mut self.pager,
                     meta.store_root_page_id,
                     meta.flags,
                     key,
                     now_ms,
                 ),
-                None => Err(EngineError::StoreNotFound(store.into())),
+                Err(error) => Err(error),
             },
             TxInner::Readwrite(rw) => exists_with_staged(&mut self.pager, rw, store, key, now_ms),
         };
@@ -964,11 +978,7 @@ impl<B: FileBackend> Engine<B> {
         let mut batch = PointReadBatch::default();
         let result = (|| match &mut tx.inner {
             TxInner::Readonly(readonly) => {
-                let meta = readonly
-                    .snapshot
-                    .catalog
-                    .get(store)
-                    .ok_or_else(|| EngineError::StoreNotFound(store.into()))?;
+                let meta = store_meta(&readonly.snapshot.catalog, store)?;
                 read_many_in_order(keys, &order, |key| {
                     exists_committed_visible_in_batch(
                         &mut self.pager,
@@ -1024,11 +1034,7 @@ impl<B: FileBackend> Engine<B> {
         let mut batch = PointReadBatch::default();
         let result = (|| match &mut tx.inner {
             TxInner::Readonly(readonly) => {
-                let meta = readonly
-                    .snapshot
-                    .catalog
-                    .get(store)
-                    .ok_or_else(|| EngineError::StoreNotFound(store.into()))?;
+                let meta = store_meta(&readonly.snapshot.catalog, store)?;
                 read_many_in_order(keys, &order, |key| {
                     get_committed_visible_in_batch(
                         &mut self.pager,
@@ -1610,15 +1616,8 @@ impl<B: FileBackend> Engine<B> {
         store: &str,
         keys: &[K],
     ) -> BatchExecutionReport<bool> {
-        if let Err(error) = validate_user_store_name(store) {
-            return BatchExecutionReport::failure(Vec::new(), error);
-        }
-        let operation_now_ms = match now_unix_ms() {
-            Ok(now_ms) => now_ms,
-            Err(error) => return BatchExecutionReport::failure(Vec::new(), error),
-        };
-        let mut tx = match self.take_visible_readwrite_tx(tx_id, store) {
-            Ok(tx) => tx,
+        let (operation_now_ms, mut tx) = match self.begin_visible_batch(tx_id, store) {
+            Ok(ready) => ready,
             Err(error) => return BatchExecutionReport::failure(Vec::new(), error),
         };
 
@@ -1665,15 +1664,8 @@ impl<B: FileBackend> Engine<B> {
         store: &str,
         ops: &[BatchOpRef<'_>],
     ) -> BatchExecutionReport<BatchOpOutcome> {
-        if let Err(error) = validate_user_store_name(store) {
-            return BatchExecutionReport::failure(Vec::new(), error);
-        }
-        let operation_now_ms = match now_unix_ms() {
-            Ok(now_ms) => now_ms,
-            Err(error) => return BatchExecutionReport::failure(Vec::new(), error),
-        };
-        let mut tx = match self.take_visible_readwrite_tx(tx_id, store) {
-            Ok(tx) => tx,
+        let (operation_now_ms, mut tx) = match self.begin_visible_batch(tx_id, store) {
+            Ok(ready) => ready,
             Err(error) => return BatchExecutionReport::failure(Vec::new(), error),
         };
 
@@ -1729,15 +1721,15 @@ impl<B: FileBackend> Engine<B> {
         let now_ms = now_unix_ms()?;
         let mut tx = self.take_tx(tx_id)?;
         let result = match &mut tx.inner {
-            TxInner::Readonly(readonly) => match readonly.snapshot.catalog.get(store) {
-                Some(meta) => scan_committed_visible(
+            TxInner::Readonly(readonly) => match store_meta(&readonly.snapshot.catalog, store) {
+                Ok(meta) => scan_committed_visible(
                     &mut self.pager,
                     meta.store_root_page_id,
                     meta.flags,
                     range,
                     now_ms,
                 ),
-                None => Err(EngineError::StoreNotFound(store.into())),
+                Err(error) => Err(error),
             },
             TxInner::Readwrite(rw) => scan_with_staged(&mut self.pager, rw, store, range, now_ms),
         };
@@ -2262,25 +2254,13 @@ impl<B: FileBackend> Engine<B> {
         // Flush tree pages and pending payload bodies before manifest publication.
         target.pager.flush()?;
 
-        let generation = target
-            .superblock
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| EngineError::Internal("superblock generation overflow".into()))?;
-        let published = SuperblockState {
-            generation,
-            db_id: target.superblock.db_id,
-            page_size: target.superblock.page_size,
-            catalog_root_page_id: catalog.root_page_id,
-            next_page_id: alloc.next_page_id(),
-            last_committed_txid: new_txid,
-            last_replayed_wal_offset: 0,
-            active_slot: if target.superblock.active_slot == 0 {
-                1
-            } else {
-                0
-            },
-        };
+        let published = Self::next_published_superblock(
+            &target.superblock,
+            catalog.root_page_id,
+            alloc.next_page_id(),
+            new_txid,
+            0,
+        )?;
         write_superblock(&mut target.manifest, &published)?;
         target.pager.set_page_limit(published.next_page_id);
         target.install_loaded(LoadedState {
@@ -2575,6 +2555,16 @@ impl<B: FileBackend> Engine<B> {
             return Err(error);
         }
         Ok(tx)
+    }
+
+    /// Store check, one clock read, then the visible writer. TTL expiry stays
+    /// outside this helper: `put_many` must reject overflow before taking the tx.
+    #[inline]
+    fn begin_visible_batch(&mut self, tx_id: u64, store: &str) -> Result<(u64, TransactionState)> {
+        validate_user_store_name(store)?;
+        let now_ms = now_unix_ms()?;
+        let tx = self.take_visible_readwrite_tx(tx_id, store)?;
+        Ok((now_ms, tx))
     }
 
     fn batch_failure<T>(
@@ -3220,12 +3210,7 @@ fn ensure_stage_for_write<'a>(rw: &'a mut ReadwriteTx, store: &str) -> Result<&'
     match rw.stores.entry(store.to_string()) {
         Entry::Occupied(entry) => Ok(entry.into_mut()),
         Entry::Vacant(vacant) => {
-            let base_meta = rw
-                .snapshot
-                .catalog
-                .get(store)
-                .cloned()
-                .ok_or_else(|| EngineError::StoreNotFound(store.into()))?;
+            let base_meta = store_meta(&rw.snapshot.catalog, store)?.clone();
             Ok(vacant.insert(StagedStore::existing(base_meta)))
         }
     }
@@ -3334,6 +3319,13 @@ fn read_many_in_order<K: AsRef<[u8]>, V: Clone + Default>(
     Ok(values)
 }
 
+#[inline]
+fn store_meta<'a>(catalog: &'a CatalogMap, store: &str) -> Result<&'a StoreMetadata> {
+    catalog
+        .get(store)
+        .ok_or_else(|| EngineError::StoreNotFound(store.into()))
+}
+
 fn get_committed_visible<B: FileBackend>(
     pager: &mut Pager<B>,
     root_page_id: u64,
@@ -3417,12 +3409,9 @@ fn staged_lookup<'a>(rw: &'a ReadwriteTx, store: &str, key: &[u8]) -> Result<Sta
             None => StagedLookup::Absent,
         });
     }
-    rw.snapshot
-        .catalog
-        .get(store)
-        .cloned()
-        .map(StagedLookup::Committed)
-        .ok_or_else(|| EngineError::StoreNotFound(store.into()))
+    Ok(StagedLookup::Committed(
+        store_meta(&rw.snapshot.catalog, store)?.clone(),
+    ))
 }
 
 fn stored_value_state_with_staged<B: FileBackend>(
@@ -3895,16 +3884,7 @@ fn visit_with_staged<B: FileBackend>(
             };
             (base, Some(stage))
         }
-        None => (
-            Some(
-                rw.snapshot
-                    .catalog
-                    .get(store)
-                    .cloned()
-                    .ok_or_else(|| EngineError::StoreNotFound(store.into()))?,
-            ),
-            None,
-        ),
+        None => (Some(store_meta(&rw.snapshot.catalog, store)?.clone()), None),
     };
 
     let limit = range.limit.unwrap_or(usize::MAX);

@@ -29,7 +29,14 @@ try {
             result.outputText.replace(/from '(\.[^']+)'/g, "from '$1.mjs'")
         );
     }
-    for (const name of ['workloads', 'report', 'bench-runner', 'moyodb-baseline', 'indexeddb-baseline']) {
+    for (const name of [
+        'workloads',
+        'report',
+        'bench-runner',
+        'moyodb-baseline',
+        'indexeddb-baseline',
+        'sync-access-handle'
+    ]) {
         const source = await readFile(join(here, `../bench/${name}.ts`), 'utf8');
         const result = ts.transpileModule(source, {
             fileName: `${name}.ts`,

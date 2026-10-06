@@ -1,21 +1,41 @@
 mod common;
 
 use moyodb_engine::engine::{Engine, Failpoint, OpenConfig, TxMode};
-use moyodb_engine::storage::memory::MemoryBundle;
+use moyodb_engine::storage::memory::{MemoryBackend, MemoryBundle};
+
+fn seed_kv(engine: &mut Engine<MemoryBackend>, key: &[u8], value: &[u8]) {
+    let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
+    engine.create_store(tx, "kv").unwrap();
+    engine.put(tx, "kv", key, value).unwrap();
+    engine.commit_tx(tx).unwrap();
+}
+
+fn commit_fails(
+    engine: &mut Engine<MemoryBackend>,
+    failpoint: Failpoint,
+    key: &[u8],
+    value: &[u8],
+) {
+    engine.set_failpoint(Some(failpoint));
+    let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
+    engine.put(tx, "kv", key, value).unwrap();
+    let err = engine.commit_tx(tx).unwrap_err();
+    assert_eq!(err.code(), "InjectedFailureError");
+}
+
+fn recovered_value(name: &str, bundle: &MemoryBundle, key: &[u8]) -> Option<Vec<u8>> {
+    let mut reopened = common::reopen_memory_engine(name, bundle);
+    let ro = reopened.begin_tx(TxMode::Readonly).unwrap();
+    let value = reopened.get(ro, "kv", key).unwrap();
+    reopened.rollback_tx(ro).unwrap();
+    value
+}
 
 #[test]
 fn recovery_replays_committed_wal_after_after_wal_flush_failpoint() {
     let (bundle, mut engine) = common::open_memory_engine("recovery-a");
-    let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
-    engine.create_store(tx, "kv").unwrap();
-    engine.put(tx, "kv", b"a", b"1").unwrap();
-    engine.commit_tx(tx).unwrap();
-
-    engine.set_failpoint(Some(Failpoint::AfterWalFlush));
-    let tx2 = engine.begin_tx(TxMode::Readwrite).unwrap();
-    engine.put(tx2, "kv", b"b", b"2").unwrap();
-    let err = engine.commit_tx(tx2).unwrap_err();
-    assert_eq!(err.code(), "InjectedFailureError");
+    seed_kv(&mut engine, b"a", b"1");
+    commit_fails(&mut engine, Failpoint::AfterWalFlush, b"b", b"2");
 
     drop(engine);
     let mut reopened = common::reopen_memory_engine("recovery-a", &bundle);
@@ -30,61 +50,40 @@ fn recovery_replays_committed_wal_after_after_wal_flush_failpoint() {
 #[test]
 fn recovery_replays_committed_wal_before_superblock_flush_failpoint() {
     let (bundle, mut engine) = common::open_memory_engine("recovery-before-superblock");
-    let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
-    engine.create_store(tx, "kv").unwrap();
-    engine.put(tx, "kv", b"base", b"ok").unwrap();
-    engine.commit_tx(tx).unwrap();
-
-    engine.set_failpoint(Some(Failpoint::BeforeSuperblockFlush));
-    let tx2 = engine.begin_tx(TxMode::Readwrite).unwrap();
-    engine.put(tx2, "kv", b"after", b"yes").unwrap();
-    let err = engine.commit_tx(tx2).unwrap_err();
-    assert_eq!(err.code(), "InjectedFailureError");
+    seed_kv(&mut engine, b"base", b"ok");
+    commit_fails(
+        &mut engine,
+        Failpoint::BeforeSuperblockFlush,
+        b"after",
+        b"yes",
+    );
 
     drop(engine);
-    let mut reopened = common::reopen_memory_engine("recovery-before-superblock", &bundle);
-    let ro = reopened.begin_tx(TxMode::Readonly).unwrap();
-    let after = reopened.get(ro, "kv", b"after").unwrap();
-    reopened.rollback_tx(ro).unwrap();
-    assert_eq!(after, Some(b"yes".to_vec()));
+    assert_eq!(
+        recovered_value("recovery-before-superblock", &bundle, b"after"),
+        Some(b"yes".to_vec())
+    );
 }
 
 #[test]
 fn latest_wal_durable_commit_wins_across_repeated_failpoints() {
     let (bundle, mut engine) = common::open_memory_engine("recovery-repeated-failpoints");
-    let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
-    engine.create_store(tx, "kv").unwrap();
-    engine.put(tx, "kv", b"base", b"ok").unwrap();
-    engine.commit_tx(tx).unwrap();
-
-    engine.set_failpoint(Some(Failpoint::AfterWalFlush));
-    let tx2 = engine.begin_tx(TxMode::Readwrite).unwrap();
-    engine.put(tx2, "kv", b"after", b"first").unwrap();
-    let err = engine.commit_tx(tx2).unwrap_err();
-    assert_eq!(err.code(), "InjectedFailureError");
+    seed_kv(&mut engine, b"base", b"ok");
+    commit_fails(&mut engine, Failpoint::AfterWalFlush, b"after", b"first");
     assert!(engine.recover().unwrap().pending_committed);
-
-    engine.set_failpoint(Some(Failpoint::AfterWalFlush));
-    let tx3 = engine.begin_tx(TxMode::Readwrite).unwrap();
-    engine.put(tx3, "kv", b"after", b"second").unwrap();
-    let err = engine.commit_tx(tx3).unwrap_err();
-    assert_eq!(err.code(), "InjectedFailureError");
+    commit_fails(&mut engine, Failpoint::AfterWalFlush, b"after", b"second");
 
     drop(engine);
-    let mut reopened = common::reopen_memory_engine("recovery-repeated-failpoints", &bundle);
-    let ro = reopened.begin_tx(TxMode::Readonly).unwrap();
-    let after = reopened.get(ro, "kv", b"after").unwrap();
-    reopened.rollback_tx(ro).unwrap();
-    assert_eq!(after, Some(b"second".to_vec()));
+    assert_eq!(
+        recovered_value("recovery-repeated-failpoints", &bundle, b"after"),
+        Some(b"second".to_vec())
+    );
 }
 
 #[test]
 fn incomplete_wal_tail_is_ignored() {
     let (bundle, mut engine) = common::open_memory_engine("recovery-b");
-    let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
-    engine.create_store(tx, "kv").unwrap();
-    engine.put(tx, "kv", b"a", b"1").unwrap();
-    engine.commit_tx(tx).unwrap();
+    seed_kv(&mut engine, b"a", b"1");
     drop(engine);
 
     let mut wal = bundle.wal.clone();
@@ -92,11 +91,10 @@ fn incomplete_wal_tail_is_ignored() {
     wal.write_at(offset, &[1, 2, 3, 4, 5, 6]).unwrap();
     wal.flush().unwrap();
 
-    let mut reopened = common::reopen_memory_engine("recovery-b", &bundle);
-    let tx = reopened.begin_tx(TxMode::Readonly).unwrap();
-    let a = reopened.get(tx, "kv", b"a").unwrap();
-    reopened.rollback_tx(tx).unwrap();
-    assert_eq!(a, Some(b"1".to_vec()));
+    assert_eq!(
+        recovered_value("recovery-b", &bundle, b"a"),
+        Some(b"1".to_vec())
+    );
 }
 
 #[test]
@@ -127,19 +125,15 @@ fn deferred_commits_survive_reopen_without_close() {
 #[test]
 fn close_checkpoints_wal_and_keeps_rows() {
     let (bundle, mut engine) = common::open_memory_engine("recovery-checkpoint-close");
-    let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
-    engine.create_store(tx, "kv").unwrap();
-    engine.put(tx, "kv", b"k", b"v").unwrap();
-    engine.commit_tx(tx).unwrap();
+    seed_kv(&mut engine, b"k", b"v");
     assert!(engine.stats().unwrap().wal_len > 0);
 
     engine.close().unwrap();
     assert!(bundle.wal.durable_snapshot().unwrap().is_empty());
-
-    let mut reopened = common::reopen_memory_engine("recovery-checkpoint-close", &bundle);
-    let ro = reopened.begin_tx(TxMode::Readonly).unwrap();
-    assert_eq!(reopened.get(ro, "kv", b"k").unwrap(), Some(b"v".to_vec()));
-    reopened.rollback_tx(ro).unwrap();
+    assert_eq!(
+        recovered_value("recovery-checkpoint-close", &bundle, b"k"),
+        Some(b"v".to_vec())
+    );
 }
 
 #[test]

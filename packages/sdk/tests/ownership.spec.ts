@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { requireMoyoDbCapabilities, uniqueDbName } from './support';
+import { openPairedPages, uniqueDbName } from './support';
 
 declare global {
     interface Window {
@@ -10,12 +10,7 @@ declare global {
 }
 test('second tab cannot acquire ownership while first owner is open', async ({ browser }) => {
     const dbName = uniqueDbName('ownership');
-    const context = await browser.newContext();
-    const page1 = await context.newPage();
-    const page2 = await context.newPage();
-    await page1.goto('/');
-    await page2.goto('/');
-    await requireMoyoDbCapabilities(page1);
+    const { first: page1, second: page2 } = await openPairedPages(browser);
     await page1.evaluate(async (name) => {
         const db = await window.moyodb.openDB(name);
         window.__heldDb = db;
@@ -49,12 +44,7 @@ test('second tab cannot acquire ownership while first owner is open', async ({ b
 });
 test('BroadcastChannel receives commit_applied event', async ({ browser }) => {
     const dbName = uniqueDbName('events');
-    const context = await browser.newContext();
-    const page1 = await context.newPage();
-    const page2 = await context.newPage();
-    await page1.goto('/');
-    await page2.goto('/');
-    await requireMoyoDbCapabilities(page1);
+    const { first: page1, second: page2 } = await openPairedPages(browser);
     const eventPromise = page2.evaluate((name) => {
         return new Promise((resolve) => {
             const channel = new BroadcastChannel(`db:${name}:events`);

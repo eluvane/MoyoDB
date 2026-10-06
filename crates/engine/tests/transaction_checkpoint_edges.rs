@@ -1,7 +1,16 @@
 use moyodb_engine::engine::{Engine, OpenConfig, TxMode};
 use moyodb_engine::error::Result;
 use moyodb_engine::recovery::select_superblock;
+use moyodb_engine::storage::backend::FileBackend;
 use moyodb_engine::storage::memory::MemoryBundle;
+
+fn assert_published_txid(manifest: &impl FileBackend, committed: u64) -> Result<()> {
+    assert_eq!(
+        select_superblock(manifest)?.unwrap().last_committed_txid,
+        committed
+    );
+    Ok(())
+}
 
 #[test]
 fn explicit_checkpoint_publishes_zero_page_commits() -> Result<()> {
@@ -15,12 +24,7 @@ fn explicit_checkpoint_publishes_zero_page_commits() -> Result<()> {
     engine.checkpoint()?;
     assert_eq!(engine.stats()?.wal_len, 0);
     let files = bundle.crash_recovered_files();
-    assert_eq!(
-        select_superblock(&files.manifest)?
-            .unwrap()
-            .last_committed_txid,
-        committed
-    );
+    assert_published_txid(&files.manifest, committed)?;
     let mut reopened = Engine::open("empty-checkpoint", files, OpenConfig::default())?;
     assert_eq!(reopened.stats()?.last_committed_txid, committed);
     Ok(())
@@ -45,12 +49,7 @@ fn wal_byte_threshold_bounds_zero_page_commits() -> Result<()> {
         assert_eq!(engine.stats()?.wal_len, 0);
     }
     let files = bundle.crash_recovered_files();
-    assert_eq!(
-        select_superblock(&files.manifest)?
-            .unwrap()
-            .last_committed_txid,
-        committed
-    );
+    assert_published_txid(&files.manifest, committed)?;
     Ok(())
 }
 
@@ -64,11 +63,6 @@ fn close_installs_zero_page_commits() -> Result<()> {
 
     let files = bundle.crash_recovered_files();
     assert_eq!(files.wal.len()?, 0);
-    assert_eq!(
-        select_superblock(&files.manifest)?
-            .unwrap()
-            .last_committed_txid,
-        committed
-    );
+    assert_published_txid(&files.manifest, committed)?;
     Ok(())
 }

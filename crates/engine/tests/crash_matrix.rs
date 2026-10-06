@@ -19,6 +19,17 @@ fn read_value(engine: &mut Engine<MemoryBackend>, key: &[u8]) -> Option<Vec<u8>>
     value
 }
 
+fn commit_fails_after_wal_flush(
+    engine: &mut Engine<MemoryBackend>,
+    mutate: impl FnOnce(&mut Engine<MemoryBackend>, u64),
+) {
+    engine.set_failpoint(Some(Failpoint::AfterWalFlush));
+    let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
+    mutate(engine, tx);
+    let err = engine.commit_tx(tx).unwrap_err();
+    assert_eq!(err.code(), "InjectedFailureError");
+}
+
 fn assert_kv_rows(engine: &mut Engine<MemoryBackend>, expected: &[(&[u8], &[u8])]) {
     let ro = engine.begin_tx(TxMode::Readonly).unwrap();
     let rows = common::scan_all(engine, ro, "kv");
@@ -51,11 +62,9 @@ fn crash_after_commit_before_checkpoint() {
     let (bundle, mut engine) = common::open_memory_engine("crash-after-commit-before-checkpoint");
     seed_kv(&mut engine);
 
-    engine.set_failpoint(Some(Failpoint::AfterWalFlush));
-    let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
-    engine.put(tx, "kv", b"dirty", b"committed-in-wal").unwrap();
-    let err = engine.commit_tx(tx).unwrap_err();
-    assert_eq!(err.code(), "InjectedFailureError");
+    commit_fails_after_wal_flush(&mut engine, |engine, tx| {
+        engine.put(tx, "kv", b"dirty", b"committed-in-wal").unwrap();
+    });
     drop(engine);
 
     let mut reopened =
@@ -87,13 +96,11 @@ fn corrupt_wal_checksum_stops_replay() {
     let (bundle, mut engine) = common::open_memory_engine("crash-corrupt-wal-checksum");
     seed_kv(&mut engine);
 
-    engine.set_failpoint(Some(Failpoint::AfterWalFlush));
-    let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
-    engine
-        .put(tx, "kv", b"after", b"should-not-replay")
-        .unwrap();
-    let err = engine.commit_tx(tx).unwrap_err();
-    assert_eq!(err.code(), "InjectedFailureError");
+    commit_fails_after_wal_flush(&mut engine, |engine, tx| {
+        engine
+            .put(tx, "kv", b"after", b"should-not-replay")
+            .unwrap();
+    });
     drop(engine);
 
     let mut wal = bundle.wal.clone();
@@ -119,11 +126,9 @@ fn multiple_commits_replay_in_order() {
         b"second".as_slice(),
         b"third".as_slice(),
     ] {
-        engine.set_failpoint(Some(Failpoint::AfterWalFlush));
-        let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
-        engine.put(tx, "kv", b"ordered", value).unwrap();
-        let err = engine.commit_tx(tx).unwrap_err();
-        assert_eq!(err.code(), "InjectedFailureError");
+        commit_fails_after_wal_flush(&mut engine, |engine, tx| {
+            engine.put(tx, "kv", b"ordered", value).unwrap();
+        });
         assert!(engine.needs_recovery());
         assert!(engine.recover().unwrap().pending_committed);
     }
@@ -141,11 +146,9 @@ fn recovery_is_idempotent() {
     let (bundle, mut engine) = common::open_memory_engine("crash-idempotent");
     seed_kv(&mut engine);
 
-    engine.set_failpoint(Some(Failpoint::AfterWalFlush));
-    let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
-    engine.put(tx, "kv", b"after", b"once").unwrap();
-    let err = engine.commit_tx(tx).unwrap_err();
-    assert_eq!(err.code(), "InjectedFailureError");
+    commit_fails_after_wal_flush(&mut engine, |engine, tx| {
+        engine.put(tx, "kv", b"after", b"once").unwrap();
+    });
     drop(engine);
 
     let mut reopened = common::reopen_memory_engine("crash-idempotent", &bundle);
@@ -164,11 +167,9 @@ fn committed_delete_survives_recovery() {
     let (bundle, mut engine) = common::open_memory_engine("crash-delete");
     seed_kv(&mut engine);
 
-    engine.set_failpoint(Some(Failpoint::AfterWalFlush));
-    let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
-    assert!(engine.delete(tx, "kv", b"base").unwrap());
-    let err = engine.commit_tx(tx).unwrap_err();
-    assert_eq!(err.code(), "InjectedFailureError");
+    commit_fails_after_wal_flush(&mut engine, |engine, tx| {
+        assert!(engine.delete(tx, "kv", b"base").unwrap());
+    });
     drop(engine);
 
     let mut reopened = common::reopen_memory_engine("crash-delete", &bundle);
@@ -180,11 +181,9 @@ fn store_drop_survives_recovery() {
     let (bundle, mut engine) = common::open_memory_engine("crash-drop-store");
     seed_kv(&mut engine);
 
-    engine.set_failpoint(Some(Failpoint::AfterWalFlush));
-    let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
-    engine.drop_store(tx, "kv").unwrap();
-    let err = engine.commit_tx(tx).unwrap_err();
-    assert_eq!(err.code(), "InjectedFailureError");
+    commit_fails_after_wal_flush(&mut engine, |engine, tx| {
+        engine.drop_store(tx, "kv").unwrap();
+    });
     drop(engine);
 
     let mut reopened = common::reopen_memory_engine("crash-drop-store", &bundle);
@@ -206,13 +205,11 @@ fn ttl_state_after_recovery() {
     engine.create_store(tx, "kv").unwrap();
     engine.commit_tx(tx).unwrap();
 
-    engine.set_failpoint(Some(Failpoint::AfterWalFlush));
-    let tx2 = engine.begin_tx(TxMode::Readwrite).unwrap();
-    engine
-        .put_with_ttl(tx2, "kv", b"live", b"kept", Some(3_600_000))
-        .unwrap();
-    let err = engine.commit_tx(tx2).unwrap_err();
-    assert_eq!(err.code(), "InjectedFailureError");
+    commit_fails_after_wal_flush(&mut engine, |engine, tx| {
+        engine
+            .put_with_ttl(tx, "kv", b"live", b"kept", Some(3_600_000))
+            .unwrap();
+    });
     drop(engine);
 
     let mut reopened = common::reopen_memory_engine("crash-ttl", &bundle);
@@ -225,11 +222,9 @@ fn large_value_overflow_recovery() {
     seed_kv(&mut engine);
     let large = vec![0xab; 64 * 1024];
 
-    engine.set_failpoint(Some(Failpoint::AfterWalFlush));
-    let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
-    engine.put(tx, "kv", b"large", &large).unwrap();
-    let err = engine.commit_tx(tx).unwrap_err();
-    assert_eq!(err.code(), "InjectedFailureError");
+    commit_fails_after_wal_flush(&mut engine, |engine, tx| {
+        engine.put(tx, "kv", b"large", &large).unwrap();
+    });
     drop(engine);
 
     let mut reopened = common::reopen_memory_engine("crash-large-value", &bundle);
@@ -244,11 +239,9 @@ fn clear_store_recovery() {
     engine.put(tx, "kv", b"another", b"value").unwrap();
     engine.commit_tx(tx).unwrap();
 
-    engine.set_failpoint(Some(Failpoint::AfterWalFlush));
-    let tx2 = engine.begin_tx(TxMode::Readwrite).unwrap();
-    engine.clear_store(tx2, "kv").unwrap();
-    let err = engine.commit_tx(tx2).unwrap_err();
-    assert_eq!(err.code(), "InjectedFailureError");
+    commit_fails_after_wal_flush(&mut engine, |engine, tx| {
+        engine.clear_store(tx, "kv").unwrap();
+    });
     drop(engine);
 
     let mut reopened = common::reopen_memory_engine("crash-clear-store", &bundle);

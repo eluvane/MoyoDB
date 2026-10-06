@@ -23,8 +23,13 @@ import {
     valueBytes,
     workloadPolicy,
     verificationKind,
-    writeVerificationIndices
+    writeVerificationIndices,
+    buildEntryBatches,
+    effectiveBatchSize,
+    requireValue,
+    shouldUseSingleTransactionPreload
 } from './workloads';
+import { hasSyncAccessHandle } from './sync-access-handle';
 
 type Entry = [Uint8Array, Uint8Array];
 
@@ -214,13 +219,16 @@ export const moyoDbBaseline: WorkloadRunner = {
             case 'point-read':
                 return assertChecksum(
                     'MoyoDB point read',
-                    valuesChecksum(requireValue(prepared.readValues, 'read values', ctx.dbName)),
-                    expectedValuesChecksum(ctx.workload, requireValue(prepared.readIndices, 'read indices', ctx.dbName))
+                    valuesChecksum(requireValue('MoyoDB', prepared.readValues, 'read values', ctx.dbName)),
+                    expectedValuesChecksum(
+                        ctx.workload,
+                        requireValue('MoyoDB', prepared.readIndices, 'read indices', ctx.dbName)
+                    )
                 );
             case 'scan':
                 return assertChecksum(
                     'MoyoDB scan',
-                    rowsChecksum(requireValue(prepared.scanRows, 'scan rows', ctx.dbName)),
+                    rowsChecksum(requireValue('MoyoDB', prepared.scanRows, 'scan rows', ctx.dbName)),
                     expectedRowsChecksum(ctx.workload, scanResultIndices(ctx.workload))
                 );
             case 'write': {
@@ -316,49 +324,6 @@ async function probeMoyoDbCapabilities(): Promise<void> {
     }
 }
 
-async function hasSyncAccessHandle(): Promise<boolean> {
-    try {
-        const source = `
-self.onmessage = async () => {
-  try {
-    const root = await navigator.storage.getDirectory();
-    const dir = await root.getDirectoryHandle('__moyodb_bench_support__', { create: true });
-    const file = await dir.getFileHandle('probe.bin', { create: true });
-    if (typeof file.createSyncAccessHandle !== 'function') {
-      self.postMessage(false);
-      return;
-    }
-    const handle = await file.createSyncAccessHandle();
-    handle.close();
-    self.postMessage(true);
-  } catch {
-    self.postMessage(false);
-  }
-};`;
-        const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
-        const worker = new Worker(url, { type: 'module' });
-        try {
-            return await new Promise<boolean>((resolve) => {
-                const timeout = setTimeout(() => resolve(false), 3000);
-                worker.onmessage = (event) => {
-                    clearTimeout(timeout);
-                    resolve(event.data === true);
-                };
-                worker.onerror = () => {
-                    clearTimeout(timeout);
-                    resolve(false);
-                };
-                worker.postMessage(null);
-            });
-        } finally {
-            worker.terminate();
-            URL.revokeObjectURL(url);
-        }
-    } catch {
-        return false;
-    }
-}
-
 async function runMoyoDbWorkload(dbName: string, workload: WorkloadSpec, sampleIndex: number): Promise<void> {
     switch (workload.name) {
         case 'noop_js_loop_1m':
@@ -436,7 +401,7 @@ async function runMoyoDbWorkload(dbName: string, workload: WorkloadSpec, sampleI
     if (isRandomGetWorkload(workload.name)) {
         const prepared = requirePrepared(dbName);
         const db = requirePreparedDb(prepared, dbName);
-        const keys = requireValue(prepared.readKeys, 'read keys', dbName);
+        const keys = requireValue('MoyoDB', prepared.readKeys, 'read keys', dbName);
         prepared.readValues = await randomPointGets(db, keys, readRequestMode(workload.name));
         return;
     }
@@ -548,41 +513,7 @@ function requirePreparedDb(prepared: PreparedMoyoSample, name: string): DB {
 }
 
 function requirePreparedEntries(prepared: PreparedMoyoSample, name: string): Entry[][] {
-    return requireValue(prepared.entries, 'entries', name);
-}
-
-function requireValue<T>(value: T | undefined, what: string, name: string): T {
-    if (value === undefined) {
-        throw new Error(`prepared MoyoDB ${what} missing for ${name}`);
-    }
-    return value;
-}
-
-function effectiveBatchSize(workload: WorkloadSpec): number {
-    if (isSingleTransactionInsertWorkload(workload.name)) {
-        return Math.min(10_000, workload.recordCount);
-    }
-    return Math.max(1, workload.batchSize);
-}
-
-function shouldUseSingleTransactionPreload(workload: WorkloadSpec): boolean {
-    return workload.recordCount >= 1_000_000;
-}
-
-function buildEntryBatches(workload: WorkloadSpec, count: number, batchSize: number): Entry[][] {
-    const batches: Entry[][] = [];
-    for (let start = 0; start < count; start += batchSize) {
-        const end = Math.min(start + batchSize, count);
-        const entries: Entry[] = [];
-        for (let i = start; i < end; i += 1) {
-            entries.push([
-                keyBytes(i, workload.keySize),
-                valueBytes(i, workload.valueSize, workloadPolicy(workload).dataset.profile)
-            ]);
-        }
-        batches.push(entries);
-    }
-    return batches;
+    return requireValue('MoyoDB', prepared.entries, 'entries', name);
 }
 
 function buildRoundtripPayloads(workload: WorkloadSpec): Uint8Array[] {

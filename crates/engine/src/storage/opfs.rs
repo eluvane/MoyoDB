@@ -5,6 +5,21 @@ use crate::error::{EngineError, Result};
 use crate::layout::{MAIN_FILE_KIND, MANIFEST_FILE_KIND, WAL_FILE_KIND};
 use crate::storage::backend::{validate_database_name, FileBackend, FileSet};
 
+#[derive(Debug, Clone)]
+pub struct OpfsBackend {
+    pub session_id: u32,
+    pub file_kind: u32,
+}
+
+impl OpfsBackend {
+    pub fn new(session_id: u32, file_kind: u32) -> Self {
+        Self {
+            session_id,
+            file_kind,
+        }
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 mod wasm_impl {
     use super::*;
@@ -88,30 +103,20 @@ mod wasm_impl {
         generation_name: String,
     }
 
-    #[derive(Debug, Clone)]
-    pub struct OpfsBackend {
-        pub session_id: u32,
-        pub file_kind: u32,
+    async fn await_opfs(promise: std::result::Result<Promise, JsValue>) -> Result<JsValue> {
+        JsFuture::from(promise.map_err(js_err)?)
+            .await
+            .map_err(js_err)
     }
 
     impl OpfsBackend {
-        pub fn new(session_id: u32, file_kind: u32) -> Self {
-            Self {
-                session_id,
-                file_kind,
-            }
-        }
-
         pub async fn open_db(
             db_name: &str,
             create_if_missing: bool,
         ) -> Result<FileSet<OpfsBackend>> {
             validate_database_name(db_name)?;
             let encoded = encode_db_name(db_name);
-            let value =
-                JsFuture::from(opfsOpenActiveDb(&encoded, create_if_missing).map_err(js_err)?)
-                    .await
-                    .map_err(js_err)?;
+            let value = await_opfs(opfsOpenActiveDb(&encoded, create_if_missing)).await?;
             files_from_session_value(value)
         }
 
@@ -122,21 +127,19 @@ mod wasm_impl {
         ) -> Result<FileSet<OpfsBackend>> {
             validate_database_name(db_name)?;
             let encoded = encode_db_name(db_name);
-            let value = JsFuture::from(
-                opfsOpenGenerationDb(&encoded, generation_name, create_if_missing)
-                    .map_err(js_err)?,
-            )
-            .await
-            .map_err(js_err)?;
+            let value = await_opfs(opfsOpenGenerationDb(
+                &encoded,
+                generation_name,
+                create_if_missing,
+            ))
+            .await?;
             files_from_session_value(value)
         }
 
         pub async fn prepare_rebuild_target(db_name: &str) -> Result<String> {
             validate_database_name(db_name)?;
             let encoded = encode_db_name(db_name);
-            let value = JsFuture::from(opfsPrepareRebuildTarget(&encoded).map_err(js_err)?)
-                .await
-                .map_err(js_err)?;
+            let value = await_opfs(opfsPrepareRebuildTarget(&encoded)).await?;
             let info: RebuildTargetInfo = parse_js_value(value, "prepare rebuild target")?;
             Ok(info.generation_name)
         }
@@ -148,21 +151,19 @@ mod wasm_impl {
         ) -> Result<()> {
             validate_database_name(db_name)?;
             let encoded = encode_db_name(db_name);
-            JsFuture::from(
-                opfsSwapActiveGeneration(&encoded, generation_name, expected_current_generation)
-                    .map_err(js_err)?,
-            )
-            .await
-            .map_err(js_err)?;
+            await_opfs(opfsSwapActiveGeneration(
+                &encoded,
+                generation_name,
+                expected_current_generation,
+            ))
+            .await?;
             Ok(())
         }
 
         pub async fn read_active_generation(db_name: &str) -> Result<Option<String>> {
             validate_database_name(db_name)?;
             let encoded = encode_db_name(db_name);
-            let value = JsFuture::from(opfsReadActiveGeneration(&encoded).map_err(js_err)?)
-                .await
-                .map_err(js_err)?;
+            let value = await_opfs(opfsReadActiveGeneration(&encoded)).await?;
             if value.is_null() || value.is_undefined() {
                 return Ok(None);
             }
@@ -174,27 +175,21 @@ mod wasm_impl {
         pub async fn cleanup_inactive_entries(db_name: &str) -> Result<()> {
             validate_database_name(db_name)?;
             let encoded = encode_db_name(db_name);
-            JsFuture::from(opfsCleanupInactiveEntries(&encoded).map_err(js_err)?)
-                .await
-                .map_err(js_err)?;
+            await_opfs(opfsCleanupInactiveEntries(&encoded)).await?;
             Ok(())
         }
 
         pub async fn db_directory_size(db_name: &str) -> Result<u64> {
             validate_database_name(db_name)?;
             let encoded = encode_db_name(db_name);
-            let value = JsFuture::from(opfsDbDirectorySize(&encoded).map_err(js_err)?)
-                .await
-                .map_err(js_err)?;
+            let value = await_opfs(opfsDbDirectorySize(&encoded)).await?;
             parse_u64(value, "db directory size")
         }
 
         pub async fn remove_db(db_name: &str) -> Result<()> {
             validate_database_name(db_name)?;
             let encoded = encode_db_name(db_name);
-            JsFuture::from(opfsRemoveDb(&encoded).map_err(js_err)?)
-                .await
-                .map_err(js_err)?;
+            await_opfs(opfsRemoveDb(&encoded)).await?;
             Ok(())
         }
     }
@@ -323,20 +318,7 @@ mod native_impl {
         )))
     }
 
-    #[derive(Debug, Clone)]
-    pub struct OpfsBackend {
-        pub session_id: u32,
-        pub file_kind: u32,
-    }
-
     impl OpfsBackend {
-        pub fn new(session_id: u32, file_kind: u32) -> Self {
-            Self {
-                session_id,
-                file_kind,
-            }
-        }
-
         pub async fn open_db(
             db_name: &str,
             _create_if_missing: bool,
@@ -410,9 +392,3 @@ mod native_impl {
         }
     }
 }
-
-#[cfg(target_arch = "wasm32")]
-pub use wasm_impl::OpfsBackend;
-
-#[cfg(not(target_arch = "wasm32"))]
-pub use native_impl::OpfsBackend;

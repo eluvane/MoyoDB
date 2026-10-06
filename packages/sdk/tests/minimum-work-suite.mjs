@@ -463,6 +463,16 @@ export function createSuite({ runtime, indexing, codec }) {
             }
         };
     }
+    function takenCatalog(defs, docs) {
+        return catalogFixture({
+            defs,
+            docs,
+            internalRows: docs.map((row) => ({
+                store: defs[0].internalStore,
+                key: indexing.encodeIndexEntryKey(indexKey('taken'), row.key)
+            }))
+        });
+    }
     function definitions(count = 8, unique = false) {
         return indexing.normalizeIndexDefinitions(
             Array.from({ length: count }, (_, i) => ({
@@ -883,14 +893,7 @@ export function createSuite({ runtime, indexing, codec }) {
             const docs = Array.from({ length: 32 }, (_, i) => ({ key: u64Key(i), value: jsonEncode({ k0: 'taken' }) }));
             // The first conflict must take priority over corruption in later rows.
             docs[31].value = new Uint8Array([255]);
-            const f = catalogFixture({
-                defs,
-                docs,
-                internalRows: docs.map((row) => ({
-                    store: defs[0].internalStore,
-                    key: indexing.encodeIndexEntryKey(indexKey('taken'), row.key)
-                }))
-            });
+            const f = takenCatalog(defs, docs);
             const writer = await f.worker.begin('readwrite');
             try {
                 await rejects(
@@ -955,14 +958,7 @@ export function createSuite({ runtime, indexing, codec }) {
             { key: u64Key(1), value: new Uint8Array([255]) },
             { key: u64Key(2), value: jsonEncode({ k0: 'taken' }) }
         ];
-        const f = catalogFixture({
-            defs,
-            docs,
-            internalRows: docs.map((row) => ({
-                store: defs[0].internalStore,
-                key: indexing.encodeIndexEntryKey(indexKey('taken'), row.key)
-            }))
-        });
+        const f = takenCatalog(defs, docs);
         f.setNow(5);
         const writer = await f.worker.begin('readwrite');
         try {
@@ -993,14 +989,7 @@ export function createSuite({ runtime, indexing, codec }) {
             value: jsonEncode({ k0: i === 31 ? 'prior' : 'taken' }),
             expiresAt: i === 31 ? null : 5
         }));
-        const f = catalogFixture({
-            defs,
-            docs,
-            internalRows: docs.map((row) => ({
-                store: defs[0].internalStore,
-                key: indexing.encodeIndexEntryKey(indexKey('taken'), row.key)
-            }))
-        });
+        const f = takenCatalog(defs, docs);
         f.setNow(5);
         const writer = await f.worker.begin('readwrite');
         try {

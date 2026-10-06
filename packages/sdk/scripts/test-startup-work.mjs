@@ -4,18 +4,13 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import ts from 'typescript';
+import { emitTranspiledModule, readFlagValue } from './fixture-emit.mjs';
 
 // Tests production DbWorker and OwnershipLease with deterministic WASM and browser fixtures.
 // Browser latency and OPFS durability are outside its scope.
 const here = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
-const flag = (name) => {
-    const index = args.indexOf(name);
-    if (index < 0) return undefined;
-    if (!args[index + 1] || args[index + 1].startsWith('--')) throw new Error(`missing ${name} value`);
-    return args[index + 1];
-};
-const source = resolve(flag('--source-root') ?? join(here, '../src'));
+const source = resolve(readFlagValue(args, '--source-root') ?? join(here, '../src'));
 const output = await mkdtemp(join(tmpdir(), 'moyo-startup-work-'));
 const originalGlobals = new Map();
 const setGlobal = (name, value) => {
@@ -204,20 +199,12 @@ try {
         'compression',
         'snappy'
     ]) {
-        const input = await readFile(join(source, `${name}.ts`), 'utf8');
-        const transpiled = ts.transpileModule(input, {
-            fileName: `${name}.ts`,
-            reportDiagnostics: true,
-            compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
+        await emitTranspiledModule({
+            name,
+            input: join(source, `${name}.ts`),
+            outputDir: output,
+            reportErrors: 'assert'
         });
-        assert.equal(
-            (transpiled.diagnostics ?? []).filter((d) => d.category === ts.DiagnosticCategory.Error).length,
-            0
-        );
-        await writeFile(
-            join(output, `${name}.mjs`),
-            transpiled.outputText.replace(/from '(\.\/[^']+)'/g, "from '$1.mjs'")
-        );
     }
     await writeFile(
         join(output, 'worker-server.mjs'),

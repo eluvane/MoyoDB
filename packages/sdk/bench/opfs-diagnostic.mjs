@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { artifactManifest, hash } from './artifact-manifest.mjs';
 import { chromium } from '@playwright/test';
 import { createServer, version as viteVersion } from 'vite';
 
@@ -32,21 +32,7 @@ const out = path.resolve(
         path.join(source, 'bench-results', `opfs-diagnostic-${persistent ? 'persistent' : 'incognito'}.json`)
 );
 await fs.mkdir(path.dirname(out), { recursive: true });
-const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
 // Hash assets before browser startup to keep manifest reads outside measurements.
-async function artifactManifest(directory, prefix = '') {
-    const entries = [];
-    for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
-        const filename = path.join(directory, entry.name),
-            relative = prefix + entry.name;
-        if (entry.isDirectory()) entries.push(...Object.entries(await artifactManifest(filename, relative + '/')));
-        else if (entry.isFile()) {
-            const bytes = await fs.readFile(filename);
-            entries.push([relative, { sha256: hash(bytes), bytes: bytes.length }]);
-        } else throw Error(`unsupported engine artifact entry: ${filename}`);
-    }
-    return Object.fromEntries(entries.sort(([a], [b]) => a.localeCompare(b)));
-}
 const artifactAssets = await artifactManifest(engineDir);
 const wasmSha256 = artifactAssets['moyodb_engine_bg.wasm'].sha256;
 const plugins = [

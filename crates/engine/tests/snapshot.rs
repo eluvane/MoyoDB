@@ -20,6 +20,33 @@ fn seed_source(engine: &mut moyodb_engine::engine::Engine<moyodb_engine::MemoryB
     engine.commit_tx(tx).unwrap();
 }
 
+fn snapshot_over_old_target(
+    source_name: &str,
+    target_name: &str,
+) -> (
+    Vec<u8>,
+    moyodb_engine::engine::Engine<moyodb_engine::MemoryBackend>,
+) {
+    let (_source_bundle, mut source) = common::open_memory_engine(source_name);
+    seed_source(&mut source);
+    let snapshot = source.export_snapshot().unwrap();
+    let (_target_bundle, mut target) = common::open_memory_engine(target_name);
+    seed_target_with_old_state(&mut target);
+    (snapshot, target)
+}
+
+fn assert_rejected_import_keeps_old_rows(
+    target: &mut moyodb_engine::engine::Engine<moyodb_engine::MemoryBackend>,
+    txid_before: u64,
+) {
+    assert_eq!(target.stats().unwrap().last_committed_txid, txid_before);
+    let ro = target.begin_tx(TxMode::Readonly).unwrap();
+    assert_eq!(target.get(ro, "junk", b"x").unwrap(), Some(b"old".to_vec()));
+    let err = target.get(ro, "alpha", b"a").unwrap_err();
+    assert!(matches!(err, EngineError::StoreNotFound(_)));
+    target.rollback_tx(ro).unwrap();
+}
+
 fn seed_target_with_old_state(
     engine: &mut moyodb_engine::engine::Engine<moyodb_engine::MemoryBackend>,
 ) {
@@ -31,12 +58,8 @@ fn seed_target_with_old_state(
 
 #[test]
 fn export_import_roundtrip_replaces_visible_state() {
-    let (_source_bundle, mut source) = common::open_memory_engine("snapshot-source-roundtrip");
-    seed_source(&mut source);
-    let snapshot = source.export_snapshot().unwrap();
-
-    let (_target_bundle, mut target) = common::open_memory_engine("snapshot-target-roundtrip");
-    seed_target_with_old_state(&mut target);
+    let (snapshot, mut target) =
+        snapshot_over_old_target("snapshot-source-roundtrip", "snapshot-target-roundtrip");
 
     let imported_txid = target.import_snapshot(&snapshot).unwrap();
     assert!(imported_txid > 0);
@@ -82,60 +105,30 @@ fn export_snapshot_ignores_uncommitted_write_state() {
 
 #[test]
 fn snapshot_checksum_is_validated_before_import() {
-    let (_source_bundle, mut source) = common::open_memory_engine("snapshot-source-checksum");
-    seed_source(&mut source);
-    let mut snapshot = source.export_snapshot().unwrap();
+    let (mut snapshot, mut target) =
+        snapshot_over_old_target("snapshot-source-checksum", "snapshot-target-checksum");
     snapshot[SNAPSHOT_HEADER_SIZE] ^= 0x5a;
-
-    let (_target_bundle, mut target) = common::open_memory_engine("snapshot-target-checksum");
-    seed_target_with_old_state(&mut target);
-    let stats_before = target.stats().unwrap();
+    let txid_before = target.stats().unwrap().last_committed_txid;
 
     let err = target.import_snapshot(&snapshot).unwrap_err();
     assert_eq!(err.code(), "CorruptionError");
     assert!(err.to_string().contains("checksum"));
-
-    let stats_after = target.stats().unwrap();
-    assert_eq!(
-        stats_after.last_committed_txid,
-        stats_before.last_committed_txid
-    );
-
-    let ro = target.begin_tx(TxMode::Readonly).unwrap();
-    assert_eq!(target.get(ro, "junk", b"x").unwrap(), Some(b"old".to_vec()));
-    let err = target.get(ro, "alpha", b"a").unwrap_err();
-    assert!(matches!(err, EngineError::StoreNotFound(_)));
-    target.rollback_tx(ro).unwrap();
+    assert_rejected_import_keeps_old_rows(&mut target, txid_before);
 }
 
 #[test]
 fn snapshot_version_mismatch_is_rejected() {
-    let (_source_bundle, mut source) = common::open_memory_engine("snapshot-source-version");
-    seed_source(&mut source);
-    let mut snapshot = source.export_snapshot().unwrap();
+    let (mut snapshot, mut target) =
+        snapshot_over_old_target("snapshot-source-version", "snapshot-target-version");
     write_u32_le(&mut snapshot, 8, SNAPSHOT_VERSION + 1).unwrap();
     let checksum = checksum_with_zeroed_region(&snapshot, SNAPSHOT_CHECKSUM_OFFSET, 4);
     write_u32_le(&mut snapshot, SNAPSHOT_CHECKSUM_OFFSET, checksum).unwrap();
-
-    let (_target_bundle, mut target) = common::open_memory_engine("snapshot-target-version");
-    seed_target_with_old_state(&mut target);
-    let stats_before = target.stats().unwrap();
+    let txid_before = target.stats().unwrap().last_committed_txid;
 
     let err = target.import_snapshot(&snapshot).unwrap_err();
     assert_eq!(err.code(), "CorruptionError");
     assert!(err.to_string().contains("unsupported snapshot version"));
-
-    let stats_after = target.stats().unwrap();
-    assert_eq!(
-        stats_after.last_committed_txid,
-        stats_before.last_committed_txid
-    );
-
-    let ro = target.begin_tx(TxMode::Readonly).unwrap();
-    assert_eq!(target.get(ro, "junk", b"x").unwrap(), Some(b"old".to_vec()));
-    let err = target.get(ro, "alpha", b"a").unwrap_err();
-    assert!(matches!(err, EngineError::StoreNotFound(_)));
-    target.rollback_tx(ro).unwrap();
+    assert_rejected_import_keeps_old_rows(&mut target, txid_before);
 }
 
 fn reseal_snapshot(bytes: &mut [u8]) {

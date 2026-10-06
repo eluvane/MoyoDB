@@ -12,6 +12,30 @@ fn child(separator: &[u8], child_page_id: u64) -> InternalCell {
     }
 }
 
+fn install_then_reject_deleting_other_key(
+    pager: &mut Pager<MemoryBackend>,
+    images: &[(u64, Vec<u8>)],
+    next_page_id: u64,
+    context: &str,
+) -> Result<()> {
+    for (page_id, bytes) in images {
+        pager.write_page_image(*page_id, bytes)?;
+    }
+    assert!(matches!(
+        lookup(pager, 1, b"a"),
+        Err(EngineError::Corruption(_))
+    ));
+    assert_eq!(lookup(pager, 1, b"z")?, Some(b"value".to_vec()));
+
+    let mut alloc = PageAllocator::new(next_page_id);
+    let result = apply_mutations(pager, 1, &[(b"z".as_slice(), None)], &mut alloc);
+    assert!(
+        matches!(result, Err(EngineError::Corruption(_))),
+        "{context}: {result:?}"
+    );
+    Ok(())
+}
+
 fn leaf(page_id: u64, key: &[u8]) -> Result<Vec<u8>> {
     encode_leaf_page(
         page_id,
@@ -47,21 +71,12 @@ fn deleting_other_subtree_rejects_repeated_levels_in_retained_root() -> Result<(
             (5, encode_internal_page(5, 1, 0, &[child(b"z", 6)])?),
             (6, leaf(6, b"z")?),
         ];
-        for (page_id, bytes) in images {
-            pager.write_page_image(page_id, &bytes)?;
-        }
-        assert!(matches!(
-            lookup(&mut pager, 1, b"a"),
-            Err(EngineError::Corruption(_))
-        ));
-        assert_eq!(lookup(&mut pager, 1, b"z")?, Some(b"value".to_vec()));
-
-        let mut alloc = PageAllocator::new(7);
-        let result = apply_mutations(&mut pager, 1, &[(b"z".as_slice(), None)], &mut alloc);
-        assert!(
-            matches!(result, Err(EngineError::Corruption(_))),
-            "a retained child's invalid height must not be hidden by root collapse: {result:?}"
-        );
+        install_then_reject_deleting_other_key(
+            &mut pager,
+            &images,
+            7,
+            "a retained child's invalid height must not be hidden by root collapse",
+        )?;
     }
     Ok(())
 }
@@ -78,20 +93,11 @@ fn deleting_other_subtree_rejects_cycle_in_retained_root() -> Result<()> {
         (3, encode_internal_page(3, 1, 0, &[child(b"z", 4)])?),
         (4, leaf(4, b"z")?),
     ];
-    for (page_id, bytes) in images {
-        pager.write_page_image(page_id, &bytes)?;
-    }
-    assert!(matches!(
-        lookup(&mut pager, 1, b"a"),
-        Err(EngineError::Corruption(_))
-    ));
-    assert_eq!(lookup(&mut pager, 1, b"z")?, Some(b"value".to_vec()));
-
-    let mut alloc = PageAllocator::new(5);
-    let result = apply_mutations(&mut pager, 1, &[(b"z".as_slice(), None)], &mut alloc);
-    assert!(
-        matches!(result, Err(EngineError::Corruption(_))),
-        "a cyclic retained root must fail instead of repeatedly retiring itself: {result:?}"
-    );
+    install_then_reject_deleting_other_key(
+        &mut pager,
+        &images,
+        5,
+        "a cyclic retained root must fail instead of repeatedly retiring itself",
+    )?;
     Ok(())
 }

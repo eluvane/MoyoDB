@@ -263,6 +263,7 @@ pub fn decode_value_envelope(
 }
 
 /// Reads expiry from the envelope header. Zero means no expiry.
+#[inline]
 pub fn decode_envelope_expiry(prefix: &[u8]) -> Result<Option<u64>> {
     if prefix.len() < VALUE_ENVELOPE_HEADER_SIZE {
         return Err(EngineError::Corruption(format!(
