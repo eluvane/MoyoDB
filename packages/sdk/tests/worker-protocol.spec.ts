@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test as base, type BrowserContext, type Page } from '@playwright/test';
 import type { WorkerProtocolClient } from '../src/worker-client';
 import type { WorkerApi } from '../src/worker-api';
 import type * as WorkerServerModule from '../src/worker-server';
@@ -122,13 +122,33 @@ window.withWorkerProtocol = async function withWorkerProtocol(run) {
 };
 `;
 
-async function prepareProtocolPage(page: Page): Promise<void> {
-    await page.goto('/');
-    await page.addScriptTag({ content: protocolHarnessScript });
-}
+const test = base.extend<
+    object,
+    {
+        protocolPage: Page;
+    }
+>({
+    protocolPage: [
+        async ({ browser }, use, testInfo) => {
+            const baseURL =
+                typeof (testInfo.project.use as { baseURL?: unknown }).baseURL === 'string'
+                    ? (testInfo.project.use as { baseURL: string }).baseURL
+                    : 'http://127.0.0.1:4173';
+            const context: BrowserContext = await browser.newContext({ baseURL });
+            const page = await context.newPage();
+            try {
+                await page.goto('/');
+                await page.addScriptTag({ content: protocolHarnessScript });
+                await use(page);
+            } finally {
+                await context.close();
+            }
+        },
+        { scope: 'worker' }
+    ]
+});
 
 async function evaluateProtocol<T>(page: Page, run: () => Promise<T>): Promise<T> {
-    await prepareProtocolPage(page);
     return page.evaluate(run);
 }
 
@@ -180,15 +200,15 @@ test('worker server rejects foreign origins and accepts dedicated-worker message
     expect(result).toEqual({ calls: 2, responseIds: [2, 3] });
 });
 
-test('worker_protocol_request_response', async ({ page }) => {
-    const value = await evaluateProtocol(page, async () =>
+test('worker_protocol_request_response', async ({ protocolPage }) => {
+    const value = await evaluateProtocol(protocolPage, async () =>
         window.withWorkerProtocol(async ({ client }) => client.begin('readwrite'))
     );
     expect(value).toBe(7);
 });
 
-test('worker_protocol_error_response', async ({ page }) => {
-    const errorName = await evaluateProtocol(page, async () =>
+test('worker_protocol_error_response', async ({ protocolPage }) => {
+    const errorName = await evaluateProtocol(protocolPage, async () =>
         window.withWorkerProtocol(async ({ client }) => {
             try {
                 await client.setFailpoint('after_wal_flush');
@@ -201,8 +221,8 @@ test('worker_protocol_error_response', async ({ page }) => {
     expect(errorName).toBe('InjectedFailureError');
 });
 
-test('worker_protocol_unknown_command', async ({ page }) => {
-    const result = await evaluateProtocol(page, async () =>
+test('worker_protocol_unknown_command', async ({ protocolPage }) => {
+    const result = await evaluateProtocol(protocolPage, async () =>
         window.withWorkerProtocol(async ({ worker, client }) => {
             await client.whenReady();
             return await new Promise<{ ok: boolean; name: string; message: string }>((resolve) => {
@@ -243,8 +263,8 @@ test('worker_protocol_unknown_command', async ({ page }) => {
     expect(result.message).toContain('unsupported worker command');
 });
 
-test('worker_client_rejects_after_close', async ({ page }) => {
-    const errorName = await evaluateProtocol(page, async () =>
+test('worker_client_rejects_after_close', async ({ protocolPage }) => {
+    const errorName = await evaluateProtocol(protocolPage, async () =>
         window.withWorkerProtocol(async ({ client }) => {
             try {
                 await client.whenReady();
@@ -259,8 +279,8 @@ test('worker_client_rejects_after_close', async ({ page }) => {
     expect(errorName).toBe('WorkerTerminatedError');
 });
 
-test('worker_pending_requests_reject_on_terminate', async ({ page }) => {
-    const errorMessage = await evaluateProtocol(page, async () =>
+test('worker_pending_requests_reject_on_terminate', async ({ protocolPage }) => {
+    const errorMessage = await evaluateProtocol(protocolPage, async () =>
         window.withWorkerProtocol(async ({ client, worker }) => {
             const pending = client.storageInfo();
             client.dispose(new Error('test termination'));
@@ -276,8 +296,8 @@ test('worker_pending_requests_reject_on_terminate', async ({ page }) => {
     expect(errorMessage).toBe('test termination');
 });
 
-test('binary_payload_roundtrip', async ({ page }) => {
-    const result = await evaluateProtocol(page, async () =>
+test('binary_payload_roundtrip', async ({ protocolPage }) => {
+    const result = await evaluateProtocol(protocolPage, async () =>
         window.withWorkerProtocol(async ({ client }) => {
             const input = new Uint8Array([1, 2, 3, 4, 5]);
             await client.importSnapshot(input.subarray(1, 4));
@@ -292,8 +312,8 @@ test('binary_payload_roundtrip', async ({ page }) => {
     expect(result.output).toEqual([2, 3, 4]);
 });
 
-test('packed_binary_response_roundtrip', async ({ page }) => {
-    const result = await evaluateProtocol(page, async () =>
+test('packed_binary_response_roundtrip', async ({ protocolPage }) => {
+    const result = await evaluateProtocol(protocolPage, async () =>
         window.withWorkerProtocol(async ({ client }) => {
             const many = await client.getMany(1, 'kv', [new Uint8Array([1]), new Uint8Array([2])]);
             const scan = await client.scan(1, 'kv', {});
@@ -310,8 +330,8 @@ test('packed_binary_response_roundtrip', async ({ page }) => {
     expect(result.indexScan).toEqual([{ key: [2], value: [9, 8, 7] }]);
 });
 
-test('transferable_payload_roundtrip_if_supported', async ({ page }) => {
-    const result = await evaluateProtocol(page, async () =>
+test('transferable_payload_roundtrip_if_supported', async ({ protocolPage }) => {
+    const result = await evaluateProtocol(protocolPage, async () =>
         window.withWorkerProtocol(async ({ client }) => {
             const bytes = await client.exportSnapshot();
             const stats = await client.stats();
@@ -325,8 +345,8 @@ test('transferable_payload_roundtrip_if_supported', async ({ page }) => {
     expect(result.workerBufferLengthAfterPost).toBe(0);
 });
 
-test('packed_bulk_binary_arguments_preserve_caller_buffers', async ({ page }) => {
-    const result = await evaluateProtocol(page, async () =>
+test('packed_bulk_binary_arguments_preserve_caller_buffers', async ({ protocolPage }) => {
+    const result = await evaluateProtocol(protocolPage, async () =>
         window.withWorkerProtocol(async ({ client }) => {
             const keyA = new Uint8Array([9, 1, 2, 8]);
             const valueA = new Uint8Array([3, 4, 5]);
@@ -484,7 +504,7 @@ test('worker_crash_cleanup', async ({ page }) => {
 });
 
 test('oversized ready timeout stays pending until an incompatible response fails the client', async ({ page }) => {
-    await prepareProtocolPage(page);
+    await prepareMoyoDbPage(page);
     const result = await page.evaluate(async () => {
         const clientUrl = new URL('/src/worker-client.ts', window.location.href).href;
         const clientModule = (await import(clientUrl)) as {

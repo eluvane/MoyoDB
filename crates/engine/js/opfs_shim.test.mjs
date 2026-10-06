@@ -40,7 +40,7 @@ class MemoryAccessHandle {
         return this.file.bytes.length;
     }
     read(dst, { at = 0 } = {}) {
-        this.file.reads.push({ at, buffer: dst.buffer, byteOffset: dst.byteOffset, length: dst.length });
+        this.file.reads.push({ at, view: dst, buffer: dst.buffer, byteOffset: dst.byteOffset, length: dst.length });
         return this.file.readHook ? this.file.readHook(dst, at, this.file) : loadBytes(this.file, dst, at);
     }
     write(src, { at = 0 } = {}) {
@@ -325,6 +325,7 @@ describe('OPFS reads', () => {
             assert.equal(file.reads.length, 16);
             for (let index = 0; index < outputs.length; index += 1) {
                 assert.deepEqual(outputs[index], Array.from(source.subarray(index * 64, (index + 1) * 64)));
+                assert.equal(file.reads[index].view, destination);
                 assert.equal(file.reads[index].buffer, destination.buffer);
                 assert.equal(file.reads[index].byteOffset, destination.byteOffset);
                 assert.equal(file.reads[index].length, destination.length);
@@ -351,6 +352,7 @@ describe('OPFS reads', () => {
                     [3, 4, 8]
                 ]
             );
+            assert.equal(file.reads[0].view, destination);
             assert.deepEqual(Array.from(backing.subarray(0, 2)), [0xa5, 0xa5]);
             assert.deepEqual(Array.from(backing.subarray(12)), [0xa5, 0xa5]);
             destination.fill(0xcc);
@@ -372,6 +374,7 @@ describe('OPFS reads', () => {
         try {
             assert.equal(readInto(sessionId, 1, 0n, destination), 4);
             assert.deepEqual(Array.from(destination), [7, 8, 9, 10]);
+            assert.equal(file.reads[0].view, destination);
             assert.deepEqual(
                 file.reads.map(({ at, byteOffset, length }) => [at, byteOffset, length]),
                 [
@@ -984,12 +987,17 @@ describe('prebatched OPFS write work', () => {
         for (let index = 0; index < backing.length; index += 1) {
             backing[index] = (index * 37) ^ (index >>> 8);
         }
+        // One 0xa5 image and handle for every size. Writes start at offset 17 and
+        // the sizes ascend, so each iteration's margin stays outside the last payload.
+        const padded = new Uint8Array(sizes.at(-1) + 34).fill(0xa5);
+        const handle = handleOver(padded);
         const results = [];
         for (const length of sizes) {
             const source = backing.subarray(11, 11 + length);
-            const handle = handleOver(new Uint8Array(length + 34).fill(0xa5));
+            handle.file.bytes = padded.subarray(0, length + 34);
             let calls = 0;
             handle.file.writeHook = (src, at, file) => {
+                assert.equal(src, source, 'the shim must pass the caller view, not a copy or wrapper');
                 assert.equal(src.buffer, source.buffer, 'the shim must borrow, not copy, the source');
                 assert.equal(src.byteOffset, source.byteOffset + at - 17);
                 assert.ok(at >= 17 && at + src.length <= 17 + length);
@@ -1060,6 +1068,7 @@ describe('prebatched OPFS write work', () => {
         handle.file.writeHook = (src, at, file) => {
             offered.push(src.length);
             assert.equal(at, 13 + stored);
+            if (stored === 0) assert.equal(src, source);
             assert.equal(src.buffer, source.buffer);
             assert.equal(src.byteOffset, source.byteOffset + stored);
             const count = Math.min(src.length, accepted[offered.length - 1] ?? src.length);

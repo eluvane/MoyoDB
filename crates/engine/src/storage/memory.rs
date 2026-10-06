@@ -49,6 +49,14 @@ impl MemoryBackend {
         FileBackend::read_at(self, offset, len)
     }
 
+    pub fn read_at_into(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        FileBackend::read_at_into(self, offset, buf)
+    }
+
+    pub fn read_at_into_vec(&self, offset: u64, len: usize, buf: &mut Vec<u8>) -> Result<()> {
+        FileBackend::read_at_into_vec(self, offset, len, buf)
+    }
+
     pub fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
         FileBackend::write_at(self, offset, bytes)
     }
@@ -103,14 +111,63 @@ fn checked_end(start: usize, len: usize, what: &str) -> Result<usize> {
     })
 }
 
-fn resize_zeroed(bytes: &mut Vec<u8>, size: usize, what: &str) -> Result<()> {
-    if size > bytes.len() {
-        bytes.try_reserve(size - bytes.len()).map_err(|err| {
-            EngineError::Storage(format!("{what} allocation failed for {size} bytes: {err}"))
+// `try_reserve` grows from `len`, so `needed - len` is what makes `capacity >= needed`.
+fn ensure_vec_capacity(bytes: &mut Vec<u8>, needed: usize, what: &str) -> Result<()> {
+    if needed > bytes.capacity() {
+        let additional = needed - bytes.len();
+        bytes.try_reserve(additional).map_err(|err| {
+            EngineError::Storage(format!(
+                "{what} allocation failed for {needed} bytes: {err}"
+            ))
         })?;
     }
+    Ok(())
+}
+
+fn resize_zeroed(bytes: &mut Vec<u8>, size: usize, what: &str) -> Result<()> {
+    ensure_vec_capacity(bytes, size, what)?;
     bytes.resize(size, 0);
     Ok(())
+}
+
+fn read_bounds(state: &MemoryFileState, offset: u64, len: usize) -> Result<(usize, usize)> {
+    if state.closed {
+        return Err(EngineError::Storage(
+            "read from closed memory backend".into(),
+        ));
+    }
+    let start = to_index(offset, "read")?;
+    let end = checked_end(start, len, "read")?;
+    Ok((start, end))
+}
+
+/// Copies `[start, end)` from `src` onto the end of an empty `dst`.
+/// Only the tail past `src` is zeroed; bytes taken from `src` are copied once.
+fn append_read_range(src: &[u8], start: usize, end: usize, dst: &mut Vec<u8>) {
+    debug_assert!(dst.is_empty());
+    let len = end - start;
+    if start >= src.len() {
+        dst.resize(len, 0);
+        return;
+    }
+    let available_end = end.min(src.len());
+    dst.extend_from_slice(&src[start..available_end]);
+    if dst.len() < len {
+        dst.resize(len, 0);
+    }
+}
+
+fn copy_read_range(src: &[u8], start: usize, end: usize, dst: &mut [u8]) {
+    let len = end - start;
+    debug_assert_eq!(dst.len(), len);
+    if start >= src.len() {
+        dst.fill(0);
+        return;
+    }
+    let available_end = end.min(src.len());
+    let copied = available_end - start;
+    dst[..copied].copy_from_slice(&src[start..available_end]);
+    dst[copied..].fill(0);
 }
 
 impl MemoryFileState {
@@ -154,23 +211,26 @@ impl MemoryFileState {
 
 impl FileBackend for MemoryBackend {
     fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
-        let state = self.lock_state()?;
-        if state.closed {
-            return Err(EngineError::Storage(
-                "read from closed memory backend".into(),
-            ));
-        }
-        let start = to_index(offset, "read")?;
-        let end = checked_end(start, len, "read")?;
         let mut out = Vec::new();
-        resize_zeroed(&mut out, len, "read")?;
-        if start >= state.working.len() {
-            return Ok(out);
-        }
-        let available_end = end.min(state.working.len());
-        let copied = available_end.saturating_sub(start);
-        out[..copied].copy_from_slice(&state.working[start..available_end]);
+        FileBackend::read_at_into_vec(self, offset, len, &mut out)?;
         Ok(out)
+    }
+
+    fn read_at_into(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        let state = self.lock_state()?;
+        let (start, end) = read_bounds(&state, offset, buf.len())?;
+        copy_read_range(&state.working, start, end, buf);
+        Ok(())
+    }
+
+    fn read_at_into_vec(&self, offset: u64, len: usize, buf: &mut Vec<u8>) -> Result<()> {
+        let state = self.lock_state()?;
+        let (start, end) = read_bounds(&state, offset, len)?;
+        // Reserve before clearing so a capacity error keeps the caller's bytes.
+        ensure_vec_capacity(buf, len, "read")?;
+        buf.clear();
+        append_read_range(&state.working, start, end, buf);
+        Ok(())
     }
 
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
@@ -184,14 +244,24 @@ impl FileBackend for MemoryBackend {
         let end = checked_end(start, bytes.len(), "write")?;
         let old_len = state.working.len();
         if end > old_len {
-            resize_zeroed(&mut state.working, end, "write")?;
-            // The zero-filled gap must replace stale durable bytes after shrink
-            // and regrowth, including an empty sparse write.
+            // One reservation covers the gap and the caller's bytes. A failed
+            // reservation does not extend the file. The new tail is copied
+            // from `bytes` instead of being zeroed and then overwritten.
+            ensure_vec_capacity(&mut state.working, end, "write")?;
             if start > old_len {
+                state.working.resize(start, 0);
+                // The zero-filled gap must replace stale durable bytes after shrink
+                // and regrowth, including an empty sparse write.
                 state.mark_dirty(old_len, start);
+                state.working.extend_from_slice(bytes);
+            } else {
+                let overlap = old_len - start;
+                state.working[start..old_len].copy_from_slice(&bytes[..overlap]);
+                state.working.extend_from_slice(&bytes[overlap..]);
             }
+        } else if start < end {
+            state.working[start..end].copy_from_slice(bytes);
         }
-        state.working[start..end].copy_from_slice(bytes);
         state.mark_dirty(start, end);
         Ok(())
     }

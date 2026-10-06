@@ -70,7 +70,8 @@ export function createReadSuite({ runtime, compression }) {
         if (!encoded) {
             encoded = [];
             for (let index = 0; index < 16; index++) {
-                const raw = new Uint8Array(2048).fill(index + 1);
+                // Threshold is the smallest input that still takes the gzip path.
+                const raw = new Uint8Array(compression.STORE_VALUE_COMPRESSION_THRESHOLD).fill(index + 1);
                 encoded.push({ raw, record: await compression.encodeStoreValueRecord(raw, 'gzip') });
                 ok(encoded[index].record[9] === 1, 'fixture must contain compressed gzip records');
             }
@@ -213,7 +214,7 @@ export function createReadSuite({ runtime, compression }) {
             async () => {
                 let keyCopies = 0;
                 const changes = Array.from({ length: 4 }, (_, index) => {
-                    const key = paddingView(new Uint8Array(31).fill(index)).value;
+                    const key = paddingView(new Uint8Array([index + 1])).value;
                     const slice = key.slice;
                     key.slice = function (...args) {
                         keyCopies++;

@@ -11,12 +11,10 @@ const TEN_MILLION: u32 = 10_000_000;
 
 fn bench_btree(c: &mut Criterion) {
     c.bench_function("btree_insert_build_1000", |b| {
+        let entries = build_entries(1000);
         b.iter(|| {
-            let entries: Vec<(Vec<u8>, Vec<u8>)> = (0u32..1000)
-                .map(|i| (i.to_be_bytes().to_vec(), vec![42u8; 16]))
-                .collect();
             let mut next_page_id = 1;
-            black_box(build_tree(&entries, &mut next_page_id).unwrap());
+            black_box(build_tree(black_box(&entries), &mut next_page_id).unwrap());
         });
     });
 

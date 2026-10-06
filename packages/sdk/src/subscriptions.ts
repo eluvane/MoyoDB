@@ -13,6 +13,10 @@ interface SubscriptionSpec {
     keyPrefix: Uint8Array | null;
     callback: DbSubscriptionCallback;
 }
+interface PendingDelivery {
+    entry: SubscriptionEntry;
+    changes: DbChange[];
+}
 function cloneChanges(changes: readonly DbChange[]): DbChange[] {
     return changes.map((change) => ({
         key: change.key.slice(),
@@ -29,6 +33,75 @@ function hasKeyPrefix(key: Uint8Array, prefix: Uint8Array): boolean {
         }
     }
     return true;
+}
+function matchesPrefix(change: DbChange, prefix: Uint8Array): boolean {
+    return change.kind === 'clear' || change.kind === 'drop' || hasKeyPrefix(change.key, prefix);
+}
+function includesStoreLevelChange(changes: readonly DbChange[]): boolean {
+    for (let index = 0; index < changes.length; index += 1) {
+        const kind = changes[index].kind;
+        if (kind === 'clear' || kind === 'drop') {
+            return true;
+        }
+    }
+    return false;
+}
+function prefixBytesOverlap(left: Uint8Array, right: Uint8Array): boolean {
+    const limit = Math.min(left.byteLength, right.byteLength);
+    for (let index = 0; index < limit; index += 1) {
+        if (left[index] !== right[index]) {
+            return false;
+        }
+    }
+    return true;
+}
+function sharedChanges(changes: DbChange[], prefix: Uint8Array | null): DbChange[] | null {
+    if (prefix === null) {
+        return changes;
+    }
+    let selected: DbChange[] | null = null;
+    for (let index = 0; index < changes.length; index += 1) {
+        const change = changes[index];
+        if (matchesPrefix(change, prefix)) {
+            if (selected !== null) {
+                selected.push(change);
+            }
+            continue;
+        }
+        if (selected === null) {
+            selected = changes.slice(0, index);
+        }
+    }
+    if (selected === null) {
+        return changes.length === 0 ? null : changes;
+    }
+    return selected.length === 0 ? null : selected;
+}
+function viewsIntersect(
+    leftPrefix: Uint8Array | null,
+    rightPrefix: Uint8Array | null,
+    hasStoreLevel: () => boolean
+): boolean {
+    if (leftPrefix === null || rightPrefix === null) {
+        return true;
+    }
+    if (prefixBytesOverlap(leftPrefix, rightPrefix)) {
+        return true;
+    }
+    return hasStoreLevel();
+}
+function laterViewIntersects(
+    deliveries: readonly PendingDelivery[],
+    index: number,
+    hasStoreLevel: () => boolean
+): boolean {
+    const prefix = deliveries[index].entry.keyPrefix;
+    for (let later = index + 1; later < deliveries.length; later += 1) {
+        if (viewsIntersect(prefix, deliveries[later].entry.keyPrefix, hasStoreLevel)) {
+            return true;
+        }
+    }
+    return false;
 }
 function normalizeSubscriptionSpec(
     arg1: string | DbSubscriptionCallback,
@@ -142,6 +215,7 @@ export class SubscriptionHub {
         }
         const entries = Array.from(this.#entries);
         for (const storeEvent of payload.stores) {
+            const deliveries: PendingDelivery[] = [];
             for (const entry of entries) {
                 if (!entry.active) {
                     continue;
@@ -149,23 +223,35 @@ export class SubscriptionHub {
                 if (entry.store !== null && entry.store !== storeEvent.store) {
                     continue;
                 }
-                let changes: DbChange[];
-                const keyPrefix = entry.keyPrefix;
-                if (keyPrefix === null) {
-                    changes = cloneChanges(storeEvent.changes);
-                } else {
-                    changes = cloneChanges(
-                        storeEvent.changes.filter(
-                            (change) =>
-                                change.kind === 'clear' || change.kind === 'drop' || hasKeyPrefix(change.key, keyPrefix)
-                        )
-                    );
-                    if (changes.length === 0) {
+                const changes = sharedChanges(storeEvent.changes, entry.keyPrefix);
+                if (changes === null) {
+                    continue;
+                }
+                deliveries.push({ entry, changes });
+            }
+            // The last listener that shares a view reuses the commit's objects.
+            // Earlier listeners get private copies before any callback runs.
+            if (deliveries.length > 1) {
+                let storeLevel: boolean | undefined;
+                const hasStoreLevel = (): boolean => {
+                    if (storeLevel === undefined) {
+                        storeLevel = includesStoreLevelChange(storeEvent.changes);
+                    }
+                    return storeLevel;
+                };
+                for (let index = 0; index < deliveries.length; index += 1) {
+                    if (!laterViewIntersects(deliveries, index, hasStoreLevel)) {
                         continue;
                     }
+                    deliveries[index].changes = cloneChanges(deliveries[index].changes);
+                }
+            }
+            for (const delivery of deliveries) {
+                if (!delivery.entry.active) {
+                    continue;
                 }
                 try {
-                    entry.callback(storeEvent.store, changes, payload.txid);
+                    delivery.entry.callback(storeEvent.store, delivery.changes, payload.txid);
                 } catch (error) {
                     queueMicrotask(() => {
                         throw error;

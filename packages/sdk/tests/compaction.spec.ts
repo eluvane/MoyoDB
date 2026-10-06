@@ -9,25 +9,28 @@ test('db.compact rebuilds live state, reclaims space, and invalidates open trans
         const encode = window.moyodb.utf8Encode;
         const decode = window.moyodb.utf8Decode;
         const payloadFor = (label: string) => `${label}:${'x'.repeat(4096)}`;
+        const keyFor = (index: number) => encode(`k${index.toString().padStart(3, '0')}`);
+        const generation = (prefix: string) => {
+            const entries: Array<[Uint8Array, Uint8Array]> = [];
+            for (let index = 0; index < 96; index += 1) {
+                entries.push([keyFor(index), encode(payloadFor(`${prefix}-${index}`))]);
+            }
+            return entries;
+        };
         try {
             await db.createStore('docs');
-            for (let index = 0; index < 96; index += 1) {
-                await db.put(
-                    'docs',
-                    encode(`k${index.toString().padStart(3, '0')}`),
-                    encode(payloadFor(`v1-${index}`))
-                );
+            for (const prefix of ['v1', 'v2']) {
+                const batch = await db.begin('readwrite');
+                await batch.putMany('docs', generation(prefix));
+                await batch.commit();
             }
-            for (let index = 0; index < 96; index += 1) {
-                await db.put(
-                    'docs',
-                    encode(`k${index.toString().padStart(3, '0')}`),
-                    encode(payloadFor(`v2-${index}`))
-                );
-            }
+            const deleted: Uint8Array[] = [];
             for (let index = 0; index < 96; index += 3) {
-                await db.delete('docs', encode(`k${index.toString().padStart(3, '0')}`));
+                deleted.push(keyFor(index));
             }
+            const deleteBatch = await db.begin('readwrite');
+            await deleteBatch.deleteMany('docs', deleted);
+            await deleteBatch.commit();
             const infoBefore = await db.storageInfo();
             const tx = await db.begin('readwrite');
             await tx.put('docs', encode('tx-only'), encode(payloadFor('uncommitted')));
@@ -77,26 +80,29 @@ test('db.rebuild swaps in a fresh generation and survives close/reopen', async (
         const encode = window.moyodb.utf8Encode;
         const decode = window.moyodb.utf8Decode;
         const payloadFor = (label: string) => `${label}:${'y'.repeat(3072)}`;
+        const keyFor = (index: number) => encode(`k${index.toString().padStart(3, '0')}`);
+        const generation = (prefix: string) => {
+            const entries: Array<[Uint8Array, Uint8Array]> = [];
+            for (let index = 0; index < 72; index += 1) {
+                entries.push([keyFor(index), encode(payloadFor(`${prefix}-${index}`))]);
+            }
+            return entries;
+        };
         try {
             await db.createStore('docs');
             await db.createStore('meta');
-            for (let index = 0; index < 72; index += 1) {
-                await db.put(
-                    'docs',
-                    encode(`k${index.toString().padStart(3, '0')}`),
-                    encode(payloadFor(`v1-${index}`))
-                );
+            for (const prefix of ['v1', 'v2']) {
+                const batch = await db.begin('readwrite');
+                await batch.putMany('docs', generation(prefix));
+                await batch.commit();
             }
-            for (let index = 0; index < 72; index += 1) {
-                await db.put(
-                    'docs',
-                    encode(`k${index.toString().padStart(3, '0')}`),
-                    encode(payloadFor(`v2-${index}`))
-                );
-            }
+            const deleted: Uint8Array[] = [];
             for (let index = 0; index < 72; index += 4) {
-                await db.delete('docs', encode(`k${index.toString().padStart(3, '0')}`));
+                deleted.push(keyFor(index));
             }
+            const deleteBatch = await db.begin('readwrite');
+            await deleteBatch.deleteMany('docs', deleted);
+            await deleteBatch.commit();
             await db.put('meta', encode('schema'), encode('1'));
             const infoBefore = await db.storageInfo();
             const rebuilt = await db.rebuild();

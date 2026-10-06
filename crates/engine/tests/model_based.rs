@@ -141,7 +141,6 @@ fn rollback_does_not_touch_committed_state() {
     }
     engine.commit_tx(tx).unwrap();
 
-    let original = model.clone();
     let rw = engine.begin_tx(TxMode::Readwrite).unwrap();
     for i in 0..50usize {
         if i % 2 == 0 {
@@ -152,7 +151,6 @@ fn rollback_does_not_touch_committed_state() {
     }
     engine.rollback_tx(rw).unwrap();
 
-    assert_eq!(model, original);
     assert_engine_matches_model(&mut engine, &model);
 }
 

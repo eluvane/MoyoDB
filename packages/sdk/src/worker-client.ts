@@ -381,7 +381,7 @@ export class WorkerProtocolClient implements WorkerApi {
                     : null;
             this.pending.set(id, {
                 command: responseCommand,
-                resolve: (value) => resolve(value),
+                resolve,
                 reject,
                 timeout
             });
@@ -400,11 +400,23 @@ export class WorkerProtocolClient implements WorkerApi {
     }
 
     private queueRequest(message: WorkerProtocolRequestMessage, transfer: Transferable[]): void {
-        const captured = captureWorkerPayload(message, transfer);
         if (!this.pending.has(message.id)) return;
-        if (this.queuedRequests.length > 0 && this.queuedBytes + captured.byteLength > MAX_WORKER_BATCH_BYTES) {
+        const byteLength = payloadBytes(message);
+        if (this.queuedRequests.length > 0 && this.queuedBytes + byteLength > MAX_WORKER_BATCH_BYTES) {
             this.flushRequests();
         }
+        // A full batch posts in this turn, so postMessage is the snapshot.
+        const releaseNow =
+            this.queuedRequests.length + 1 >= MAX_WORKER_BATCH_MESSAGES ||
+            this.queuedBytes + byteLength >= MAX_WORKER_BATCH_BYTES;
+        if (releaseNow) {
+            this.queuedRequests.push({ message, transfer, byteLength });
+            this.queuedBytes += byteLength;
+            this.flushRequests();
+            return;
+        }
+        const captured = snapshotQueuedPayload(message, transfer);
+        if (!this.pending.has(message.id)) return;
         this.queuedRequests.push({
             message: captured.value,
             transfer: captured.transfer,
@@ -417,9 +429,6 @@ export class WorkerProtocolClient implements WorkerApi {
                 this.flushScheduled = false;
                 this.flushRequests();
             });
-        }
-        if (this.queuedRequests.length >= MAX_WORKER_BATCH_MESSAGES || this.queuedBytes >= MAX_WORKER_BATCH_BYTES) {
-            this.flushRequests();
         }
     }
 
@@ -591,4 +600,299 @@ export class WorkerProtocolClient implements WorkerApi {
             this.fatalHandler?.(reason);
         }
     }
+}
+
+interface ViewGeometry {
+    offset: number;
+    length: number;
+    dataView: boolean;
+}
+
+const STANDARD_VIEW_CONSTRUCTORS = new Set<object>([
+    DataView,
+    Uint8Array,
+    Uint8ClampedArray,
+    Uint16Array,
+    Uint32Array,
+    Int8Array,
+    Int16Array,
+    Int32Array,
+    Float32Array,
+    Float64Array,
+    BigInt64Array,
+    BigUint64Array
+]);
+
+/**
+ * Freeze a queued payload so the later postMessage is its only structured clone.
+ * Listed buffers move now. Other ArrayBuffers are copied. SharedArrayBuffers stay shared.
+ */
+function snapshotQueuedPayload<T>(
+    value: T,
+    transfer: readonly Transferable[]
+): { value: T; transfer: Transferable[]; byteLength: number } {
+    const moving = new Set<ArrayBuffer>();
+    for (const item of transfer) {
+        if (!(item instanceof ArrayBuffer) || isResizableBuffer(item)) {
+            return captureWorkerPayload(value, transfer as Transferable[]);
+        }
+        moving.add(item);
+    }
+    const geometries = new Map<ArrayBufferView, ViewGeometry>();
+    if (!isPlainPayload(value, geometries, new WeakSet<object>())) {
+        return captureWorkerPayload(value, transfer as Transferable[]);
+    }
+    const relocated = new Map<ArrayBuffer, ArrayBuffer>();
+    for (const buffer of moving) {
+        relocated.set(buffer, moveArrayBuffer(buffer));
+    }
+    const owned: ArrayBuffer[] = [];
+    const seen = new WeakMap<object, unknown>();
+    const cloneValue = (item: unknown): unknown => {
+        if (item === null || typeof item !== 'object') {
+            return item;
+        }
+        const existing = seen.get(item);
+        if (existing !== undefined) {
+            return existing;
+        }
+        if (typeof SharedArrayBuffer !== 'undefined' && item instanceof SharedArrayBuffer) {
+            seen.set(item, item);
+            return item;
+        }
+        if (item instanceof ArrayBuffer) {
+            const next = relocated.get(item) ?? item.slice(0);
+            seen.set(item, next);
+            owned.push(next);
+            return next;
+        }
+        if (ArrayBuffer.isView(item)) {
+            const geometry = geometries.get(item);
+            if (!geometry) {
+                throw workerProtocolError('WorkerProtocolError', 'worker payload could not be queued');
+            }
+            const buffer = item.buffer;
+            const nextBuffer =
+                typeof SharedArrayBuffer !== 'undefined' && buffer instanceof SharedArrayBuffer
+                    ? buffer
+                    : (cloneValue(buffer) as ArrayBuffer);
+            const out = retargetView(item, nextBuffer, geometry);
+            seen.set(item, out);
+            return out;
+        }
+        if (Array.isArray(item)) {
+            const out = new Array<unknown>(item.length);
+            seen.set(item, out);
+            for (let index = 0; index < item.length; index += 1) {
+                if (index in item) {
+                    out[index] = cloneValue(item[index]);
+                }
+            }
+            return out;
+        }
+        const out: Record<string, unknown> = Object.getPrototypeOf(item) === null ? Object.create(null) : {};
+        seen.set(item, out);
+        const record = item as Record<string, unknown>;
+        for (const key in record) {
+            if (Object.prototype.hasOwnProperty.call(record, key)) {
+                out[key] = cloneValue(record[key]);
+            }
+        }
+        return out;
+    };
+    const cloned = cloneValue(value) as T;
+    return { value: cloned, transfer: owned, byteLength: payloadBytes(cloned) };
+}
+
+function payloadBytes(value: unknown): number {
+    let byteLength = 0;
+    const seen = new WeakSet<object>();
+    const visit = (item: unknown): void => {
+        if (!Number.isFinite(byteLength)) return;
+        if (typeof item === 'string') {
+            byteLength += 8 + item.length * 2;
+            return;
+        }
+        if (item === null || typeof item !== 'object') {
+            byteLength += 8;
+            return;
+        }
+        if (seen.has(item)) {
+            return;
+        }
+        seen.add(item);
+        byteLength += 8;
+        if (item instanceof ArrayBuffer) {
+            byteLength += item.byteLength;
+        } else if (typeof SharedArrayBuffer !== 'undefined' && item instanceof SharedArrayBuffer) {
+            byteLength += item.byteLength;
+        } else if (ArrayBuffer.isView(item)) {
+            visit(item.buffer);
+        } else if (Array.isArray(item)) {
+            if (Object.getPrototypeOf(item) !== Array.prototype || hasExtraKeys(item)) {
+                byteLength = Number.POSITIVE_INFINITY;
+                return;
+            }
+            for (let index = 0; index < item.length; index += 1) {
+                const descriptor = Object.getOwnPropertyDescriptor(item, String(index));
+                if (descriptor && !('value' in descriptor)) {
+                    byteLength = Number.POSITIVE_INFINITY;
+                    return;
+                }
+                visit(descriptor?.value);
+            }
+        } else if (item instanceof Map) {
+            for (const [key, child] of item) {
+                visit(key);
+                visit(child);
+            }
+        } else if (item instanceof Set) {
+            for (const child of item) {
+                visit(child);
+            }
+        } else {
+            const record = item as Record<string, unknown>;
+            for (const key in record) {
+                if (Object.prototype.hasOwnProperty.call(record, key)) {
+                    const descriptor = Object.getOwnPropertyDescriptor(record, key);
+                    // Let postMessage evaluate accessors and preserve special data keys.
+                    if (key === '__proto__' || !descriptor || !('value' in descriptor)) {
+                        byteLength = Number.POSITIVE_INFINITY;
+                        return;
+                    }
+                    byteLength += 8 + key.length * 2;
+                    visit(descriptor.value);
+                }
+            }
+        }
+    };
+    visit(value);
+    return byteLength;
+}
+
+function isPlainPayload(
+    value: unknown,
+    geometries: Map<ArrayBufferView, ViewGeometry>,
+    seen: WeakSet<object>
+): boolean {
+    if (typeof value === 'function' || typeof value === 'symbol') {
+        return false;
+    }
+    if (value === null || typeof value !== 'object') {
+        return true;
+    }
+    if (seen.has(value)) {
+        return true;
+    }
+    seen.add(value);
+    if (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer) {
+        return !isResizableBuffer(value);
+    }
+    if (value instanceof ArrayBuffer) {
+        return !isResizableBuffer(value);
+    }
+    if (ArrayBuffer.isView(value)) {
+        if (!isStandardView(value)) {
+            return false;
+        }
+        const buffer = value.buffer;
+        if (typeof SharedArrayBuffer !== 'undefined' && buffer instanceof SharedArrayBuffer) {
+            if (isResizableBuffer(buffer)) {
+                return false;
+            }
+            geometries.set(value, viewGeometry(value));
+            return true;
+        }
+        if (!(buffer instanceof ArrayBuffer) || isResizableBuffer(buffer)) {
+            return false;
+        }
+        geometries.set(value, viewGeometry(value));
+        return true;
+    }
+    if (value instanceof Map || value instanceof Set || value instanceof Date || value instanceof RegExp) {
+        return false;
+    }
+    if (Array.isArray(value)) {
+        if (hasExtraKeys(value) || hasEnumerableSymbols(value)) {
+            return false;
+        }
+        for (const child of value) {
+            if (!isPlainPayload(child, geometries, seen)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) {
+        return false;
+    }
+    if (hasEnumerableSymbols(value)) {
+        return false;
+    }
+    const record = value as Record<string, unknown>;
+    for (const key in record) {
+        if (Object.prototype.hasOwnProperty.call(record, key) && !isPlainPayload(record[key], geometries, seen)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function hasExtraKeys(value: readonly unknown[]): boolean {
+    const record: object = value;
+    for (const key in record) {
+        if (!Object.prototype.hasOwnProperty.call(value, key)) {
+            continue;
+        }
+        const index = Number(key);
+        if (!Number.isInteger(index) || index < 0 || index >= value.length || String(index) !== key) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function hasEnumerableSymbols(value: object): boolean {
+    for (const symbol of Object.getOwnPropertySymbols(value)) {
+        if (Object.prototype.propertyIsEnumerable.call(value, symbol)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function isStandardView(view: ArrayBufferView): boolean {
+    return STANDARD_VIEW_CONSTRUCTORS.has(view.constructor);
+}
+
+function viewGeometry(view: ArrayBufferView): ViewGeometry {
+    if (view instanceof DataView) {
+        return { offset: view.byteOffset, length: view.byteLength, dataView: true };
+    }
+    return { offset: view.byteOffset, length: (view as Uint8Array).length, dataView: false };
+}
+
+function retargetView(view: ArrayBufferView, buffer: ArrayBufferLike, geometry: ViewGeometry): ArrayBufferView {
+    if (geometry.dataView) {
+        return new DataView(buffer, geometry.offset, geometry.length);
+    }
+    const Typed = view.constructor as new (
+        buffer: ArrayBufferLike,
+        byteOffset: number,
+        length: number
+    ) => ArrayBufferView;
+    return new Typed(buffer, geometry.offset, geometry.length);
+}
+
+function moveArrayBuffer(buffer: ArrayBuffer): ArrayBuffer {
+    const movable = buffer as ArrayBuffer & { transfer?: () => ArrayBuffer };
+    if (typeof movable.transfer === 'function') {
+        return movable.transfer();
+    }
+    return structuredClone(buffer, { transfer: [buffer] });
+}
+
+function isResizableBuffer(buffer: ArrayBuffer | SharedArrayBuffer): boolean {
+    return (buffer as { resizable?: boolean }).resizable === true;
 }

@@ -115,7 +115,7 @@ jobs:
         with:
           auto-config: false
           lake-package-directory: proofs/moyodb_proofs
-          use-github-cache: false
+          use-github-cache: true
           use-mathlib-cache: false
           build: true
           build-args: '--wfail MoyoDbProofs'
@@ -238,10 +238,28 @@ jobs:
         with:
           config-file: .config/moyo/ci/dependency-review-config.yml
 
-  test:
-    name: MoyoDB tests
+  test-rust:
+    name: MoyoDB Rust tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master; toolchain 1.98.1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Run Rust CI tests
+        run: npm run test:rust:ci
+
+  test-sdk:
+    name: MoyoDB SDK tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -259,19 +277,32 @@ jobs:
       - name: Install Node dependencies
         run: npm ci --ignore-scripts --no-audit --no-fund --prefer-online --registry=https://registry.npmjs.org/
       - name: Install wasm-pack
-        run: cargo install --locked wasm-pack --version 0.15.0
+        run: node scripts/ci/install-wasm-pack.mjs
+      - name: Install Playwright Chromium
+        if: github.event_name == 'pull_request'
+        run: npm exec --workspace @moyodb/sdk -- playwright install --with-deps chromium
       - name: Install Playwright browsers
+        if: github.event_name != 'pull_request'
         run: npm exec --workspace @moyodb/sdk -- playwright install --with-deps
       - name: Run repository tooling tests
         run: npm run test:tooling
-      - name: Run Rust tests
-        run: npm run test:rust
       - name: Run OPFS shim tests
         run: npm run test:shim
-      - name: Run SDK Node and browser tests
+      - name: Run SDK browser tests
+        if: github.event_name == 'pull_request'
+        env:
+          MOYODB_WASM_READY: '1'
+          MOYODB_PLAYWRIGHT_PROJECTS: chromium
+        run: npm run test:sdk
+      - name: Run SDK browser tests
+        if: github.event_name != 'pull_request'
+        env:
+          MOYODB_WASM_READY: '1'
         run: npm run test:sdk
       - name: Verify Node and native storage interoperability
-        run: cargo test --locked -p moyodb-engine --test file_backend node_native_file_format_roundtrip_through_active_generation -- --ignored
+        run: >-
+          cargo test --locked -p moyodb-engine --test file_backend
+          node_native_file_format_roundtrip_through_active_generation -- --ignored
       - name: Run opt-in soak tests
         if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.full_quality || inputs.run_soak))
         run: npm run test:browser:soak --workspace @moyodb/sdk
@@ -288,7 +319,8 @@ jobs:
       - lint-repo
       - quality
       - security
-      - test
+      - test-rust
+      - test-sdk
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -306,7 +338,7 @@ jobs:
       - name: Install Node dependencies
         run: npm ci --ignore-scripts --no-audit --no-fund --prefer-online --registry=https://registry.npmjs.org/
       - name: Install wasm-pack
-        run: cargo install --locked wasm-pack --version 0.15.0
+        run: node scripts/ci/install-wasm-pack.mjs
       - name: Build SDK/WASM package
         run: npm run build
       - name: Verify WASM artifacts are present for SDK/browser path

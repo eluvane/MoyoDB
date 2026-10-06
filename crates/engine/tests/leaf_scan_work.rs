@@ -191,8 +191,8 @@ fn keys_only_pruning_does_not_allocate_inline_payloads() -> Result<()> {
         println!("work keys_only_pruning limit={limit}: {work:?}");
         assert_eq!(work.payload_requests, 0, "pruning does not consume values");
         assert_eq!(work.payload_bytes, 0);
-        // One upper bound copy in RangeSpec and one owned iterator bound.
-        assert_eq!(work.key_requests, limit.min(8) + 2);
+        // The upper bound is borrowed from the caller, so only returned keys allocate.
+        assert_eq!(work.key_requests, limit.min(8));
         if let Some(key) = actual.first_mut() {
             key.fill(0xff);
             assert_eq!(

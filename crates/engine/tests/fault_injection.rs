@@ -282,6 +282,14 @@ impl FaultBundle {
     fn tripped(&self) -> Option<String> {
         lock(&self.controller).tripped.clone()
     }
+
+    fn durable_bytes(&self) -> [Vec<u8>; 3] {
+        [
+            lock(&self.manifest.state).durable.clone(),
+            lock(&self.main.state).durable.clone(),
+            lock(&self.wal.state).durable.clone(),
+        ]
+    }
 }
 
 type Rows = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -415,13 +423,49 @@ fn eager_checkpoint() -> OpenConfig {
     }
 }
 
+/// Durable bytes after `build`, with no extra checkpoint on drop.
+///
+/// Reopening the deferred seed replays that commit, then the armed commit and
+/// close hit the same storage operations as a live engine. Eager checkpoint
+/// cannot use this: the page freed by the seed commit stays only in memory,
+/// and without it two main-file writes collapse into one. The large checkpoint
+/// cannot either: recovery installs its dirty pages, so the checkpoint that
+/// follows issues no writes.
+fn durable_image(config: &OpenConfig, build: impl FnOnce(&mut Engine<FaultyFile>)) -> [Vec<u8>; 3] {
+    let bundle = FaultBundle::new();
+    let mut engine = Engine::open(DB, bundle.files(), config.clone()).expect("open image database");
+    build(&mut engine);
+    drop(engine);
+    bundle.durable_bytes()
+}
+
+fn open_image(config: &OpenConfig, image: &[Vec<u8>; 3]) -> (FaultBundle, Engine<FaultyFile>) {
+    let bundle = FaultBundle::with_contents(image.clone());
+    let engine = Engine::open(DB, bundle.files(), config.clone()).expect("open durable image");
+    (bundle, engine)
+}
+
 /// Fail counted operation `target` during commit or close. Return false
 /// when no operation reaches `target`, so the fault sweep terminates.
 fn commit_case(config: &OpenConfig, fault: Fault, target: u64) -> bool {
     let bundle = FaultBundle::new();
     let mut engine = Engine::open(DB, bundle.files(), config.clone()).expect("open fresh database");
     seed(&mut engine);
+    fault_commit(config, bundle, engine, fault, target)
+}
 
+fn commit_from_image(config: &OpenConfig, image: &[Vec<u8>; 3], fault: Fault, target: u64) -> bool {
+    let (bundle, engine) = open_image(config, image);
+    fault_commit(config, bundle, engine, fault, target)
+}
+
+fn fault_commit(
+    config: &OpenConfig,
+    bundle: FaultBundle,
+    mut engine: Engine<FaultyFile>,
+    fault: Fault,
+    target: u64,
+) -> bool {
     bundle.arm(fault, target);
     let committed = mutate(&mut engine);
     let closed = (committed.is_ok() && bundle.tripped().is_none()).then(|| engine.close());
@@ -488,7 +532,7 @@ fn recover_in_place(
     );
 }
 
-fn sweep(config: OpenConfig, case: fn(&OpenConfig, Fault, u64) -> bool) {
+fn sweep(config: OpenConfig, mut case: impl FnMut(&OpenConfig, Fault, u64) -> bool) {
     for fault in FAULTS {
         let mut target = 1;
         while case(&config, fault, target) {
@@ -504,7 +548,11 @@ fn sweep(config: OpenConfig, case: fn(&OpenConfig, Fault, u64) -> bool) {
 
 #[test]
 fn every_fault_during_commit_with_deferred_checkpoint_is_atomic() {
-    sweep(deferred_checkpoint(), commit_case);
+    let config = deferred_checkpoint();
+    let image = durable_image(&config, seed);
+    sweep(config, |config, fault, target| {
+        commit_from_image(config, &image, fault, target)
+    });
 }
 
 #[test]
@@ -514,14 +562,8 @@ fn every_fault_during_commit_with_eager_checkpoint_is_atomic() {
 
 /// Fail each storage operation while replaying a durable, uninstalled WAL
 /// commit. A later clean open must recover the same commit.
-fn recovery_case(config: &OpenConfig, fault: Fault, target: u64) -> bool {
-    let bundle = FaultBundle::new();
-    let mut engine = Engine::open(DB, bundle.files(), config.clone()).expect("open fresh database");
-    seed(&mut engine);
-    mutate(&mut engine).expect("commit before crash");
-    drop(engine);
-
-    let crashed = bundle.crash_copy();
+fn recovery_case(config: &OpenConfig, image: &[Vec<u8>; 3], fault: Fault, target: u64) -> bool {
+    let crashed = FaultBundle::with_contents(image.clone());
     crashed.arm(fault, target);
     let opened = Engine::open(DB, crashed.files(), config.clone());
     let Some(trip) = crashed.tripped() else {
@@ -545,7 +587,14 @@ fn recovery_case(config: &OpenConfig, fault: Fault, target: u64) -> bool {
 
 #[test]
 fn every_fault_during_crash_recovery_is_idempotent() {
-    sweep(deferred_checkpoint(), recovery_case);
+    let config = deferred_checkpoint();
+    let image = durable_image(&config, |engine| {
+        seed(engine);
+        mutate(engine).expect("commit before crash");
+    });
+    sweep(config, |config, fault, target| {
+        recovery_case(config, &image, fault, target)
+    });
 }
 
 /// Dirty images span several main-file write batches. Partial writes and

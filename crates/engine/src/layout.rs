@@ -168,16 +168,18 @@ pub const WAL_COMMIT_BODY_SIZE: usize = size_of::<WalCommitBody>();
 /// use moyodb_engine::layout::unsafe_read_struct;
 /// let _decode: fn(&[u8]) -> moyodb_engine::Result<bool> = unsafe_read_struct::<bool>;
 /// ```
+#[inline]
 pub fn unsafe_read_struct<T: FromBytes + Copy>(bytes: &[u8]) -> Result<T> {
-    T::read_from_prefix(bytes)
-        .map(|(value, _)| value)
-        .map_err(|_| {
-            EngineError::Serialization(format!(
-                "short struct read: need {}, got {}",
-                size_of::<T>(),
-                bytes.len()
-            ))
-        })
+    match T::read_from_prefix(bytes) {
+        Ok((value, _)) => Ok(value),
+        Err(_) => Err(short_struct_read(size_of::<T>(), bytes.len())),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn short_struct_read(need: usize, got: usize) -> EngineError {
+    EngineError::Serialization(format!("short struct read: need {need}, got {got}"))
 }
 
 pub fn encode_superblock_slot(state: &SuperblockState) -> [u8; SUPERBLOCK_SLOT_SIZE] {
@@ -241,10 +243,12 @@ pub fn decode_superblock_slot(slot_index: usize, bytes: &[u8]) -> Result<Option<
     }))
 }
 
+#[inline]
 pub fn page_offset(page_id: u64) -> u64 {
     page_id.saturating_sub(1).saturating_mul(PAGE_SIZE as u64)
 }
 
+#[inline]
 pub fn wal_record_total_len(payload_len: usize) -> usize {
     WAL_RECORD_HEADER_SIZE.saturating_add(payload_len)
 }

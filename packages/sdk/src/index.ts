@@ -46,6 +46,7 @@ import {
 } from './errors';
 import {
     assertPublicStoreName,
+    assertValidScanRange,
     normalizeIndexDefinitions,
     serializeNormalizedIndexDefinitions,
     toPublicIndexDefinitions,
@@ -59,6 +60,9 @@ import type { AutocommitArgs, WorkerCommandResult } from './worker-protocol';
 const INDEX_SCAN_PAGE_ROWS = 256;
 const SCAN_PAGE_ROWS = 256;
 const SCAN_PAGE_BYTES = 8 * 1024 * 1024 + 18 + 1024 + 12;
+/** Reused when a put has no ttl, or a scan range is omitted. Do not mutate. */
+const EMPTY_RANGE: Range = Object.freeze({});
+const EMPTY_PUT_OPTIONS: PutOptions = Object.freeze({});
 
 async function callProxy<T>(fn: () => Promise<T>): Promise<T> {
     try {
@@ -100,12 +104,12 @@ class TransactionImpl implements Transaction {
         assertPublicStoreName(store);
         return callProxy(() => this.#entry.proxy.has(this.#txId, store, key));
     }
-    async put(store: string, key: Uint8Array, value: Uint8Array, options: PutOptions = {}): Promise<void> {
+    async put(store: string, key: Uint8Array, value: Uint8Array, options?: PutOptions): Promise<void> {
         this.#ensureOpen();
         assertPublicStoreName(store);
         return callProxy(() => this.#entry.proxy.put(this.#txId, store, key, value, normalizePutOptions(options)));
     }
-    async putMany(store: string, entries: Array<[Uint8Array, Uint8Array]>, options: PutOptions = {}): Promise<void> {
+    async putMany(store: string, entries: Array<[Uint8Array, Uint8Array]>, options?: PutOptions): Promise<void> {
         this.#ensureOpen();
         assertPublicStoreName(store);
         return callProxy(() => this.#entry.proxy.putMany(this.#txId, store, entries, normalizePutOptions(options)));
@@ -125,10 +129,12 @@ class TransactionImpl implements Transaction {
         assertPublicStoreName(store);
         return callProxy(() => this.#entry.proxy.applyBatch(this.#txId, store, ops));
     }
-    async scan(store: string, range: Range = {}): Promise<ScanItem[]> {
+    async scan(store: string, range?: Range): Promise<ScanItem[]> {
         this.#ensureOpen();
         assertPublicStoreName(store);
-        return callProxy(() => this.#entry.proxy.scan(this.#txId, store, range));
+        const bounds = range ?? EMPTY_RANGE;
+        assertValidScanRange(bounds);
+        return callProxy(() => this.#entry.proxy.scan(this.#txId, store, bounds));
     }
     async scanPage(store: string, range: Range = {}, options: ScanPageOptions = {}): Promise<ScanPage> {
         this.#ensureOpen();
@@ -168,25 +174,33 @@ class TransactionImpl implements Transaction {
     async *scanByIndex(
         store: string,
         indexName: string,
-        range: Range = {},
+        range: Range = EMPTY_RANGE,
         options: IndexScanOptions = {}
     ): AsyncIterable<[Uint8Array, Uint8Array]> {
         this.#ensureOpen();
         assertPublicStoreName(store);
         const { maxRows: pageRows, maxBytes } = normalizeScanPageOptions(options);
+        const bounds = range;
+        assertValidScanRange(bounds);
         let remaining = range.limit ?? Number.POSITIVE_INFINITY;
         let cursor: Uint8Array | null = null;
+        const proxy = this.#entry.proxy;
+        const txId = this.#txId;
         while (remaining > 0) {
             this.#ensureOpen();
             const pageLimit = Math.min(remaining, pageRows, INDEX_SCAN_PAGE_ROWS);
-            const resumeAfter: Uint8Array | null = cursor;
-            const page: IndexScanPage = await callProxy(() =>
-                this.#entry.proxy.scanByIndexPage(this.#txId, store, indexName, range, resumeAfter, pageLimit, maxBytes)
-            );
-            for (const row of page.rows) {
+            let page: IndexScanPage;
+            try {
+                page = await proxy.scanByIndexPage(txId, store, indexName, bounds, cursor, pageLimit, maxBytes);
+            } catch (error) {
+                throw normalizeError(error);
+            }
+            const rows = page.rows;
+            for (let index = 0; index < rows.length; index += 1) {
+                const row = rows[index];
                 yield [row.key, row.value];
             }
-            remaining -= page.rows.length;
+            remaining -= rows.length;
             if (page.cursor === null) {
                 return;
             }
@@ -383,7 +397,7 @@ class DBImpl implements DB {
         assertPublicStoreName(store);
         return this.#autocommit('readonly', 'has', [store, key]);
     }
-    async put(store: string, key: Uint8Array, value: Uint8Array, options: PutOptions = {}): Promise<void> {
+    async put(store: string, key: Uint8Array, value: Uint8Array, options?: PutOptions): Promise<void> {
         assertPublicStoreName(store);
         await this.#autocommit('readwrite', 'put', [store, key, value, normalizePutOptions(options)]);
     }
@@ -391,9 +405,9 @@ class DBImpl implements DB {
         assertPublicStoreName(store);
         return this.#autocommit('readwrite', 'delete', [store, key]);
     }
-    async scan(store: string, range: Range = {}): Promise<ScanItem[]> {
+    async scan(store: string, range?: Range): Promise<ScanItem[]> {
         assertPublicStoreName(store);
-        return this.#autocommit('readonly', 'scan', [store, range]);
+        return this.#autocommit('readonly', 'scan', [store, range ?? EMPTY_RANGE]);
     }
     async scanPage(store: string, range: Range = {}, options: ScanPageOptions = {}): Promise<ScanPage> {
         this.#ensureOpen();
@@ -647,10 +661,10 @@ class MigrationTransactionImpl implements Transaction {
     async has(store: string, key: Uint8Array): Promise<boolean> {
         return this.#inner.has(store, key);
     }
-    async put(store: string, key: Uint8Array, value: Uint8Array, options: PutOptions = {}): Promise<void> {
+    async put(store: string, key: Uint8Array, value: Uint8Array, options?: PutOptions): Promise<void> {
         await this.#inner.put(store, key, value, options);
     }
-    async putMany(store: string, entries: Array<[Uint8Array, Uint8Array]>, options: PutOptions = {}): Promise<void> {
+    async putMany(store: string, entries: Array<[Uint8Array, Uint8Array]>, options?: PutOptions): Promise<void> {
         await this.#inner.putMany(store, entries, options);
     }
     async delete(store: string, key: Uint8Array): Promise<boolean> {
@@ -662,7 +676,7 @@ class MigrationTransactionImpl implements Transaction {
     async applyBatch(store: string, ops: Array<BatchOp>): Promise<void> {
         await this.#inner.applyBatch(store, ops);
     }
-    async scan(store: string, range: Range = {}): Promise<ScanItem[]> {
+    async scan(store: string, range?: Range): Promise<ScanItem[]> {
         return this.#inner.scan(store, range);
     }
     scanPage(store: string, range: Range = {}, options: ScanPageOptions = {}): Promise<ScanPage> {
@@ -745,13 +759,13 @@ class MigrationDbImpl implements DB {
     async has(store: string, key: Uint8Array): Promise<boolean> {
         return this.#transaction.has(store, key);
     }
-    async put(store: string, key: Uint8Array, value: Uint8Array, options: PutOptions = {}): Promise<void> {
+    async put(store: string, key: Uint8Array, value: Uint8Array, options?: PutOptions): Promise<void> {
         await this.#transaction.put(store, key, value, options);
     }
     async delete(store: string, key: Uint8Array): Promise<boolean> {
         return this.#transaction.delete(store, key);
     }
-    async scan(store: string, range: Range = {}): Promise<ScanItem[]> {
+    async scan(store: string, range?: Range): Promise<ScanItem[]> {
         return this.#transaction.scan(store, range);
     }
     scanPage(store: string, range: Range = {}, options: ScanPageOptions = {}): Promise<ScanPage> {
@@ -928,11 +942,20 @@ function normalizeSchemaVersion(value: unknown): number | undefined {
     );
 }
 function normalizePutOptions(options: unknown): PutOptions {
-    const { ttl } = normalizeOptionsObject<{
-        ttl?: unknown;
-    }>(options, 'put options must be an object');
-    const normalizedTtl = normalizeOptionalNonNegativeSafeInteger(ttl, 'ttl must be a non-negative safe integer');
-    return normalizedTtl === undefined ? {} : { ttl: normalizedTtl };
+    if (options === undefined) {
+        return EMPTY_PUT_OPTIONS;
+    }
+    if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+        throw new TypeError('put options must be an object');
+    }
+    const ttl = (options as { ttl?: unknown }).ttl;
+    if (ttl === undefined) {
+        return EMPTY_PUT_OPTIONS;
+    }
+    if (typeof ttl !== 'number' || !Number.isSafeInteger(ttl) || ttl < 0) {
+        throw new TypeError('ttl must be a non-negative safe integer');
+    }
+    return { ttl };
 }
 function normalizeCompressionOptions<T extends CreateStoreOptions | ExportSnapshotOptions>(
     options: unknown,

@@ -1,13 +1,6 @@
-import { InvalidOpenOptionsError, ReservedStoreNameError, SerializationError } from './errors';
+import { InvalidOpenOptionsError, InvalidRangeError, ReservedStoreNameError, SerializationError } from './errors';
 import { compareStringsByCodeUnit } from './internal';
-import {
-    encodeCompoundKeyParts,
-    encodeIndexScalar,
-    prefixRange,
-    prefixSuccessor,
-    splitCompoundKey,
-    utf8Encode
-} from './codec';
+import { encodeCompoundKeyParts, encodeIndexScalar, utf8Encode } from './codec';
 import type { IndexDef, Range } from './types';
 const fatalDecoder = new TextDecoder('utf-8', { fatal: true });
 const MISSING = Symbol('moyodb.indexing.missing');
@@ -139,28 +132,50 @@ export function decodeIndexMetadataValue(bytes: Uint8Array): NormalizedIndexDef 
     }
 }
 export function encodeIndexEntryKey(logicalIndexKey: Uint8Array, primaryKey: Uint8Array): Uint8Array {
-    return encodeCompoundKeyParts([logicalIndexKey, primaryKey]);
+    const out = new Uint8Array(compoundEncodedLength(logicalIndexKey) + compoundEncodedLength(primaryKey));
+    const primaryAt = writeCompoundPart(out, 0, logicalIndexKey);
+    writeCompoundPart(out, primaryAt, primaryKey);
+    return out;
 }
 export function decodeIndexEntryKey(bytes: Uint8Array): DecodedIndexEntryKey {
-    let parts: Uint8Array[];
     try {
-        parts = splitCompoundKey(bytes);
+        return decodeTwoPartIndexKey(bytes);
     } catch (error) {
+        if (error instanceof SerializationError) {
+            throw error;
+        }
         throw new SerializationError(`invalid index entry key encoding: ${String(error)}`);
     }
-    if (parts.length !== 2) {
-        throw new SerializationError('invalid index entry key encoding');
-    }
-    return {
-        logicalKey: parts[0],
-        primaryKey: parts[1]
-    };
 }
 export function indexKeyExactRange(logicalIndexKey: Uint8Array): Range {
-    return prefixRange(encodeCompoundKeyParts([logicalIndexKey]));
+    const gte = encodeCompoundPrefix(logicalIndexKey);
+    const lt = advanceEncodedPrefix(gte.slice());
+    return lt ? { gte, lt } : { gte };
 }
+/** WASM `usize` is 32-bit, so this is the largest limit the engine can accept. */
+export const MAX_ENGINE_SCAN_LIMIT = 0xffff_ffff;
+
+/**
+ * Bounds and limits follow the engine `RangeSpec` contract.
+ * Conflicting bounds and a limit the engine cannot store are `InvalidRangeError`.
+ */
+export function assertValidScanRange(range: Range = {}): void {
+    if (range.gt !== undefined && range.gte !== undefined) {
+        throw new InvalidRangeError('range cannot include both gt and gte');
+    }
+    if (range.lt !== undefined && range.lte !== undefined) {
+        throw new InvalidRangeError('range cannot include both lt and lte');
+    }
+    if (
+        range.limit !== undefined &&
+        (!Number.isSafeInteger(range.limit) || range.limit < 0 || range.limit > MAX_ENGINE_SCAN_LIMIT)
+    ) {
+        throw new InvalidRangeError('limit must be an integer between 0 and 4294967295');
+    }
+}
+
 export function indexRangeToPhysicalRange(range: Range = {}): Range {
-    validateIndexRangeShape(range);
+    assertValidScanRange(range);
     const physical: Range = {};
     if (range.reverse !== undefined) {
         physical.reverse = range.reverse;
@@ -169,19 +184,19 @@ export function indexRangeToPhysicalRange(range: Range = {}): Range {
         physical.limit = range.limit;
     }
     if (range.gte) {
-        physical.gte = encodeCompoundKeyParts([range.gte]);
+        physical.gte = encodeCompoundPrefix(range.gte);
     }
     if (range.gt) {
-        const lower = prefixSuccessor(encodeCompoundKeyParts([range.gt]));
+        const lower = advanceEncodedPrefix(encodeCompoundPrefix(range.gt));
         if (lower) {
             physical.gte = lower;
         }
     }
     if (range.lt) {
-        physical.lt = encodeCompoundKeyParts([range.lt]);
+        physical.lt = encodeCompoundPrefix(range.lt);
     }
     if (range.lte) {
-        const upper = prefixSuccessor(encodeCompoundKeyParts([range.lte]));
+        const upper = advanceEncodedPrefix(encodeCompoundPrefix(range.lte));
         if (upper) {
             physical.lt = upper;
         }
@@ -356,11 +371,128 @@ function describeValue(value: unknown): string {
     }
     return typeof value;
 }
-function validateIndexRangeShape(range: Range): void {
-    if (range.gt !== undefined && range.gte !== undefined) {
-        throw new TypeError('index range cannot specify both gt and gte');
+const INDEX_KEY_ESCAPE = 0x00;
+const INDEX_KEY_ESCAPE_CONT = 0xff;
+const INDEX_KEY_TERM = 0x00;
+function compoundEncodedLength(part: Uint8Array): number {
+    let zeros = 0;
+    const length = part.length;
+    for (let index = 0; index < length; index += 1) {
+        if (part[index] === INDEX_KEY_ESCAPE) {
+            zeros += 1;
+        }
     }
-    if (range.lt !== undefined && range.lte !== undefined) {
-        throw new TypeError('index range cannot specify both lt and lte');
+    return length + zeros + 2;
+}
+function writeCompoundPart(out: Uint8Array, offset: number, part: Uint8Array): number {
+    const length = part.length;
+    for (let index = 0; index < length; index += 1) {
+        const byte = part[index];
+        if (byte === INDEX_KEY_ESCAPE) {
+            out[offset] = INDEX_KEY_ESCAPE;
+            out[offset + 1] = INDEX_KEY_ESCAPE_CONT;
+            offset += 2;
+        } else {
+            out[offset] = byte;
+            offset += 1;
+        }
+    }
+    out[offset] = INDEX_KEY_TERM;
+    out[offset + 1] = INDEX_KEY_TERM;
+    return offset + 2;
+}
+function encodeCompoundPrefix(part: Uint8Array): Uint8Array {
+    const out = new Uint8Array(compoundEncodedLength(part));
+    writeCompoundPart(out, 0, part);
+    return out;
+}
+// In-place prefixSuccessor. Compound prefixes end in 0x00, so the final byte
+// advances inside this buffer instead of allocating a second copy.
+function advanceEncodedPrefix(prefix: Uint8Array): Uint8Array | null {
+    for (let index = prefix.length - 1; index >= 0; index -= 1) {
+        if (prefix[index] !== 0xff) {
+            prefix[index] += 1;
+            return index + 1 === prefix.length ? prefix : prefix.subarray(0, index + 1);
+        }
+    }
+    return null;
+}
+// Count both parts, then fill exact buffers. splitCompoundKey would also build a
+// temporary number list for every byte of every scanned index row.
+function decodeTwoPartIndexKey(bytes: Uint8Array): DecodedIndexEntryKey {
+    const cursor = { unescaped: 0, end: 0 };
+    if (!readCompoundPart(bytes, 0, cursor)) {
+        throw new SerializationError('invalid index entry key encoding');
+    }
+    const logicalLength = cursor.unescaped;
+    const primaryStart = cursor.end;
+    if (!readCompoundPart(bytes, primaryStart, cursor)) {
+        throw new SerializationError('invalid index entry key encoding');
+    }
+    const primaryLength = cursor.unescaped;
+    let end = cursor.end;
+    if (end !== bytes.length) {
+        for (;;) {
+            if (!readCompoundPart(bytes, end, cursor)) {
+                throw new SerializationError('invalid index entry key encoding');
+            }
+            if (cursor.end <= end) {
+                throw new TypeError('invalid compound key encoding');
+            }
+            end = cursor.end;
+            if (end === bytes.length) {
+                throw new SerializationError('invalid index entry key encoding');
+            }
+        }
+    }
+    const logicalKey = new Uint8Array(logicalLength);
+    const primaryKey = new Uint8Array(primaryLength);
+    copyUnescapedPart(bytes, 0, logicalKey);
+    copyUnescapedPart(bytes, primaryStart, primaryKey);
+    return { logicalKey, primaryKey };
+}
+function readCompoundPart(bytes: Uint8Array, start: number, cursor: { unescaped: number; end: number }): boolean {
+    if (start >= bytes.length) {
+        return false;
+    }
+    let unescaped = 0;
+    for (let index = start; index < bytes.length; index += 1) {
+        const byte = bytes[index];
+        if (byte !== INDEX_KEY_ESCAPE) {
+            unescaped += 1;
+            continue;
+        }
+        const next = bytes[index + 1];
+        if (next === INDEX_KEY_ESCAPE_CONT) {
+            unescaped += 1;
+            index += 1;
+            continue;
+        }
+        if (next === INDEX_KEY_TERM) {
+            cursor.unescaped = unescaped;
+            cursor.end = index + 2;
+            return true;
+        }
+        throw new TypeError('invalid compound key encoding');
+    }
+    throw new TypeError('compound key terminated unexpectedly');
+}
+function copyUnescapedPart(bytes: Uint8Array, start: number, out: Uint8Array): void {
+    const needed = out.length;
+    let offset = 0;
+    for (let index = start; offset < needed; index += 1) {
+        const byte = bytes[index];
+        if (byte !== INDEX_KEY_ESCAPE) {
+            out[offset] = byte;
+            offset += 1;
+            continue;
+        }
+        if (bytes[index + 1] === INDEX_KEY_ESCAPE_CONT) {
+            out[offset] = INDEX_KEY_ESCAPE;
+            offset += 1;
+            index += 1;
+            continue;
+        }
+        return;
     }
 }

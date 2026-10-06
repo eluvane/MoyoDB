@@ -151,6 +151,13 @@ impl StoredValue {
         }
 
         if store_uses_value_envelope(store_flags) {
+            // Zero in the header means no expiry. Some(0) is already expired and
+            // cannot share that sentinel without becoming permanent on read.
+            if self.expires_at_ms == Some(0) {
+                return Err(EngineError::Serialization(
+                    "expiry at unix epoch cannot be stored in the value envelope".into(),
+                ));
+            }
             let mut prefix = [0; VALUE_REVISION_ENVELOPE_HEADER_SIZE];
             let length = store_value_prefix_len(store_flags);
             let magic = if store_flags & STORE_FLAG_VALUE_REVISION != 0 {

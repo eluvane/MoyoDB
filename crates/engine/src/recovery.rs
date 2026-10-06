@@ -1,10 +1,15 @@
 use crate::btree::{build_catalog_tree, read_catalog, PageAllocator};
-use crate::catalog::CatalogState;
+use crate::catalog::{
+    decode_change_feed_floor_txid, decode_change_feed_policy, decode_schema_version,
+    decode_store_metadata, CatalogState, CATALOG_CHANGE_FEED_FLOOR_TXID_KEY,
+    CATALOG_CHANGE_FEED_POLICY_KEY, CATALOG_SCHEMA_VERSION_KEY,
+};
 use crate::error::{EngineError, Result};
 use crate::layout::{
-    decode_superblock_slot, encode_superblock_slot, SuperblockState, PAGE_SIZE,
-    SUPERBLOCK_SLOT_SIZE,
+    decode_superblock_slot, encode_superblock_slot, PageKind, SuperblockState, ValueKind,
+    PAGE_SIZE, SUPERBLOCK_SLOT_SIZE,
 };
+use crate::page::{decode_leaf_cell_ref, decode_page_header_verified, read_cell_slot, LeafCellRef};
 use crate::pager::Pager;
 use crate::storage::backend::{ensure_exact_len, FileBackend};
 use crate::wal::{replay_latest_pages, visit_wal_transactions};
@@ -161,7 +166,88 @@ pub fn load_catalog_snapshot<B: FileBackend>(
     pager: &mut Pager<B>,
     state: &SuperblockState,
 ) -> Result<CatalogState> {
+    // A root leaf is the usual catalog. Its inline cells are decoded from the
+    // cached page, without an intermediate copy of every key and value.
+    // Internal nodes and overflow values stay on the full scanner so later
+    // structural errors still win over metadata errors.
+    if let Some(catalog) = try_read_inline_root_leaf(pager, state.catalog_root_page_id)? {
+        return Ok(catalog);
+    }
     read_catalog(pager, state.catalog_root_page_id)
+}
+
+/// `None` means the caller must use `read_catalog`.
+fn try_read_inline_root_leaf<B: FileBackend>(
+    pager: &mut Pager<B>,
+    root_page_id: u64,
+) -> Result<Option<CatalogState>> {
+    if root_page_id == 0 {
+        return Ok(None);
+    }
+    pager.with_page(root_page_id, |bytes| {
+        decode_inline_root_leaf(root_page_id, bytes)
+    })
+}
+
+fn decode_inline_root_leaf(root_page_id: u64, bytes: &[u8]) -> Result<Option<CatalogState>> {
+    let header = decode_page_header_verified(bytes)?;
+    if header.page_kind != PageKind::Leaf {
+        return Ok(None);
+    }
+    if header.page_id != root_page_id {
+        return Err(EngineError::Corruption(format!(
+            "page header id mismatch: expected {root_page_id}, got {}",
+            header.page_id
+        )));
+    }
+    let count = header.cell_count as usize;
+    // Structural cell errors are reported before any metadata is interpreted.
+    // An overflow value is materialized by the full scanner, which also sees
+    // a later structural error first.
+    let mut overflow = false;
+    for index in 0..count {
+        let slot = read_cell_slot(bytes, &header, index)?;
+        let cell = decode_leaf_cell_ref(bytes, slot)?;
+        if cell.value_kind != ValueKind::Inline {
+            overflow = true;
+        }
+    }
+    if overflow {
+        return Ok(None);
+    }
+    let mut catalog = CatalogState::default();
+    for index in 0..count {
+        let slot = read_cell_slot(bytes, &header, index)?;
+        let cell = decode_leaf_cell_ref(bytes, slot)?;
+        apply_inline_catalog_cell(&mut catalog, &cell)?;
+    }
+    Ok(Some(catalog))
+}
+
+fn apply_inline_catalog_cell(catalog: &mut CatalogState, cell: &LeafCellRef<'_>) -> Result<()> {
+    if cell.key == CATALOG_SCHEMA_VERSION_KEY {
+        catalog.schema_version = decode_schema_version(cell.inline_value)?;
+        return Ok(());
+    }
+    if cell.key == CATALOG_CHANGE_FEED_FLOOR_TXID_KEY {
+        catalog.change_feed_floor_txid = decode_change_feed_floor_txid(cell.inline_value)?;
+        return Ok(());
+    }
+    if cell.key == CATALOG_CHANGE_FEED_POLICY_KEY {
+        catalog.change_feed_policy = decode_change_feed_policy(cell.inline_value)?;
+        return Ok(());
+    }
+    if cell.key.first() == Some(&0xff) {
+        return Err(EngineError::Corruption(
+            "unknown catalog metadata record".into(),
+        ));
+    }
+    let name = String::from_utf8(cell.key.to_vec())
+        .map_err(|err| EngineError::Corruption(format!("catalog key utf8: {err}")))?;
+    let meta = decode_store_metadata(cell.inline_value)
+        .map_err(|err| EngineError::Corruption(err.to_string()))?;
+    catalog.stores.insert(name, meta);
+    Ok(())
 }
 
 pub fn ensure_openable_or_initialize<B: FileBackend>(

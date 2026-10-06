@@ -577,11 +577,9 @@ fn readwrite_commit_cleans_up_expired_keys_seen_during_reads() {
 
     let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
     engine.create_store(tx, "kv").unwrap();
-    engine
-        .put_with_ttl(tx, "kv", b"a", b"1", Some(100))
-        .unwrap();
+    engine.put_with_ttl(tx, "kv", b"a", b"1", Some(1)).unwrap();
     engine.commit_tx(tx).unwrap();
-    sleep(Duration::from_millis(200));
+    sleep(Duration::from_millis(20));
 
     let root_before = engine.catalog().get("kv").unwrap().store_root_page_id;
 
@@ -607,10 +605,10 @@ fn staged_put_survives_lazy_cleanup_of_same_expired_base_key() {
     let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
     engine.create_store(tx, "kv").unwrap();
     engine
-        .put_with_ttl(tx, "kv", b"a", b"stale", Some(100))
+        .put_with_ttl(tx, "kv", b"a", b"stale", Some(1))
         .unwrap();
     engine.commit_tx(tx).unwrap();
-    sleep(Duration::from_millis(200));
+    sleep(Duration::from_millis(20));
 
     let rw = engine.begin_tx(TxMode::Readwrite).unwrap();
     engine.put(rw, "kv", b"a", b"fresh").unwrap();
@@ -656,4 +654,27 @@ fn put_many_with_shared_ttl_expires_as_one_batch() {
         .unwrap()
         .is_empty());
     engine.rollback_tx(ro).unwrap();
+}
+
+#[test]
+fn create_store_rejects_the_change_log_name() {
+    let (_bundle, mut engine) = common::open_memory_engine("txn-reserved-changelog");
+    let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
+    let err = engine.create_store(tx, "__browserdb:changes").unwrap_err();
+    assert_eq!(err.code(), "ReservedStoreNameError");
+    assert_eq!(
+        engine
+            .put(tx, "__browserdb:changes", b"k", b"v")
+            .unwrap_err()
+            .code(),
+        "ReservedStoreNameError"
+    );
+    assert_eq!(
+        engine
+            .drop_store(tx, "__browserdb:changes")
+            .unwrap_err()
+            .code(),
+        "ReservedStoreNameError"
+    );
+    engine.rollback_tx(tx).unwrap();
 }

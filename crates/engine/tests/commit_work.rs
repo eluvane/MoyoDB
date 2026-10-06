@@ -1,4 +1,4 @@
-use moyodb_engine::change_feed::{encode_change_log_key, SYSTEM_CHANGELOG_STORE_NAME};
+use moyodb_engine::change_feed::SYSTEM_CHANGELOG_STORE_NAME;
 use moyodb_engine::storage::backend::{FileBackend, FileSet};
 use moyodb_engine::{
     ChangeFeedOptions, ChangeFeedPolicy, Engine, EngineError, MemoryBackend, OpenConfig, Result,
@@ -315,30 +315,17 @@ fn filtered_change_feed_still_reports_corrupt_excluded_external_bodies() -> Resu
 }
 
 #[test]
-fn filtered_change_feed_still_reports_corrupt_excluded_payloads() -> Result<()> {
+fn user_put_cannot_replace_a_change_log_record() -> Result<()> {
     let (mut engine, _) = open_engine(deferred_config(), true)?;
-    let before = engine.stats()?.last_committed_txid;
     let tx = engine.begin_tx(TxMode::Readwrite)?;
     engine.put(tx, "source", b"key", b"value")?;
-    let logged = engine.commit_tx(tx)?;
-    let tx = engine.begin_tx(TxMode::Readwrite)?;
-    engine.put(
-        tx,
-        SYSTEM_CHANGELOG_STORE_NAME,
-        &encode_change_log_key(logged, 0),
-        b"broken",
-    )?;
     engine.commit_tx(tx)?;
+    let tx = engine.begin_tx(TxMode::Readwrite)?;
     let error = engine
-        .changes_since(
-            before,
-            ChangeFeedOptions {
-                stores: Some(vec!["wanted".to_string()]),
-                limit: None,
-            },
-        )
-        .expect_err("excluded payloads still require validation");
-    assert!(matches!(error, EngineError::Corruption(_)));
+        .put(tx, SYSTEM_CHANGELOG_STORE_NAME, b"k", b"broken")
+        .expect_err("the change log is not a user store");
+    assert!(matches!(error, EngineError::ReservedStoreName(_)));
+    engine.rollback_tx(tx)?;
     Ok(())
 }
 #[test]
@@ -349,4 +336,38 @@ fn public_staged_store_keeps_default_struct_update_construction() {
     };
     assert!(stage.mutations.is_empty());
     assert!(!stage.has_changes());
+}
+
+#[test]
+fn repeated_puts_keep_baselines_across_one_read_path() -> Result<()> {
+    let (mut engine, _) = open_engine(deferred_config(), false)?;
+    let tx = engine.begin_tx(TxMode::Readwrite)?;
+    assert!(!engine.put_reporting_baseline(tx, "source", b"a", b"1", None)?);
+    assert!(!engine.put_reporting_baseline(tx, "source", b"c", b"3", None)?);
+    assert!(engine.put_reporting_baseline(tx, "source", b"a", b"1b", None)?);
+    engine.commit_tx(tx)?;
+
+    let tx = engine.begin_tx(TxMode::Readwrite)?;
+    assert!(engine.put_reporting_baseline(tx, "source", b"c", b"3b", None)?);
+    assert!(!engine.put_reporting_baseline(tx, "source", b"b", b"2", None)?);
+    assert!(engine.put_reporting_baseline(tx, "source", b"a", b"1c", None)?);
+    assert_eq!(engine.get(tx, "source", b"a")?, Some(b"1c".to_vec()));
+    assert_eq!(engine.get(tx, "source", b"b")?, Some(b"2".to_vec()));
+    assert!(!engine.has(tx, "source", b"missing")?);
+    // Replacing a live key with an already-expired value still reports the old baseline.
+    assert!(engine.put_reporting_baseline(tx, "source", b"c", b"gone", Some(0))?);
+    engine.commit_tx(tx)?;
+
+    let tx = engine.begin_tx(TxMode::Readonly)?;
+    assert_eq!(engine.get(tx, "source", b"a")?, Some(b"1c".to_vec()));
+    assert_eq!(engine.get(tx, "source", b"b")?, Some(b"2".to_vec()));
+    assert_eq!(engine.get(tx, "source", b"c")?, None);
+    engine.rollback_tx(tx)?;
+
+    let tx = engine.begin_tx(TxMode::Readwrite)?;
+    assert!(!engine.put_reporting_baseline(tx, "source", b"c", b"fresh", None)?);
+    engine.commit_tx(tx)?;
+    let tx = engine.begin_tx(TxMode::Readonly)?;
+    assert_eq!(engine.get(tx, "source", b"c")?, Some(b"fresh".to_vec()));
+    engine.rollback_tx(tx)
 }

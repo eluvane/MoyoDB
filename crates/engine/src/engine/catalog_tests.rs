@@ -413,7 +413,7 @@ fn corrupt_catalog_path_fails_before_wal_or_metadata_publication() -> Result<()>
     let mut damaged = original.clone();
     damaged[0] ^= 1;
     bundle.main.write_at(page_offset(root), &damaged)?;
-    engine.pager.discard_cache();
+    engine.discard_pager_cache();
     let tx = engine.begin_tx(TxMode::Readwrite)?;
     engine.put(tx, &store_name(0), b"key", b"after")?;
     assert!(matches!(
@@ -425,7 +425,7 @@ fn corrupt_catalog_path_fails_before_wal_or_metadata_publication() -> Result<()>
     assert_eq!(engine.superblock.catalog_root_page_id, root);
     assert_eq!(engine.health(), &EngineHealth::Healthy);
     bundle.main.write_at(page_offset(root), &original)?;
-    engine.pager.discard_cache();
+    engine.discard_pager_cache();
     assert_current_catalog(&mut engine)
 }
 

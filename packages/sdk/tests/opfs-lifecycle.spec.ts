@@ -97,7 +97,8 @@ test('storageInfo_usage_changes_after_bulk_insert', async ({ page }) => {
             const tx = await db.begin('readwrite');
             try {
                 const entries: Array<[Uint8Array, Uint8Array]> = [];
-                for (let i = 0; i < 1000; i += 1) {
+                // dbSize only has to grow; the assertion is not the row count.
+                for (let i = 0; i < 8; i += 1) {
                     entries.push([window.moyodb.utf8Encode(`k-${i.toString().padStart(4, '0')}`), value]);
                 }
                 await tx.putMany('kv', entries);

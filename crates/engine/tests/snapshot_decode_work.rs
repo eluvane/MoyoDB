@@ -55,6 +55,13 @@ unsafe impl GlobalAlloc for DecodeAllocator {
 #[global_allocator]
 static ALLOCATOR: DecodeAllocator = DecodeAllocator;
 
+fn encode_work(contents: &SnapshotContents) -> (Vec<u8>, usize) {
+    ALLOCATED_BYTES.with(|work| assert!(work.replace(Some(0)).is_none()));
+    let encoded = encode_snapshot(contents);
+    let allocated = ALLOCATED_BYTES.with(|work| work.replace(None).unwrap());
+    (encoded.unwrap(), allocated)
+}
+
 fn decode_work(bytes: &[u8]) -> (SnapshotContents, usize) {
     ALLOCATED_BYTES.with(|work| assert!(work.replace(Some(0)).is_none()));
     let decoded = decode_snapshot(bytes);
@@ -126,6 +133,54 @@ fn decoding_copies_each_owned_store_name_once() {
     assert_eq!(decoded_small, small);
     assert_eq!(decoded_large, large);
     assert_eq!(large_work - small_work, 32 * (240 - 32));
+}
+
+fn value_fixture(value_len: usize) -> SnapshotContents {
+    SnapshotContents {
+        source_last_committed_txid: 7,
+        schema_version: 3,
+        stores: vec![SnapshotStore {
+            name: "kv".into(),
+            flags: 0,
+            entries: (0..32u32)
+                .map(|index| SnapshotEntry {
+                    key: index.to_be_bytes().to_vec(),
+                    value: vec![0x5a; value_len],
+                    expires_at_ms: None,
+                })
+                .collect(),
+        }],
+    }
+}
+
+#[test]
+fn encoding_copies_each_owned_value_once() {
+    let small = value_fixture(32);
+    let large = value_fixture(4 * 1024);
+    let (encoded_small, small_work) = encode_work(&small);
+    let (encoded_large, large_work) = encode_work(&large);
+    assert_eq!(decode_snapshot(&encoded_small).unwrap(), small);
+    assert_eq!(decode_snapshot(&encoded_large).unwrap(), large);
+    // Uniqueness checks and headers match. Only the 32 owned value copies differ.
+    assert_eq!(large_work - small_work, 32 * (4 * 1024 - 32));
+}
+
+#[test]
+fn rejected_encode_does_not_allocate_the_rejected_value() {
+    let value_len = MAX_VALUE_BYTES + 1;
+    let contents = kv_snapshot(vec![SnapshotEntry {
+        key: Vec::new(),
+        value: vec![0x11; value_len],
+        expires_at_ms: None,
+    }]);
+    ALLOCATED_BYTES.with(|work| assert!(work.replace(Some(0)).is_none()));
+    let encoded = encode_snapshot(&contents);
+    let allocated = ALLOCATED_BYTES.with(|work| work.replace(None).unwrap());
+    assert_eq!(encoded.unwrap_err(), EngineError::ValueTooLarge(value_len));
+    assert!(
+        allocated < MAX_VALUE_BYTES,
+        "rejected snapshot allocated {allocated} bytes for its oversized value"
+    );
 }
 
 fn kv_snapshot(entries: Vec<SnapshotEntry>) -> SnapshotContents {

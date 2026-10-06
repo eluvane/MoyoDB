@@ -7,7 +7,8 @@ test('compressed stores decode transparently for get/scan and managed indexes', 
     const result = await page.evaluate(async (name) => {
         const encode = window.moyodb.utf8Encode;
         const decodeJson = window.moyodb.jsonDecode;
-        const largeBody = 'moyodb compression payload '.repeat(512);
+        // 36 repeats is 1025 JSON bytes, just above the 1024-byte store compression threshold.
+        const largeBody = 'moyodb compression payload '.repeat(36);
         const db = await window.moyodb.openDB(name, {
             version: 1,
             indexes: [{ store: 'docs', name: 'byType', keyPath: 'type' }],
@@ -73,7 +74,8 @@ test('store-level compression shrinks large values but leaves small values effec
         const encode = window.moyodb.utf8Encode;
         const bigPayload = window.moyodb.jsonEncode({
             kind: 'big',
-            body: 'compressible-content-'.repeat(4096)
+            // 80 repeats is 1704 JSON bytes, enough for gzip to beat the 512-byte savings check.
+            body: 'compressible-content-'.repeat(80)
         });
         const smallPayload = window.moyodb.jsonEncode({
             kind: 'small',
@@ -82,7 +84,7 @@ test('store-level compression shrinks large values but leaves small values effec
         async function snapshotSize(name: string, compression: 'gzip' | false, value: Uint8Array) {
             const db = await window.moyodb.openDB(name);
             try {
-                await db.createStore('docs', compression ? { compression } : {});
+                await db.createStore('docs', { compression });
                 await db.put('docs', encode('k'), value);
                 const snapshot = await db.exportSnapshot();
                 return snapshot.byteLength;
@@ -110,7 +112,8 @@ test('compressed snapshot export/import roundtrip restores values and indexes', 
         async ({ sourceName, targetName }) => {
             const encode = window.moyodb.utf8Encode;
             const decodeJson = window.moyodb.jsonDecode;
-            const body = 'snapshot-compression-body '.repeat(2048);
+            // 38 repeats is 1047 JSON bytes, still on the gzip store path.
+            const body = 'snapshot-compression-body '.repeat(38);
             const sourceDb = await window.moyodb.openDB(sourceName, {
                 version: 1,
                 indexes: [{ store: 'docs', name: 'byCategory', keyPath: 'category' }],

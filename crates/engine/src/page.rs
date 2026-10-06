@@ -1,17 +1,16 @@
-use crate::bytes::{
-    compare_keys, read_u16_le, read_u32_le, read_u64_le, write_u16_le, write_u32_le, write_u64_le,
-};
+use crate::bytes::{compare_keys, read_u16_le, read_u32_le, read_u64_le, write_u16_le};
 use crate::checksum::{checksum_with_zeroed_region, crc32_with_generated_overflow};
 use crate::error::{EngineError, Result};
 use crate::layout::{
-    unsafe_read_struct, PageHeader, PageKind, ValueKind, INLINE_VALUE_LIMIT,
-    PAGE_HEADER_CHECKSUM_OFFSET, PAGE_HEADER_SIZE, PAGE_MAGIC, PAGE_SIZE,
+    PageHeader, PageKind, ValueKind, INLINE_VALUE_LIMIT, PAGE_HEADER_CHECKSUM_OFFSET,
+    PAGE_HEADER_SIZE, PAGE_MAGIC, PAGE_SIZE,
 };
 use crate::payload::decode_payload_descriptor;
 use crate::prepared_value::ValueParts;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use zerocopy::IntoBytes;
+use std::mem::size_of;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LeafCell {
@@ -69,6 +68,43 @@ pub(crate) struct InternalCellRef<'a> {
 /// Levels must decrease on descent. This limit bounds corrupt-tree traversal.
 pub const MAX_TREE_LEVEL: u8 = 48;
 
+const LEAF_CELL_HEADER_LEN: usize = 20;
+const INTERNAL_CELL_HEADER_LEN: usize = 12;
+
+// On-disk cell prefixes. Multi-byte integers are little-endian.
+#[repr(C, packed)]
+#[derive(Copy, Clone, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
+struct LeafCellHeader {
+    key_len: u16,
+    value_kind: u8,
+    reserved: u8,
+    total_value_len: u32,
+    overflow_head_page_id: u64,
+    inline_value_len: u32,
+}
+
+#[repr(C, packed)]
+#[derive(Copy, Clone, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
+struct InternalCellHeader {
+    separator_len: u16,
+    reserved: u16,
+    child_page_id: u64,
+}
+
+// `PageHeader` field offsets. The sibling id is the last header field.
+const PAGE_ID_OFFSET: usize = 8;
+const PAGE_KIND_OFFSET: usize = 16;
+const PAGE_LEVEL_OFFSET: usize = 17;
+const PAGE_CELL_COUNT_OFFSET: usize = 18;
+const PAGE_LOWER_OFFSET: usize = 20;
+const PAGE_UPPER_OFFSET: usize = 22;
+const PAGE_RIGHT_SIBLING_OFFSET: usize = 26;
+
+const _: () = assert!(size_of::<LeafCellHeader>() == LEAF_CELL_HEADER_LEN);
+const _: () = assert!(size_of::<InternalCellHeader>() == INTERNAL_CELL_HEADER_LEN);
+const _: () = assert!(PAGE_RIGHT_SIBLING_OFFSET + 8 == PAGE_HEADER_SIZE);
+const _: () = assert!(PAGE_HEADER_SIZE <= PAGE_SIZE);
+
 /// Checks image size, magic, checksum, header invariants and expected page id.
 /// Cells require separate validation.
 pub(crate) fn verify_page_image(bytes: &[u8], expected_page_id: u64) -> Result<PageHeaderInfo> {
@@ -111,18 +147,33 @@ pub(crate) fn decode_page_header_verified(bytes: &[u8]) -> Result<PageHeaderInfo
             bytes.len()
         )));
     }
-    let header: PageHeader = unsafe_read_struct(&bytes[..PAGE_HEADER_SIZE])?;
+    // The page-size check covers every header field, so these loads do not
+    // copy a `PageHeader` before reading the values scans actually use.
     let header_info = PageHeaderInfo {
-        page_id: u64::from_le(header.page_id),
-        page_kind: PageKind::from_u8(header.page_kind)?,
-        level: header.level,
-        cell_count: u16::from_le(header.cell_count),
-        lower: u16::from_le(header.lower),
-        upper: u16::from_le(header.upper),
-        right_sibling_page_id: u64::from_le(header.right_sibling_page_id),
+        page_id: le_u64(bytes, PAGE_ID_OFFSET),
+        page_kind: PageKind::from_u8(bytes[PAGE_KIND_OFFSET])?,
+        level: bytes[PAGE_LEVEL_OFFSET],
+        cell_count: le_u16(bytes, PAGE_CELL_COUNT_OFFSET),
+        lower: le_u16(bytes, PAGE_LOWER_OFFSET),
+        upper: le_u16(bytes, PAGE_UPPER_OFFSET),
+        right_sibling_page_id: le_u64(bytes, PAGE_RIGHT_SIBLING_OFFSET),
     };
     validate_page_bounds(&header_info)?;
     Ok(header_info)
+}
+
+#[inline]
+fn le_u16(bytes: &[u8], offset: usize) -> u16 {
+    let mut raw = [0u8; 2];
+    raw.copy_from_slice(&bytes[offset..offset + 2]);
+    u16::from_le_bytes(raw)
+}
+
+#[inline]
+fn le_u64(bytes: &[u8], offset: usize) -> u64 {
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&bytes[offset..offset + 8]);
+    u64::from_le_bytes(raw)
 }
 
 pub(crate) fn read_cell_slot(bytes: &[u8], header: &PageHeaderInfo, index: usize) -> Result<usize> {
@@ -137,30 +188,14 @@ pub(crate) fn read_cell_slot(bytes: &[u8], header: &PageHeaderInfo, index: usize
     Ok(slot)
 }
 
-pub(crate) fn decode_leaf_cell_ref<'a>(bytes: &'a [u8], slot: usize) -> Result<LeafCellRef<'a>> {
-    let key_len = read_u16_le(bytes, slot)? as usize;
-    let value_kind = ValueKind::from_u8(
-        *bytes
-            .get(slot + 2)
-            .ok_or_else(|| EngineError::Corruption("leaf cell kind".into()))?,
-    )?;
-    let total_value_len = read_u32_le(bytes, slot + 4)?;
-    let overflow_head_page_id = read_u64_le(bytes, slot + 8)?;
-    let inline_value_len = read_u32_le(bytes, slot + 16)? as usize;
-    let key_start = slot + 20;
-    let key_end = key_start
-        .checked_add(key_len)
-        .ok_or_else(|| EngineError::Corruption("leaf cell key length overflow".into()))?;
-    let value_start = key_end;
-    let value_end = value_start
-        .checked_add(inline_value_len)
-        .ok_or_else(|| EngineError::Corruption("leaf cell value out of bounds".into()))?;
-    let key = bytes
-        .get(key_start..key_end)
-        .ok_or_else(|| EngineError::Corruption("leaf cell key out of bounds".into()))?;
-    let inline_value = bytes
-        .get(value_start..value_end)
-        .ok_or_else(|| EngineError::Corruption("leaf cell value out of bounds".into()))?;
+#[inline]
+fn validate_leaf_value(
+    value_kind: ValueKind,
+    inline_value: &[u8],
+    total_value_len: u32,
+    overflow_head_page_id: u64,
+) -> Result<()> {
+    let inline_value_len = inline_value.len();
     match value_kind {
         ValueKind::Inline => {
             if overflow_head_page_id != 0 {
@@ -195,6 +230,44 @@ pub(crate) fn decode_leaf_cell_ref<'a>(bytes: &'a [u8], slot: usize) -> Result<L
             decode_payload_descriptor(overflow_head_page_id, total_value_len, inline_value)?;
         }
     }
+    Ok(())
+}
+
+pub(crate) fn decode_leaf_cell_ref<'a>(bytes: &'a [u8], slot: usize) -> Result<LeafCellRef<'a>> {
+    let (key_len, value_kind, total_value_len, overflow_head_page_id, inline_value_len) =
+        if let Some(header) = leaf_header_at(bytes, slot) {
+            (
+                u16::from_le(header.key_len) as usize,
+                ValueKind::from_u8(header.value_kind)?,
+                u32::from_le(header.total_value_len),
+                u64::from_le(header.overflow_head_page_id),
+                u32::from_le(header.inline_value_len) as usize,
+            )
+        } else {
+            read_leaf_header(bytes, slot)?
+        };
+    let key_start = slot
+        .checked_add(LEAF_CELL_HEADER_LEN)
+        .ok_or_else(|| EngineError::Corruption("leaf cell key length overflow".into()))?;
+    let key_end = key_start
+        .checked_add(key_len)
+        .ok_or_else(|| EngineError::Corruption("leaf cell key length overflow".into()))?;
+    let value_end = key_end
+        .checked_add(inline_value_len)
+        .ok_or_else(|| EngineError::Corruption("leaf cell value length overflow".into()))?;
+    // Key and inline value stay borrowed from the page.
+    let key = bytes
+        .get(key_start..key_end)
+        .ok_or_else(|| EngineError::Corruption("leaf cell key out of bounds".into()))?;
+    let inline_value = bytes
+        .get(key_end..value_end)
+        .ok_or_else(|| EngineError::Corruption("leaf cell value out of bounds".into()))?;
+    validate_leaf_value(
+        value_kind,
+        inline_value,
+        total_value_len,
+        overflow_head_page_id,
+    )?;
     Ok(LeafCellRef {
         key,
         inline_value,
@@ -204,18 +277,56 @@ pub(crate) fn decode_leaf_cell_ref<'a>(bytes: &'a [u8], slot: usize) -> Result<L
     })
 }
 
+fn leaf_header_at(bytes: &[u8], slot: usize) -> Option<LeafCellHeader> {
+    let end = slot.checked_add(LEAF_CELL_HEADER_LEN)?;
+    let prefix = bytes.get(slot..end)?;
+    LeafCellHeader::read_from_prefix(prefix)
+        .ok()
+        .map(|(header, _)| header)
+}
+
+fn read_leaf_header(bytes: &[u8], slot: usize) -> Result<(usize, ValueKind, u32, u64, usize)> {
+    let key_len = read_u16_le(bytes, slot)? as usize;
+    let value_kind = ValueKind::from_u8(
+        *bytes
+            .get(slot + 2)
+            .ok_or_else(|| EngineError::Corruption("leaf cell kind".into()))?,
+    )?;
+    let total_value_len = read_u32_le(bytes, slot + 4)?;
+    let overflow_head_page_id = read_u64_le(bytes, slot + 8)?;
+    let inline_value_len = read_u32_le(bytes, slot + 16)? as usize;
+    Ok((
+        key_len,
+        value_kind,
+        total_value_len,
+        overflow_head_page_id,
+        inline_value_len,
+    ))
+}
+
 pub(crate) fn decode_internal_cell_ref<'a>(
     bytes: &'a [u8],
     slot: usize,
 ) -> Result<InternalCellRef<'a>> {
-    let sep_len = read_u16_le(bytes, slot)? as usize;
-    let child_page_id = read_u64_le(bytes, slot + 4)?;
+    let (sep_len, child_page_id) = if let Some(header) = internal_header_at(bytes, slot) {
+        (
+            u16::from_le(header.separator_len) as usize,
+            u64::from_le(header.child_page_id),
+        )
+    } else {
+        (
+            read_u16_le(bytes, slot)? as usize,
+            read_u64_le(bytes, slot + 4)?,
+        )
+    };
     if child_page_id == 0 {
         return Err(EngineError::Corruption(
             "internal cell has child_page_id=0".into(),
         ));
     }
-    let sep_start = slot + 12;
+    let sep_start = slot
+        .checked_add(INTERNAL_CELL_HEADER_LEN)
+        .ok_or_else(|| EngineError::Corruption("internal separator length overflow".into()))?;
     let sep_end = sep_start
         .checked_add(sep_len)
         .ok_or_else(|| EngineError::Corruption("internal separator length overflow".into()))?;
@@ -226,6 +337,14 @@ pub(crate) fn decode_internal_cell_ref<'a>(
         separator,
         child_page_id,
     })
+}
+
+fn internal_header_at(bytes: &[u8], slot: usize) -> Option<InternalCellHeader> {
+    let end = slot.checked_add(INTERNAL_CELL_HEADER_LEN)?;
+    let prefix = bytes.get(slot..end)?;
+    InternalCellHeader::read_from_prefix(prefix)
+        .ok()
+        .map(|(header, _)| header)
 }
 
 pub fn decode_page(bytes: &[u8]) -> Result<DecodedPage> {
@@ -322,18 +441,39 @@ pub fn encode_leaf_page(
     right_sibling_page_id: u64,
     cells: &[LeafCell],
 ) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; PAGE_SIZE];
-    let mut upper = PAGE_SIZE;
-    let lower = PAGE_HEADER_SIZE + cells.len() * 2;
-    for (index, cell) in cells.iter().enumerate() {
-        let use_overflow = cell.value_kind == ValueKind::Overflow;
-        let encoded_len = leaf_cell_size(cell.key.len(), cell.value.len(), use_overflow);
-        if upper < lower + encoded_len {
-            return Err(EngineError::Serialization("leaf page overflow".into()));
+    let mut payload_len = 0usize;
+    for cell in cells {
+        if cell.value_kind == ValueKind::External {
+            decode_payload_descriptor(
+                cell.overflow_head_page_id,
+                cell.total_value_len,
+                &cell.value,
+            )?;
         }
-        upper -= encoded_len;
-        encode_leaf_cell_into(&mut buf[upper..upper + encoded_len], cell)?;
-        write_u16_le(&mut buf, PAGE_HEADER_SIZE + index * 2, upper as u16)?;
+        let encoded_len = leaf_cell_size(
+            cell.key.len(),
+            cell.value.len(),
+            cell.value_kind == ValueKind::Overflow,
+        );
+        payload_len = payload_len
+            .checked_add(encoded_len)
+            .ok_or_else(|| EngineError::Serialization("leaf page overflow".into()))?;
+    }
+    let (mut buf, lower, upper) = slotted_image(cells.len(), payload_len, "leaf page overflow")?;
+    // Cells are packed from the end of the page. Appending the last cell first
+    // copies each key and value once instead of zeroing that region first.
+    for (index, cell) in cells.iter().enumerate().rev() {
+        let start = buf.len();
+        append_leaf_cell(&mut buf, cell);
+        write_u16_le(
+            &mut buf,
+            PAGE_HEADER_SIZE + index * 2,
+            u16::try_from(start)
+                .map_err(|_| EngineError::Serialization("leaf page overflow".into()))?,
+        )?;
+    }
+    if buf.len() != PAGE_SIZE {
+        return Err(EngineError::Serialization("leaf page overflow".into()));
     }
     write_page_header(
         &mut buf,
@@ -341,9 +481,10 @@ pub fn encode_leaf_page(
             page_id,
             page_kind: PageKind::Leaf,
             level,
-            cell_count: cells.len() as u16,
-            lower: lower as u16,
-            upper: upper as u16,
+            cell_count: u16::try_from(cells.len())
+                .map_err(|_| EngineError::Serialization("leaf page overflow".into()))?,
+            lower,
+            upper,
             right_sibling_page_id,
         },
     )?;
@@ -356,17 +497,26 @@ pub fn encode_internal_page(
     right_sibling_page_id: u64,
     cells: &[InternalCell],
 ) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; PAGE_SIZE];
-    let mut upper = PAGE_SIZE;
-    let lower = PAGE_HEADER_SIZE + cells.len() * 2;
-    for (index, cell) in cells.iter().enumerate() {
-        let encoded_len = internal_cell_size(cell.separator.len());
-        if upper < lower + encoded_len {
-            return Err(EngineError::Serialization("internal page overflow".into()));
-        }
-        upper -= encoded_len;
-        encode_internal_cell_into(&mut buf[upper..upper + encoded_len], cell)?;
-        write_u16_le(&mut buf, PAGE_HEADER_SIZE + index * 2, upper as u16)?;
+    let mut payload_len = 0usize;
+    for cell in cells {
+        payload_len = payload_len
+            .checked_add(internal_cell_size(cell.separator.len()))
+            .ok_or_else(|| EngineError::Serialization("internal page overflow".into()))?;
+    }
+    let (mut buf, lower, upper) =
+        slotted_image(cells.len(), payload_len, "internal page overflow")?;
+    for (index, cell) in cells.iter().enumerate().rev() {
+        let start = buf.len();
+        append_internal_cell(&mut buf, cell);
+        write_u16_le(
+            &mut buf,
+            PAGE_HEADER_SIZE + index * 2,
+            u16::try_from(start)
+                .map_err(|_| EngineError::Serialization("internal page overflow".into()))?,
+        )?;
+    }
+    if buf.len() != PAGE_SIZE {
+        return Err(EngineError::Serialization("internal page overflow".into()));
     }
     write_page_header(
         &mut buf,
@@ -374,13 +524,42 @@ pub fn encode_internal_page(
             page_id,
             page_kind: PageKind::Internal,
             level,
-            cell_count: cells.len() as u16,
-            lower: lower as u16,
-            upper: upper as u16,
+            cell_count: u16::try_from(cells.len())
+                .map_err(|_| EngineError::Serialization("internal page overflow".into()))?,
+            lower,
+            upper,
             right_sibling_page_id,
         },
     )?;
     Ok(buf)
+}
+
+/// Zeroes the header, slot table, and free gap. The caller appends cell bytes.
+fn slotted_image(
+    cell_count: usize,
+    payload_len: usize,
+    overflow: &str,
+) -> Result<(Vec<u8>, u16, u16)> {
+    let slot_bytes = cell_count
+        .checked_mul(2)
+        .ok_or_else(|| EngineError::Serialization(overflow.into()))?;
+    let lower = PAGE_HEADER_SIZE
+        .checked_add(slot_bytes)
+        .ok_or_else(|| EngineError::Serialization(overflow.into()))?;
+    let used = lower
+        .checked_add(payload_len)
+        .ok_or_else(|| EngineError::Serialization(overflow.into()))?;
+    if used > PAGE_SIZE {
+        return Err(EngineError::Serialization(overflow.into()));
+    }
+    let upper = PAGE_SIZE - payload_len;
+    let mut buf = Vec::with_capacity(PAGE_SIZE);
+    buf.resize(upper, 0);
+    Ok((
+        buf,
+        u16::try_from(lower).map_err(|_| EngineError::Serialization(overflow.into()))?,
+        u16::try_from(upper).map_err(|_| EngineError::Serialization(overflow.into()))?,
+    ))
 }
 
 pub fn encode_overflow_page(
@@ -410,6 +589,9 @@ fn encode_overflow_parts(
 ) -> Result<Vec<u8>> {
     let max = max_overflow_chunk_len();
     let chunk_len = prefix.len() + payload.len();
+    if chunk_len == 0 {
+        return Err(EngineError::Serialization("overflow chunk is empty".into()));
+    }
     if chunk_len > max {
         return Err(EngineError::Serialization(format!(
             "overflow chunk too large: {} > {max}",
@@ -444,12 +626,11 @@ fn encode_overflow_parts(
 }
 
 pub fn leaf_cell_size(key_len: usize, inline_value_len: usize, overflow: bool) -> usize {
-    let header_len = 2 + 1 + 1 + 4 + 8 + 4;
-    header_len + key_len + if overflow { 0 } else { inline_value_len }
+    LEAF_CELL_HEADER_LEN + key_len + if overflow { 0 } else { inline_value_len }
 }
 
 pub fn internal_cell_size(separator_len: usize) -> usize {
-    2 + 2 + 8 + separator_len
+    INTERNAL_CELL_HEADER_LEN + separator_len
 }
 
 pub fn max_overflow_chunk_len() -> usize {
@@ -460,35 +641,32 @@ pub fn should_overflow_value(value_len: usize) -> bool {
     value_len > INLINE_VALUE_LIMIT
 }
 
-fn encode_leaf_cell_into(dst: &mut [u8], cell: &LeafCell) -> Result<()> {
-    if cell.value_kind == ValueKind::External {
-        decode_payload_descriptor(
-            cell.overflow_head_page_id,
-            cell.total_value_len,
-            &cell.value,
-        )?;
-    }
-    let key_len = cell.key.len();
+fn append_leaf_cell(dst: &mut Vec<u8>, cell: &LeafCell) {
     let use_overflow = cell.value_kind == ValueKind::Overflow;
-    let inline_value = if use_overflow {
-        &[][..]
+    let inline_value: &[u8] = if use_overflow {
+        &[]
     } else {
         cell.value.as_slice()
     };
-    write_u16_le(dst, 0, key_len as u16)?;
-    dst[2] = cell.value_kind as u8;
-    dst[3] = 0;
-    write_u32_le(dst, 4, cell.total_value_len)?;
-    write_u64_le(dst, 8, cell.overflow_head_page_id)?;
-    write_u32_le(dst, 16, inline_value.len() as u32)?;
-    dst[20..20 + key_len].copy_from_slice(&cell.key);
-    dst[20 + key_len..].copy_from_slice(inline_value);
-    Ok(())
+    let header = LeafCellHeader {
+        key_len: (cell.key.len() as u16).to_le(),
+        value_kind: cell.value_kind as u8,
+        reserved: 0,
+        total_value_len: cell.total_value_len.to_le(),
+        overflow_head_page_id: cell.overflow_head_page_id.to_le(),
+        inline_value_len: (inline_value.len() as u32).to_le(),
+    };
+    let start = dst.len();
+    dst.extend_from_slice(header.as_bytes());
+    dst.extend_from_slice(&cell.key);
+    dst.extend_from_slice(inline_value);
+    debug_assert_eq!(
+        dst.len() - start,
+        leaf_cell_size(cell.key.len(), cell.value.len(), use_overflow)
+    );
 }
 
 fn decode_leaf_cell(bytes: &[u8]) -> Result<LeafCell> {
-    // The owned decoder used to add the u32 value length with unchecked
-    // arithmetic. Delegating keeps hostile lengths on the checked path.
     let cell = decode_leaf_cell_ref(bytes, 0)?;
     Ok(LeafCell {
         key: cell.key.to_vec(),
@@ -499,12 +677,16 @@ fn decode_leaf_cell(bytes: &[u8]) -> Result<LeafCell> {
     })
 }
 
-fn encode_internal_cell_into(dst: &mut [u8], cell: &InternalCell) -> Result<()> {
-    write_u16_le(dst, 0, cell.separator.len() as u16)?;
-    write_u16_le(dst, 2, 0)?;
-    write_u64_le(dst, 4, cell.child_page_id)?;
-    dst[12..].copy_from_slice(&cell.separator);
-    Ok(())
+fn append_internal_cell(dst: &mut Vec<u8>, cell: &InternalCell) {
+    let header = InternalCellHeader {
+        separator_len: (cell.separator.len() as u16).to_le(),
+        reserved: 0,
+        child_page_id: cell.child_page_id.to_le(),
+    };
+    let start = dst.len();
+    dst.extend_from_slice(header.as_bytes());
+    dst.extend_from_slice(&cell.separator);
+    debug_assert_eq!(dst.len() - start, internal_cell_size(cell.separator.len()));
 }
 
 fn decode_internal_cell(bytes: &[u8]) -> Result<InternalCell> {
@@ -753,3 +935,6 @@ fn write_page_header(buf: &mut [u8], info: PageHeaderInfo) -> Result<()> {
         .copy_from_slice(&checksum.to_le_bytes());
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

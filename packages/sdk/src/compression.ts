@@ -145,6 +145,37 @@ function writeEnvelope(
     view.setUint32(10, rawLength, true);
     view.setUint32(14, checksum, true);
 }
+function writeEnvelopeHeader(
+    out: Uint8Array,
+    magic: Uint8Array,
+    kindTag: number,
+    rawLength: number,
+    payload: Uint8Array
+): void {
+    const checksum = crc32(payload);
+    out.set(magic);
+    out[8] = ENVELOPE_VERSION;
+    out[9] = kindTag;
+    const view = new DataView(out.buffer, out.byteOffset, ENVELOPE_HEADER_SIZE);
+    view.setUint32(10, rawLength, true);
+    view.setUint32(14, checksum, true);
+}
+function envelopeFromChunks(
+    magic: Uint8Array,
+    kindTag: number,
+    rawLength: number,
+    chunks: Uint8Array[],
+    totalBytes: number
+): Uint8Array {
+    const out = new Uint8Array(ENVELOPE_HEADER_SIZE + totalBytes);
+    let offset = ENVELOPE_HEADER_SIZE;
+    for (const chunk of chunks) {
+        out.set(chunk, offset);
+        offset += chunk.byteLength;
+    }
+    writeEnvelopeHeader(out, magic, kindTag, rawLength, out.subarray(ENVELOPE_HEADER_SIZE));
+    return out;
+}
 function compressionIsProfitable(rawLength: number, compressedLength: number): boolean {
     return (
         (compressedLength + ENVELOPE_HEADER_SIZE) * 100 <=
@@ -169,12 +200,6 @@ function snappyPreflightIsProfitable(value: Uint8Array): boolean {
         STORE_VALUE_COMPRESSION_PREFLIGHT_WINDOW_BYTES * STORE_VALUE_COMPRESSION_PREFLIGHT_WINDOW_COUNT,
         compressedLength
     );
-}
-function buildStoreRecord(input: Uint8Array, compressed: Uint8Array, compression: CompressionKind): Uint8Array {
-    if (!compressionIsProfitable(input.byteLength, compressed.byteLength)) {
-        return buildEnvelope(STORE_RECORD_MAGIC, COMPRESSION_TAG_NONE, input.byteLength, input);
-    }
-    return buildEnvelope(STORE_RECORD_MAGIC, compressionTag(compression), input.byteLength, compressed);
 }
 function validateStoreValueLength(value: Uint8Array): void {
     if (value.byteLength > MAX_DECOMPRESSED_STORE_VALUE_BYTES) {
@@ -267,19 +292,53 @@ function readEnvelopeHeader(magic: Uint8Array, bytes: Uint8Array, strict = true)
         payloadChecksum: view.getUint32(14, true)
     };
 }
-async function compressBytes(data: Uint8Array<ArrayBuffer>, kind: SnapshotCompressionKind): Promise<Uint8Array> {
+// `stopAtBytes` abandons a result that will not be smaller than the raw payload.
+// The caller then seals the snapshot it already owns instead of copying those bytes again.
+async function collectCompressed(
+    input: Uint8Array<ArrayBuffer>,
+    kind: SnapshotCompressionKind,
+    stopAtBytes?: number
+): Promise<{
+    chunks: Uint8Array[];
+    totalBytes: number;
+} | null> {
     ensureCompressionRuntime();
     let stream: ReadableStream<Uint8Array>;
     try {
-        stream = byteStream(data).pipeThrough(new CompressionStream(kind));
+        stream = byteStream(input).pipeThrough(new CompressionStream(kind));
     } catch {
         throw compressionRuntimeUnavailable();
     }
+    const reader = stream.getReader();
+    const chunks: Uint8Array[] = [];
+    let totalBytes = 0;
+    let stopped = false;
     try {
-        return new Uint8Array(await new Response(stream).arrayBuffer());
+        for (let next = await reader.read(); !next.done; next = await reader.read()) {
+            const part = next.value;
+            totalBytes += part.byteLength;
+            if (stopAtBytes !== undefined && totalBytes >= stopAtBytes) {
+                stopped = true;
+                await reader.cancel('compressed output is not smaller than the raw payload');
+                break;
+            }
+            chunks.push(part);
+        }
     } catch (error) {
-        throw namedError('InternalError', `failed to compress bytes with ${kind}: ${String(error)}`);
+        if (!stopped) {
+            throw namedError('InternalError', `failed to compress bytes with ${kind}: ${String(error)}`);
+        }
+    } finally {
+        try {
+            reader.releaseLock();
+        } catch {
+            // cancel() may already have released this reader.
+        }
     }
+    if (stopped || (stopAtBytes !== undefined && totalBytes >= stopAtBytes)) {
+        return null;
+    }
+    return { chunks, totalBytes };
 }
 async function decompressBytes(
     data: Uint8Array,
@@ -352,6 +411,7 @@ export function compressionFromStoreFlags(flags: number): CompressionOption {
     }
 }
 export async function encodeStoreValueRecord(value: Uint8Array, compression: CompressionOption): Promise<Uint8Array> {
+    validateStoreValueLength(value);
     if (compression === false) {
         return value;
     }
@@ -361,12 +421,24 @@ export async function encodeStoreValueRecord(value: Uint8Array, compression: Com
         writePreparedStoreValueRecord(record, output, 0);
         return output;
     }
-    validateStoreValueLength(value);
     if (value.byteLength < STORE_VALUE_COMPRESSION_THRESHOLD) {
         return buildEnvelope(STORE_RECORD_MAGIC, COMPRESSION_TAG_NONE, value.byteLength, value);
     }
-    const input = copyBytes(value);
-    return buildStoreRecord(input, await compressBytes(input, compression), compression);
+    const stored = new Uint8Array(ENVELOPE_HEADER_SIZE + value.byteLength);
+    const payload = stored.subarray(ENVELOPE_HEADER_SIZE);
+    payload.set(value);
+    const compressed = await collectCompressed(payload, compression, payload.byteLength);
+    if (compressed === null || !compressionIsProfitable(payload.byteLength, compressed.totalBytes)) {
+        writeEnvelopeHeader(stored, STORE_RECORD_MAGIC, COMPRESSION_TAG_NONE, payload.byteLength, payload);
+        return stored;
+    }
+    return envelopeFromChunks(
+        STORE_RECORD_MAGIC,
+        compressionTag(compression),
+        payload.byteLength,
+        compressed.chunks,
+        compressed.totalBytes
+    );
 }
 export async function decodeStoreValueRecord(
     value: Uint8Array,
@@ -437,9 +509,24 @@ export async function wrapSnapshotWithCompression(
     if (!['gzip', 'deflate'].includes(compression)) {
         throw namedError('InternalError', `unsupported snapshot compression kind: ${String(compression)}`);
     }
+    if (snapshot.byteLength > MAX_DECOMPRESSED_SNAPSHOT_BYTES) {
+        throw namedError(
+            'SerializationError',
+            `snapshot has ${snapshot.byteLength} bytes, exceeding the ${MAX_DECOMPRESSED_SNAPSHOT_BYTES} byte limit`
+        );
+    }
     const input = copyBytes(snapshot);
-    const compressed = await compressBytes(input, compression);
-    return buildEnvelope(SNAPSHOT_EXPORT_MAGIC, compressionTag(compression), input.byteLength, compressed);
+    const compressed = await collectCompressed(input, compression);
+    if (compressed === null) {
+        throw namedError('InternalError', `failed to compress bytes with ${compression}`);
+    }
+    return envelopeFromChunks(
+        SNAPSHOT_EXPORT_MAGIC,
+        compressionTag(compression),
+        input.byteLength,
+        compressed.chunks,
+        compressed.totalBytes
+    );
 }
 export async function unwrapSnapshotCompression(snapshot: Uint8Array): Promise<Uint8Array> {
     const header = readEnvelopeHeader(SNAPSHOT_EXPORT_MAGIC, snapshot);

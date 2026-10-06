@@ -12,7 +12,7 @@ use moyodb_engine::wal::{
     append_transaction, replay_wal_index, replay_wal_transactions, scan_wal_index, CommitRecord,
     PageImageRecord, ReplayTransaction,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Clone, Debug, Default)]
 struct IoWork {
@@ -190,6 +190,16 @@ fn leaf(page_id: u64, marker: u8) -> Result<Vec<u8>> {
     )
 }
 
+struct DurableBytes {
+    manifest: Vec<u8>,
+    main: Vec<u8>,
+    wal: Vec<u8>,
+    expected: SuperblockState,
+    oracle_main: Vec<u8>,
+    oracle_manifest: Vec<u8>,
+    wal_end: u64,
+}
+
 struct Fixture {
     manifest: RecordingBackend,
     main: RecordingBackend,
@@ -294,16 +304,32 @@ impl Fixture {
         recover_if_needed(&mut self.manifest, &mut pager, &mut self.wal, &base)
     }
 
-    fn crash_copy(&self) -> Self {
-        Self {
-            manifest: RecordingBackend::from_durable(self.manifest.snapshot()),
-            main: RecordingBackend::from_durable(self.main.snapshot()),
-            wal: RecordingBackend::from_durable(self.wal.snapshot()),
+    fn durable_bytes(&self) -> DurableBytes {
+        DurableBytes {
+            manifest: self.manifest.snapshot(),
+            main: self.main.snapshot(),
+            wal: self.wal.snapshot(),
             expected: self.expected.clone(),
             oracle_main: self.oracle_main.clone(),
             oracle_manifest: self.oracle_manifest.clone(),
             wal_end: self.wal_end,
         }
+    }
+
+    fn reopen(bytes: &DurableBytes) -> Self {
+        Self {
+            manifest: RecordingBackend::from_durable(bytes.manifest.clone()),
+            main: RecordingBackend::from_durable(bytes.main.clone()),
+            wal: RecordingBackend::from_durable(bytes.wal.clone()),
+            expected: bytes.expected.clone(),
+            oracle_main: bytes.oracle_main.clone(),
+            oracle_manifest: bytes.oracle_manifest.clone(),
+            wal_end: bytes.wal_end,
+        }
+    }
+
+    fn crash_copy(&self) -> Self {
+        Self::reopen(&self.durable_bytes())
     }
 
     fn assert_oracle(&self, recovered: &SuperblockState) {
@@ -314,6 +340,34 @@ impl Fixture {
     }
 }
 
+fn once_durable_bytes(
+    slot: &'static OnceLock<DurableBytes>,
+    build: impl FnOnce() -> Result<DurableBytes>,
+) -> Result<&'static DurableBytes> {
+    if let Some(bytes) = slot.get() {
+        return Ok(bytes);
+    }
+    let bytes = build()?;
+    Ok(slot.get_or_init(|| bytes))
+}
+
+fn adjacent_committed_bytes() -> Result<&'static DurableBytes> {
+    static SLOT: OnceLock<DurableBytes> = OnceLock::new();
+    once_durable_bytes(&SLOT, || {
+        Ok(Fixture::new(&[adjacent_images()?], 66)?.durable_bytes())
+    })
+}
+
+fn rewritten_page_bytes() -> Result<&'static DurableBytes> {
+    static SLOT: OnceLock<DurableBytes> = OnceLock::new();
+    once_durable_bytes(&SLOT, || {
+        let transactions = (1..=32)
+            .map(|marker| Ok(vec![(1, leaf(1, marker)?)]))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Fixture::new(&transactions, 2)?.durable_bytes())
+    })
+}
+
 fn adjacent_images() -> Result<Vec<(u64, Vec<u8>)>> {
     (1..=65)
         .map(|page_id| Ok((page_id, leaf(page_id, page_id as u8)?)))
@@ -322,7 +376,7 @@ fn adjacent_images() -> Result<Vec<(u64, Vec<u8>)>> {
 
 #[test]
 fn adjacent_wal_source_reads_are_bounded_and_batched() -> Result<()> {
-    let fixture = Fixture::new(&[adjacent_images()?], 66)?;
+    let fixture = Fixture::reopen(adjacent_committed_bytes()?);
     let txs = scan_wal_index(&fixture.wal)?;
     fixture.reset();
     let mut pager = Pager::new(fixture.main.clone(), 4);
@@ -423,10 +477,7 @@ fn latest_images_keep_gaps_and_mixed_source_offsets() -> Result<()> {
 
 #[test]
 fn repeated_commits_replay_only_final_page_and_keep_collecting_api() -> Result<()> {
-    let transactions = (1..=32)
-        .map(|marker| Ok(vec![(1, leaf(1, marker)?)]))
-        .collect::<Result<Vec<_>>>()?;
-    let mut fixture = Fixture::new(&transactions, 2)?;
+    let mut fixture = Fixture::reopen(rewritten_page_bytes()?);
     let collected = scan_wal_index(&fixture.wal)?;
     assert_eq!(collected.len(), 32);
     assert!(collected.iter().all(|tx| tx.pages.len() == 1));
@@ -457,11 +508,11 @@ fn repeated_commits_replay_only_final_page_and_keep_collecting_api() -> Result<(
 
 #[test]
 fn torn_last_commit_preserves_committed_prefix_bytes() -> Result<()> {
-    let transactions = (1..=32)
+    let mut fixture = Fixture::reopen(rewritten_page_bytes()?);
+    let prefix_transactions = (1..=31)
         .map(|marker| Ok(vec![(1, leaf(1, marker)?)]))
         .collect::<Result<Vec<_>>>()?;
-    let mut fixture = Fixture::new(&transactions, 2)?;
-    let prefix = Fixture::new(&transactions[..31], 2)?;
+    let prefix = Fixture::new(&prefix_transactions, 2)?;
     let bytes = fixture.wal.snapshot();
     fixture.wal = RecordingBackend::from_durable(bytes[..bytes.len() - 1].to_vec());
     fixture.expected = prefix.expected;
@@ -479,8 +530,9 @@ fn overwritten_committed_corruption_prevents_every_recovery_write() -> Result<()
         vec![(1, vec![0; PAGE_SIZE])],
         vec![(1, leaf(1, 3)?)],
     ];
+    let image = Fixture::new(&transactions, 2)?.durable_bytes();
     for published_txid in [0, 2] {
-        let mut fixture = Fixture::new(&transactions, 2)?;
+        let mut fixture = Fixture::reopen(&image);
         let mut base = select_superblock(&fixture.manifest)?.expect("fixture superblock");
         base.last_committed_txid = published_txid;
         fixture
@@ -514,9 +566,8 @@ fn overwritten_committed_corruption_prevents_every_recovery_write() -> Result<()
 
 #[test]
 fn recovery_faults_retry_to_the_same_durable_bytes() -> Result<()> {
-    let images = adjacent_images()?;
-    let fixture = Fixture::new(std::slice::from_ref(&images), 66)?;
-    let second_replay_read = (fixture.wal_end as usize).div_ceil(64 * 1024) + 2;
+    let image = adjacent_committed_bytes()?;
+    let second_replay_read = (image.wal_end as usize).div_ceil(64 * 1024) + 2;
     // Read faults occur after the WAL scan, in the second source batch.
     // Other faults cover main-file installation, publication, and WAL cleanup.
     let faults = [
@@ -531,7 +582,7 @@ fn recovery_faults_retry_to_the_same_durable_bytes() -> Result<()> {
         (0, Fault::FlushError(1)),
     ];
     for (file, fault) in faults {
-        let mut interrupted = Fixture::new(std::slice::from_ref(&images), 66)?;
+        let mut interrupted = Fixture::reopen(image);
         let original_wal = interrupted.wal.snapshot();
         let backend = match file {
             0 => interrupted.wal.clone(),

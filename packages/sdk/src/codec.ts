@@ -12,6 +12,8 @@ const COMPOUND_ESCAPE = 0x00;
 const COMPOUND_ESCAPE_CONT = 0xff;
 const COMPOUND_TERM = 0x00;
 const F64_MASK = BigInt('0xffffffffffffffff');
+const sortableNumberBytes = new Uint8Array(9);
+const sortableNumberView = new DataView(sortableNumberBytes.buffer);
 export type CompoundKeyPart = string | number | boolean | null | Uint8Array;
 export type IndexKeyPrimitive = CompoundKeyPart;
 export function utf8Encode(value: string): Uint8Array {
@@ -53,12 +55,12 @@ function isCompoundKeyPartList(
 }
 export function indexKey(value: CompoundKeyPart | ReadonlyArray<CompoundKeyPart>): Uint8Array {
     if (isCompoundKeyPartList(value)) {
-        return compoundKey(...value);
+        return encodeCompoundKeyList(value);
     }
     return encodeCompoundKeyPart(value);
 }
 export function compoundKey(...parts: CompoundKeyPart[]): Uint8Array {
-    return encodeCompoundBytes(parts.map((part) => encodeCompoundKeyPart(part)));
+    return encodeCompoundKeyList(parts);
 }
 export function encodeIndexScalar(value: IndexKeyPrimitive): Uint8Array {
     return encodeCompoundKeyPart(value);
@@ -68,41 +70,62 @@ export function encodeCompoundKeyParts(parts: ReadonlyArray<Uint8Array>): Uint8A
 }
 export function splitCompoundKey(key: Uint8Array): Uint8Array[] {
     const parts: Uint8Array[] = [];
-    const current: number[] = [];
-    for (let index = 0; index < key.length; index += 1) {
-        const byte = key[index];
-        if (byte !== COMPOUND_ESCAPE) {
-            current.push(byte);
-            continue;
+    let index = 0;
+    while (index < key.length) {
+        const start = index;
+        let length = 0;
+        let closed = false;
+        for (; index < key.length; index += 1) {
+            const byte = key[index];
+            if (byte !== COMPOUND_ESCAPE) {
+                length += 1;
+                continue;
+            }
+            const next = key[index + 1];
+            if (next === COMPOUND_ESCAPE_CONT) {
+                length += 1;
+                index += 1;
+                continue;
+            }
+            if (next === COMPOUND_TERM) {
+                index += 2;
+                closed = true;
+                break;
+            }
+            throw new TypeError('invalid compound key encoding');
         }
-        const next = key[index + 1];
-        if (next === COMPOUND_ESCAPE_CONT) {
-            current.push(COMPOUND_ESCAPE);
-            index += 1;
-            continue;
+        if (!closed) {
+            throw new TypeError('compound key terminated unexpectedly');
         }
-        if (next === COMPOUND_TERM) {
-            parts.push(Uint8Array.from(current));
-            current.length = 0;
-            index += 1;
-            continue;
+        const part = new Uint8Array(length);
+        let offset = 0;
+        for (let cursor = start; cursor < index - 2; cursor += 1) {
+            const byte = key[cursor];
+            if (byte !== COMPOUND_ESCAPE) {
+                part[offset] = byte;
+                offset += 1;
+                continue;
+            }
+            part[offset] = COMPOUND_ESCAPE;
+            offset += 1;
+            cursor += 1;
         }
-        throw new TypeError('invalid compound key encoding');
-    }
-    if (current.length !== 0) {
-        throw new TypeError('compound key terminated unexpectedly');
+        parts.push(part);
     }
     return parts;
 }
 export function prefixSuccessor(prefix: Uint8Array): Uint8Array | null {
-    const out = prefix.slice();
-    for (let index = out.length - 1; index >= 0; index -= 1) {
-        if (out[index] !== 0xff) {
-            out[index] += 1;
-            return out.subarray(0, index + 1);
-        }
+    let end = prefix.length;
+    while (end > 0 && prefix[end - 1] === 0xff) {
+        end -= 1;
     }
-    return null;
+    if (end === 0) {
+        return null;
+    }
+    const out = new Uint8Array(end);
+    out.set(end === prefix.length ? prefix : prefix.subarray(0, end));
+    out[end - 1] += 1;
+    return out;
 }
 export function prefixRange(prefix: Uint8Array): Range {
     const upper = prefixSuccessor(prefix);
@@ -122,18 +145,7 @@ function encodeCompoundKeyPart(value: CompoundKeyPart): Uint8Array {
         return encodeSortableNumber(value);
     }
     if (typeof value === 'string') {
-        // Reject lone surrogates so TextEncoder cannot map distinct keys to U+FFFD.
-        for (const character of value) {
-            const codePoint = character.codePointAt(0) as number;
-            if (codePoint >= 0xd800 && codePoint <= 0xdfff) {
-                throw new TypeError('compound key string parts must contain valid Unicode scalar values');
-            }
-        }
-        const body = utf8Encode(value);
-        const out = new Uint8Array(1 + body.length);
-        out[0] = TYPE_STRING;
-        out.set(body, 1);
-        return out;
+        return encodeStringKey(value);
     }
     if (value instanceof Uint8Array) {
         const out = new Uint8Array(1 + value.length);
@@ -143,44 +155,171 @@ function encodeCompoundKeyPart(value: CompoundKeyPart): Uint8Array {
     }
     throw new TypeError('compound key parts must be string, number, boolean, null, or Uint8Array');
 }
-function encodeCompoundBytes(parts: ReadonlyArray<Uint8Array>): Uint8Array {
+function encodeCompoundKeyList(parts: ReadonlyArray<CompoundKeyPart>): Uint8Array {
     let length = 0;
-    for (const part of parts) {
-        for (const byte of part) {
-            length += byte === COMPOUND_ESCAPE ? 2 : 1;
-        }
-        length += 2;
+    for (let index = 0; index < parts.length; index += 1) {
+        length += compoundPartEncodedLength(parts[index]);
     }
     const out = new Uint8Array(length);
     let offset = 0;
-    for (const part of parts) {
-        for (const byte of part) {
-            if (byte === COMPOUND_ESCAPE) {
-                out[offset] = COMPOUND_ESCAPE;
-                out[offset + 1] = COMPOUND_ESCAPE_CONT;
-                offset += 2;
-            } else {
-                out[offset] = byte;
-                offset += 1;
-            }
-        }
-        out[offset] = COMPOUND_TERM;
-        out[offset + 1] = COMPOUND_TERM;
-        offset += 2;
+    for (let index = 0; index < parts.length; index += 1) {
+        offset = writeCompoundPart(out, offset, parts[index]);
     }
     return out;
 }
+function compoundPartEncodedLength(value: CompoundKeyPart): number {
+    if (value === null || typeof value === 'boolean') {
+        return 3;
+    }
+    if (typeof value === 'number') {
+        writeSortableNumber(sortableNumberView, value);
+        return escapedByteLength(sortableNumberBytes) + 2;
+    }
+    if (typeof value === 'string') {
+        return 1 + walkUtf8(value, null, 0, true) + 2;
+    }
+    if (value instanceof Uint8Array) {
+        return 1 + escapedByteLength(value) + 2;
+    }
+    throw new TypeError('compound key parts must be string, number, boolean, null, or Uint8Array');
+}
+function writeCompoundPart(out: Uint8Array, offset: number, value: CompoundKeyPart): number {
+    if (value === null) {
+        out[offset] = TYPE_NULL;
+        return writeTerminator(out, offset + 1);
+    }
+    if (typeof value === 'boolean') {
+        out[offset] = value ? TYPE_TRUE : TYPE_FALSE;
+        return writeTerminator(out, offset + 1);
+    }
+    if (typeof value === 'number') {
+        writeSortableNumber(sortableNumberView, value);
+        return writeTerminator(out, writeEscapedBytes(out, offset, sortableNumberBytes));
+    }
+    if (typeof value === 'string') {
+        out[offset] = TYPE_STRING;
+        return writeTerminator(out, walkUtf8(value, out, offset + 1, true));
+    }
+    if (value instanceof Uint8Array) {
+        out[offset] = TYPE_BYTES;
+        return writeTerminator(out, writeEscapedBytes(out, offset + 1, value));
+    }
+    throw new TypeError('compound key parts must be string, number, boolean, null, or Uint8Array');
+}
+function encodeCompoundBytes(parts: ReadonlyArray<Uint8Array>): Uint8Array {
+    let length = 0;
+    for (let index = 0; index < parts.length; index += 1) {
+        length += escapedByteLength(parts[index]) + 2;
+    }
+    const out = new Uint8Array(length);
+    let offset = 0;
+    for (let index = 0; index < parts.length; index += 1) {
+        offset = writeTerminator(out, writeEscapedBytes(out, offset, parts[index]));
+    }
+    return out;
+}
+function escapedByteLength(bytes: Uint8Array): number {
+    let extra = 0;
+    for (let index = 0; index < bytes.length; index += 1) {
+        if (bytes[index] === COMPOUND_ESCAPE) {
+            extra += 1;
+        }
+    }
+    return bytes.length + extra;
+}
+function writeEscapedBytes(out: Uint8Array, offset: number, bytes: Uint8Array): number {
+    for (let index = 0; index < bytes.length; index += 1) {
+        const byte = bytes[index];
+        if (byte === COMPOUND_ESCAPE) {
+            out[offset] = COMPOUND_ESCAPE;
+            out[offset + 1] = COMPOUND_ESCAPE_CONT;
+            offset += 2;
+        } else {
+            out[offset] = byte;
+            offset += 1;
+        }
+    }
+    return offset;
+}
+function writeTerminator(out: Uint8Array, offset: number): number {
+    out[offset] = COMPOUND_TERM;
+    out[offset + 1] = COMPOUND_TERM;
+    return offset + 2;
+}
+function encodeStringKey(value: string): Uint8Array {
+    const length = walkUtf8(value, null, 0, false);
+    const out = new Uint8Array(1 + length);
+    out[0] = TYPE_STRING;
+    walkUtf8(value, out, 1, false);
+    return out;
+}
+// Reject lone surrogates so distinct keys cannot collapse to U+FFFD.
+function walkUtf8(value: string, out: Uint8Array | null, offset: number, escapeNul: boolean): number {
+    for (let index = 0; index < value.length; index += 1) {
+        const code = value.charCodeAt(index);
+        if (code <= 0x7f) {
+            if (escapeNul && code === 0) {
+                if (out !== null) {
+                    out[offset] = COMPOUND_ESCAPE;
+                    out[offset + 1] = COMPOUND_ESCAPE_CONT;
+                }
+                offset += 2;
+            } else {
+                if (out !== null) {
+                    out[offset] = code;
+                }
+                offset += 1;
+            }
+            continue;
+        }
+        if (code <= 0x7ff) {
+            if (out !== null) {
+                out[offset] = 0xc0 | (code >> 6);
+                out[offset + 1] = 0x80 | (code & 0x3f);
+            }
+            offset += 2;
+            continue;
+        }
+        if (code >= 0xd800 && code <= 0xdbff) {
+            const next = value.charCodeAt(index + 1);
+            if (next >= 0xdc00 && next <= 0xdfff) {
+                const point = ((code - 0xd800) << 10) + (next - 0xdc00) + 0x10000;
+                if (out !== null) {
+                    out[offset] = 0xf0 | (point >> 18);
+                    out[offset + 1] = 0x80 | ((point >> 12) & 0x3f);
+                    out[offset + 2] = 0x80 | ((point >> 6) & 0x3f);
+                    out[offset + 3] = 0x80 | (point & 0x3f);
+                }
+                offset += 4;
+                index += 1;
+                continue;
+            }
+        }
+        if (code >= 0xd800 && code <= 0xdfff) {
+            throw new TypeError('compound key string parts must contain valid Unicode scalar values');
+        }
+        if (out !== null) {
+            out[offset] = 0xe0 | (code >> 12);
+            out[offset + 1] = 0x80 | ((code >> 6) & 0x3f);
+            out[offset + 2] = 0x80 | (code & 0x3f);
+        }
+        offset += 3;
+    }
+    return offset;
+}
 function encodeSortableNumber(value: number): Uint8Array {
+    const bytes = new Uint8Array(9);
+    writeSortableNumber(new DataView(bytes.buffer), value);
+    return bytes;
+}
+function writeSortableNumber(view: DataView, value: number): void {
     if (!Number.isFinite(value)) {
         throw new TypeError('compound key number parts must be finite');
     }
     const normalized = Object.is(value, -0) ? 0 : value;
-    const buffer = new ArrayBuffer(9);
-    const view = new DataView(buffer);
     view.setUint8(0, TYPE_NUMBER);
     view.setFloat64(1, normalized, false);
     let bits = view.getBigUint64(1, false);
     bits = (bits & (1n << 63n)) !== 0n ? ~bits & F64_MASK : bits ^ (1n << 63n);
     view.setBigUint64(1, bits, false);
-    return new Uint8Array(buffer);
 }
