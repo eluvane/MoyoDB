@@ -549,3 +549,172 @@ fn policy_changes_and_retention_persist_across_recovery() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn change_log_name_cannot_be_created_and_still_records_user_writes() -> Result<()> {
+    let mut engine = Engine::open(
+        "reserved-change-log",
+        MemoryBundle::new().files(),
+        OpenConfig::default(),
+    )?;
+    let tx = engine.begin_tx(TxMode::Readwrite)?;
+    let error = engine
+        .create_store(tx, SYSTEM_CHANGELOG_STORE_NAME)
+        .unwrap_err();
+    assert_eq!(
+        error,
+        EngineError::ReservedStoreName(SYSTEM_CHANGELOG_STORE_NAME.into())
+    );
+    engine.create_store(tx, "docs")?;
+    engine.put(tx, "docs", b"key", b"value")?;
+    let committed = engine.commit_tx(tx)?;
+    let feed = engine.changes_since(committed - 1, ChangeFeedOptions::default())?;
+    assert_eq!(feed.changes.len(), 1);
+    assert_eq!(feed.changes[0].store, "docs");
+    assert!(engine
+        .catalog
+        .get(SYSTEM_CHANGELOG_STORE_NAME)
+        .is_some_and(|meta| store_uses_system_raw_values(meta.flags)));
+    Ok(())
+}
+
+#[test]
+fn legacy_user_store_under_change_log_name_blocks_feed_append_without_wal() -> Result<()> {
+    let bundle = MemoryBundle::new();
+    let mut engine = Engine::open(
+        "legacy-change-log-name",
+        bundle.files(),
+        OpenConfig::default(),
+    )?;
+    let tx = engine.begin_tx(TxMode::Readwrite)?;
+    engine.set_change_feed_policy(
+        tx,
+        ChangeFeedPolicy {
+            enabled: false,
+            retain_txids: None,
+        },
+    )?;
+    engine.create_store(tx, "docs")?;
+    engine.put(tx, "docs", b"key", b"original")?;
+    engine.commit_tx(tx)?;
+    {
+        let catalog = Arc::make_mut(&mut engine.catalog);
+        catalog.insert(
+            SYSTEM_CHANGELOG_STORE_NAME.to_string(),
+            StoreMetadata {
+                store_root_page_id: 0,
+                created_txid: 1,
+                flags: store_flags_for_user_store(StoreCompression::None),
+            },
+        );
+    }
+    let wal_len = bundle.wal.len()?;
+    let root = engine.superblock.catalog_root_page_id;
+    let tx = engine.begin_tx(TxMode::Readwrite)?;
+    engine.set_change_feed_policy(
+        tx,
+        ChangeFeedPolicy {
+            enabled: true,
+            retain_txids: None,
+        },
+    )?;
+    engine.put(tx, "docs", b"key", b"replacement")?;
+    let error = engine.commit_tx(tx).unwrap_err();
+    assert_eq!(
+        error,
+        EngineError::ReservedStoreName(SYSTEM_CHANGELOG_STORE_NAME.into())
+    );
+    assert_eq!(engine.health(), &EngineHealth::Healthy);
+    assert!(!engine.change_feed_policy.enabled);
+    assert_eq!(bundle.wal.len()?, wal_len);
+    assert_eq!(engine.superblock.catalog_root_page_id, root);
+    assert!(engine
+        .catalog
+        .get(SYSTEM_CHANGELOG_STORE_NAME)
+        .is_some_and(|meta| !store_uses_system_raw_values(meta.flags)));
+    let read = engine.begin_tx(TxMode::Readonly)?;
+    assert_eq!(
+        engine.get(read, "docs", b"key")?,
+        Some(b"original".to_vec())
+    );
+    engine.rollback_tx(read)?;
+    Ok(())
+}
+
+#[test]
+fn compaction_omits_the_system_log_and_keeps_a_same_named_user_store() -> Result<()> {
+    let mut source = Engine::open(
+        "compact-log-source",
+        MemoryBundle::new().files(),
+        OpenConfig::default(),
+    )?;
+    let tx = source.begin_tx(TxMode::Readwrite)?;
+    source.create_store(tx, "docs")?;
+    source.put(tx, "docs", b"key", b"value")?;
+    source.commit_tx(tx)?;
+    let mut target = Engine::open(
+        "compact-log-target",
+        MemoryBundle::new().files(),
+        OpenConfig::default(),
+    )?;
+    source.compact_into(&mut target)?;
+    assert!(!target.catalog.contains_key(SYSTEM_CHANGELOG_STORE_NAME));
+    let read = target.begin_tx(TxMode::Readonly)?;
+    assert_eq!(target.get(read, "docs", b"key")?, Some(b"value".to_vec()));
+    target.rollback_tx(read)?;
+
+    let mut legacy = Engine::open(
+        "compact-legacy-log-name",
+        MemoryBundle::new().files(),
+        OpenConfig::default(),
+    )?;
+    let tx = legacy.begin_tx(TxMode::Readwrite)?;
+    legacy.set_change_feed_policy(
+        tx,
+        ChangeFeedPolicy {
+            enabled: false,
+            retain_txids: None,
+        },
+    )?;
+    legacy.create_store(tx, "docs")?;
+    legacy.put(tx, "docs", b"key", b"kept")?;
+    legacy.commit_tx(tx)?;
+    let user_flags = store_flags_for_user_store(StoreCompression::None);
+    {
+        let catalog = Arc::make_mut(&mut legacy.catalog);
+        catalog.insert(
+            SYSTEM_CHANGELOG_STORE_NAME.to_string(),
+            StoreMetadata {
+                store_root_page_id: 0,
+                created_txid: 1,
+                flags: user_flags,
+            },
+        );
+    }
+    let mut legacy_target = Engine::open(
+        "compact-legacy-log-target",
+        MemoryBundle::new().files(),
+        OpenConfig::default(),
+    )?;
+    legacy.compact_into(&mut legacy_target)?;
+    assert_eq!(
+        legacy_target
+            .catalog
+            .get(SYSTEM_CHANGELOG_STORE_NAME)
+            .map(|meta| meta.flags),
+        Some(user_flags)
+    );
+    let read = legacy_target.begin_tx(TxMode::Readonly)?;
+    assert_eq!(
+        legacy_target.get(read, "docs", b"key")?,
+        Some(b"kept".to_vec())
+    );
+    legacy_target.rollback_tx(read)?;
+    let source_read = legacy.begin_tx(TxMode::Readonly)?;
+    assert_eq!(
+        legacy.get(source_read, "docs", b"key")?,
+        Some(b"kept".to_vec())
+    );
+    legacy.rollback_tx(source_read)?;
+    Ok(())
+}

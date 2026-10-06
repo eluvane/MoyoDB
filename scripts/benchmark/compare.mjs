@@ -61,8 +61,12 @@ const currentCases = flattenCases(current);
 const previousCases = new Map(flattenCases(previous).map((entry) => [benchmarkCaseKey(entry.suite, entry), entry]));
 const comparisons = [];
 const unmatchedCases = [];
+const currentKeys = new Set();
 for (const currentEntry of currentCases) {
     const key = benchmarkCaseKey(currentEntry.suite, currentEntry);
+    if (key !== undefined) {
+        currentKeys.add(key);
+    }
     const previousEntry = key === undefined ? undefined : previousCases.get(key);
     if (!previousEntry) {
         unmatchedCases.push({
@@ -78,16 +82,16 @@ for (const currentEntry of currentCases) {
     const p95LatencyDeltaPct = deltaPercent(currentEntry.metrics.p95LatencyMs, previousEntry.metrics.p95LatencyMs);
     const p99LatencyDeltaPct = deltaPercent(currentEntry.metrics.p99LatencyMs, previousEntry.metrics.p99LatencyMs);
     const regressionReasons = [];
-    if (Number.isFinite(opsDeltaPct) && opsDeltaPct <= -throughputRegressionPct) {
+    if (isRegression(opsDeltaPct, throughputRegressionPct, 'decrease')) {
         regressionReasons.push(`throughput ${formatDeltaPercent(opsDeltaPct)}`);
     }
-    if (Number.isFinite(avgLatencyDeltaPct) && avgLatencyDeltaPct >= latencyRegressionPct) {
+    if (isRegression(avgLatencyDeltaPct, latencyRegressionPct, 'increase')) {
         regressionReasons.push(`avg latency ${formatDeltaPercent(avgLatencyDeltaPct)}`);
     }
-    if (Number.isFinite(p95LatencyDeltaPct) && p95LatencyDeltaPct >= latencyRegressionPct) {
+    if (isRegression(p95LatencyDeltaPct, latencyRegressionPct, 'increase')) {
         regressionReasons.push(`p95 latency ${formatDeltaPercent(p95LatencyDeltaPct)}`);
     }
-    if (Number.isFinite(p99LatencyDeltaPct) && p99LatencyDeltaPct >= tailLatencyRegressionPct) {
+    if (isRegression(p99LatencyDeltaPct, tailLatencyRegressionPct, 'increase')) {
         regressionReasons.push(`p99 latency ${formatDeltaPercent(p99LatencyDeltaPct)}`);
     }
     comparisons.push({
@@ -107,6 +111,18 @@ for (const currentEntry of currentCases) {
         regressionReasons
     });
 }
+const missingCases = [];
+for (const [key, previousEntry] of previousCases) {
+    if (key === undefined || currentKeys.has(key)) {
+        continue;
+    }
+    missingCases.push({
+        suite: previousEntry.suite,
+        id: previousEntry.id,
+        label: previousEntry.label,
+        source: previousEntry.source
+    });
+}
 
 const regressions = comparisons.filter((entry) => entry.regression);
 const summaryLines = [
@@ -123,10 +139,15 @@ const summaryLines = [
               ''
           ]
         : ['']),
+    ...(missingCases.length > 0
+        ? [`${missingCases.length} baseline case(s) were absent from the current run.`, '']
+        : []),
     comparisons.length === 0
         ? 'No comparable benchmark cases were available.'
         : regressions.length === 0
-          ? 'No regressions crossed the governance threshold.'
+          ? missingCases.length === 0
+              ? 'No regressions crossed the governance threshold.'
+              : 'No compared row crossed the governance threshold.'
           : `Detected ${regressions.length} benchmark governance regression(s).`,
     ''
 ];
@@ -163,7 +184,8 @@ await writeJsonFile(path.join(outDir, 'comparison.json'), {
     currentGeneratedAt: current.generatedAt,
     thresholds: thresholdPolicy(),
     comparisons,
-    unmatchedCases
+    unmatchedCases,
+    missingCases
 });
 if (failOnRegression && comparisons.length === 0) {
     console.error('Benchmark regression gate failed: no comparable benchmark cases with matching settings.');
@@ -171,6 +193,12 @@ if (failOnRegression && comparisons.length === 0) {
 }
 if (failOnRegression && regressions.length > 0) {
     console.error(`Benchmark regression gate failed with ${regressions.length} regression(s).`);
+    process.exit(1);
+}
+if (failOnRegression && missingCases.length > 0) {
+    console.error(
+        `Benchmark regression gate failed: ${missingCases.length} baseline case(s) were absent from the current run.`
+    );
     process.exit(1);
 }
 
@@ -229,17 +257,63 @@ function flattenCases(report) {
 }
 
 function deltaPercent(currentValue, previousValue) {
-    if (!Number.isFinite(currentValue) || !Number.isFinite(previousValue) || previousValue === 0) {
+    if (!Number.isFinite(currentValue) || !Number.isFinite(previousValue)) {
         return Number.NaN;
+    }
+    if (previousValue === 0) {
+        if (currentValue === 0) {
+            return 0;
+        }
+        // A zero baseline makes any positive current value an unbounded increase.
+        return currentValue > 0 ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY;
     }
     return ((currentValue - previousValue) / previousValue) * 100;
 }
 
+function isRegression(delta, thresholdPct, direction) {
+    const worsened = direction === 'increase' ? delta : -delta;
+    if (worsened === Number.POSITIVE_INFINITY) {
+        return true;
+    }
+    if (!Number.isFinite(worsened) || !Number.isFinite(thresholdPct)) {
+        return false;
+    }
+    if (thresholdPct === 0) {
+        return worsened > 0;
+    }
+    return worsened >= thresholdPct;
+}
+
 async function readBenchmarkPolicy() {
+    const policyPath = path.join(rootDir, '.benchmark', 'policy.json');
+    let policy;
     try {
-        return JSON.parse(await readFile(path.join(rootDir, '.benchmark', 'policy.json'), 'utf8'));
-    } catch {
-        return {};
+        policy = JSON.parse(await readFile(policyPath, 'utf8'));
+    } catch (error) {
+        if (error && error.code === 'ENOENT') {
+            return {};
+        }
+        throw error;
+    }
+    if (policy === null || typeof policy !== 'object' || Array.isArray(policy)) {
+        throw new Error('.benchmark/policy.json must be a JSON object');
+    }
+    const thresholds = policy.thresholds ?? {};
+    if (thresholds === null || typeof thresholds !== 'object' || Array.isArray(thresholds)) {
+        throw new Error('.benchmark/policy.json thresholds must be a JSON object');
+    }
+    assertThreshold('throughputRegressionPct', thresholds.throughputRegressionPct);
+    assertThreshold('latencyRegressionPct', thresholds.latencyRegressionPct);
+    assertThreshold('tailLatencyRegressionPct', thresholds.tailLatencyRegressionPct);
+    return policy;
+}
+
+function assertThreshold(name, value) {
+    if (value === undefined) {
+        return;
+    }
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+        throw new Error(`.benchmark/policy.json thresholds.${name} must be a non-negative finite number`);
     }
 }
 

@@ -221,14 +221,31 @@ pub(crate) fn visit_wal_transactions<B: FileBackend>(
             break;
         }
         let payload_len = u32::from_le(header.payload_len) as usize;
-        let Ok(tag) = WalTag::from_u8(header.tag) else {
-            break;
+        // A checksum-valid record this reader does not understand is not a torn
+        // tail. Truncating it would destroy a future format and anything after it.
+        let tag = match WalTag::from_u8(header.tag) {
+            Ok(tag) => tag,
+            Err(_) => {
+                if foreign_wal_checksum_matches(&mut reader, offset, len, &header)? {
+                    return Err(wal_corruption(
+                        offset,
+                        &format!("unsupported WAL record tag {}", header.tag),
+                    ));
+                }
+                break;
+            }
         };
         let expected_payload_len = match tag {
             WalTag::PageImage => PAGE_IMAGE_PAYLOAD_LEN,
             WalTag::Commit => WAL_COMMIT_BODY_SIZE,
         };
         if payload_len != expected_payload_len {
+            if foreign_wal_checksum_matches(&mut reader, offset, len, &header)? {
+                return Err(wal_corruption(
+                    offset,
+                    &format!("unsupported WAL payload length {payload_len}"),
+                ));
+            }
             break;
         }
         let total_len = wal_record_total_len(payload_len) as u64;
@@ -240,11 +257,17 @@ pub(crate) fn visit_wal_transactions<B: FileBackend>(
         if expected != u32::from_le(header.checksum) {
             break;
         }
+        if header.reserved0 != 0 || header.reserved1 != 0 || header.reserved2 != 0 {
+            return Err(wal_corruption(offset, "unsupported WAL header flags"));
+        }
         let payload = &record[WAL_RECORD_HEADER_SIZE..];
         match tag {
             WalTag::PageImage => {
                 let body: WalPageImageBodyHeader =
                     unsafe_read_struct(&payload[..WAL_PAGE_IMAGE_BODY_HEADER_SIZE])?;
+                if u32::from_le(body.reserved) != 0 {
+                    return Err(wal_corruption(offset, "unsupported WAL page image flags"));
+                }
                 let txid = u64::from_le(body.txid);
                 let page_id = u64::from_le(body.page_id);
                 match pending_txid {
@@ -271,6 +294,9 @@ pub(crate) fn visit_wal_transactions<B: FileBackend>(
             }
             WalTag::Commit => {
                 let body: WalCommitBody = unsafe_read_struct(&payload[..WAL_COMMIT_BODY_SIZE])?;
+                if u32::from_le(body.reserved) != 0 {
+                    return Err(wal_corruption(offset, "unsupported WAL commit flags"));
+                }
                 let commit = CommitRecord {
                     txid: u64::from_le(body.txid),
                     new_catalog_root_page_id: u64::from_le(body.new_catalog_root_page_id),

@@ -144,6 +144,72 @@ fn decode_rejects_invalid_inline_leaf_metadata() {
 }
 
 #[test]
+fn decode_rejects_hostile_inline_length_without_panicking() {
+    let mut page = encode_leaf_page(
+        3,
+        0,
+        0,
+        &[LeafCell {
+            key: b"a".to_vec(),
+            value: b"1".to_vec(),
+            value_kind: ValueKind::Inline,
+            total_value_len: 1,
+            overflow_head_page_id: 0,
+        }],
+    )
+    .unwrap();
+    let slot = u16::from_le_bytes([page[PAGE_HEADER_SIZE], page[PAGE_HEADER_SIZE + 1]]) as usize;
+    page[slot + 16..slot + 20].copy_from_slice(&u32::MAX.to_le_bytes());
+    let checksum = checksum_with_zeroed_region(&page, PAGE_HEADER_CHECKSUM_OFFSET, 4);
+    page[PAGE_HEADER_CHECKSUM_OFFSET..PAGE_HEADER_CHECKSUM_OFFSET + 4]
+        .copy_from_slice(&checksum.to_le_bytes());
+
+    let err = decode_page(&page).unwrap_err();
+    assert_eq!(err.code(), "CorruptionError");
+    assert!(
+        err.to_string().contains("leaf cell value out of bounds"),
+        "{err}"
+    );
+}
+
+#[test]
+fn decode_rejects_overlapping_leaf_cells() {
+    let mut page = encode_leaf_page(
+        4,
+        0,
+        0,
+        &[
+            LeafCell {
+                key: b"a".to_vec(),
+                value: b"1".to_vec(),
+                value_kind: ValueKind::Inline,
+                total_value_len: 1,
+                overflow_head_page_id: 0,
+            },
+            LeafCell {
+                key: b"m".to_vec(),
+                value: b"2".to_vec(),
+                value_kind: ValueKind::Inline,
+                total_value_len: 1,
+                overflow_head_page_id: 0,
+            },
+        ],
+    )
+    .unwrap();
+    let low_slot =
+        u16::from_le_bytes([page[PAGE_HEADER_SIZE + 2], page[PAGE_HEADER_SIZE + 3]]) as usize;
+    page[low_slot + 4..low_slot + 8].copy_from_slice(&2u32.to_le_bytes());
+    page[low_slot + 16..low_slot + 20].copy_from_slice(&2u32.to_le_bytes());
+    let checksum = checksum_with_zeroed_region(&page, PAGE_HEADER_CHECKSUM_OFFSET, 4);
+    page[PAGE_HEADER_CHECKSUM_OFFSET..PAGE_HEADER_CHECKSUM_OFFSET + 4]
+        .copy_from_slice(&checksum.to_le_bytes());
+
+    let err = decode_page(&page).unwrap_err();
+    assert_eq!(err.code(), "CorruptionError");
+    assert!(err.to_string().contains("cells overlap"), "{err}");
+}
+
+#[test]
 fn exported_layout_constants_are_stable() {
     assert_eq!(FORMAT_VERSION, 1);
     assert_eq!(SUPERBLOCK_MAGIC, *b"STKDB001");

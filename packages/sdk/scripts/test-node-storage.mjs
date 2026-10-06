@@ -7,7 +7,12 @@ import { dirname, join, resolve, sep } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { isMainThread, parentPort, Worker, workerData } from 'node:worker_threads';
-import { installNodeStorage, releaseNodeStorageLease } from '../src/node-storage.mjs';
+import {
+    MISSING_DATABASE_MESSAGE,
+    ensureStorageRoot,
+    installNodeStorage,
+    releaseNodeStorageLease
+} from '../src/node-storage.mjs';
 
 const script = fileURLToPath(import.meta.url);
 const temporaryRoot = resolve(dirname(script), '../../../.tmp');
@@ -75,6 +80,19 @@ async function scenario() {
         if (action === 'invalid-path') {
             await assert.rejects(installNodeStorage(directory, { lockToken }), { name: 'StorageError' });
             assert.deepEqual(Object.getOwnPropertyDescriptor(globalThis, 'navigator'), originalNavigator);
+            return;
+        }
+        if (action === 'absent-database') {
+            await assert.rejects(installNodeStorage(directory, { lockToken, createIfMissing: false }), {
+                name: 'StorageError',
+                message: MISSING_DATABASE_MESSAGE
+            });
+            assert.equal(fs.existsSync(directory), false);
+            return;
+        }
+        if (action === 'existing-no-create') {
+            installation = await installNodeStorage(directory, { lockToken, createIfMissing: false });
+            assert.equal(fs.existsSync(lockDirectory(directory)), true);
             return;
         }
         const encodedDbName = action === 'mounted-generations' ? '666f6f' : undefined;
@@ -476,6 +494,79 @@ if (!isMainThread) {
             await exited;
         }
         await run('reopen', storageDirectory);
+    });
+
+    test('does not create a missing directory when database creation is disabled', () =>
+        run('absent-database', directory('absent-database')));
+
+    test('keeps an existing directory usable when database creation is disabled', async () => {
+        const storageDirectory = directory('existing-no-create');
+        fs.mkdirSync(storageDirectory);
+        await run('existing-no-create', storageDirectory);
+    });
+
+    test('node worker startup does not create a missing database when creation is disabled', async () => {
+        const storageDirectory = directory('worker-absent');
+        const worker = new Worker(new URL('../src/node-worker.mjs', import.meta.url), {
+            workerData: {
+                directory: storageDirectory,
+                dbName: 'absent',
+                channelName: 'node:test',
+                lockToken: randomUUID(),
+                ownerWaitMs: 0,
+                encodedDbName: Buffer.from('absent', 'utf8').toString('hex'),
+                createIfMissing: false
+            }
+        });
+        try {
+            const error = await new Promise((resolve, reject) => {
+                const fail = (failure) => {
+                    cleanup();
+                    reject(failure);
+                };
+                const cleanup = () => {
+                    worker.off('error', onError);
+                    worker.off('exit', onExit);
+                };
+                const onError = (failure) => {
+                    cleanup();
+                    resolve(failure);
+                };
+                const onExit = (code) => fail(new Error(`worker exited ${code} before reporting the missing database`));
+                worker.once('error', onError);
+                worker.once('exit', onExit);
+            });
+            assert.equal(error.name, 'StorageError');
+            assert.equal(error.message, MISSING_DATABASE_MESSAGE);
+            assert.equal(fs.existsSync(storageDirectory), false);
+        } finally {
+            await worker.terminate();
+        }
+    });
+
+    test('caller root preparation does not create a missing directory when creation is disabled', () => {
+        const storageDirectory = directory('missing-root');
+        assert.throws(() => ensureStorageRoot(storageDirectory, false), {
+            name: 'StorageError',
+            message: MISSING_DATABASE_MESSAGE
+        });
+        assert.equal(fs.existsSync(storageDirectory), false);
+        ensureStorageRoot(storageDirectory, true);
+        assert.equal(fs.statSync(storageDirectory).isDirectory(), true);
+    });
+
+    test('does not delete an unverifiable oversized lease record', async () => {
+        const storageDirectory = directory('unverifiable-lease');
+        fs.mkdirSync(storageDirectory);
+        const lock = lockDirectory(storageDirectory);
+        fs.mkdirSync(lock);
+        const token = '11111111-2222-3333-4444-555555555555';
+        const record = join(lock, `${token}.json`);
+        const body = JSON.stringify({ pid: 2147483647, token, pad: 'x'.repeat(1100) });
+        assert.ok(Buffer.byteLength(body) > 1024);
+        fs.writeFileSync(record, body);
+        await run('locked', storageDirectory);
+        assert.equal(fs.readFileSync(record, 'utf8'), body);
     });
 
     test('does not mutate a storage target that is a file', async () => {

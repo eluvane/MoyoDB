@@ -54,7 +54,8 @@ async function acquireStorage() {
         try {
             return await installNodeStorage(workerData.directory, {
                 lockToken: workerData.lockToken,
-                encodedDbName: workerData.encodedDbName
+                encodedDbName: workerData.encodedDbName,
+                createIfMissing: workerData.createIfMissing !== false
             });
         } catch (error) {
             const remaining = deadline - performance.now();

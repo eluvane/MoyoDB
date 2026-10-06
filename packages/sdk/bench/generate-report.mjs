@@ -1,12 +1,20 @@
-import { readdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 const resultsDir = join(import.meta.dirname, 'results');
 const outPath = join(resultsDir, 'report.md');
-const files = (await readdir(resultsDir)).filter((name) => name.endsWith('.json')).sort();
+let files = [];
+try {
+    files = (await readdir(resultsDir)).filter((name) => name.endsWith('.json')).sort();
+} catch (error) {
+    if (error?.code !== 'ENOENT') {
+        throw error;
+    }
+}
 
 if (files.length === 0) {
     const empty = `# Browser benchmark report\n\nNo raw browser benchmark JSON files were found in \`packages/sdk/bench/results\`.\n\nRun one of:\n\n\`\`\`bash\ncd packages/sdk\nnpm run bench:browser\nnpm run bench:indexeddb\nnpm run bench:opfs\n\`\`\`\n`;
+    await mkdir(resultsDir, { recursive: true });
     await writeFile(outPath, empty);
     console.log(`wrote ${join('bench', 'results', 'report.md')} (no results found)`);
     process.exit(0);
@@ -163,7 +171,7 @@ await writeFile(outPath, `${lines.join('\n')}\n`);
 console.log(`wrote ${join('bench', 'results', 'report.md')}`);
 
 function metric(value) {
-    return typeof value === 'number' ? value.toFixed(2) : 'n/a';
+    return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(2) : 'n/a';
 }
 
 function tableText(value = '') {

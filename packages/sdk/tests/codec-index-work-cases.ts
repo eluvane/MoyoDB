@@ -181,6 +181,25 @@ export async function checkCodecIndexWork(api: {
         ]);
         ok(hashed.internalStore === '__browserdb:index:h:7d1625c67ba33d3b', 'legacy hashed store naming changed');
     });
+    await test('dotted index paths do not box JSON primitives', () => {
+        const document = codec.jsonEncode({ name: 'Ada', tags: ['A', 'B'] });
+        const [stringLength] = indexing.normalizeIndexDefinitions([
+            { store: 'docs', name: 'lookup', keyPath: 'name.length' }
+        ]);
+        const [stringUnit] = indexing.normalizeIndexDefinitions([{ store: 'docs', name: 'lookup', keyPath: 'name.0' }]);
+        ok(indexing.extractLogicalIndexKey(stringLength, document) === null, 'string length was indexed');
+        ok(indexing.extractLogicalIndexKey(stringUnit, document) === null, 'string unit was indexed');
+        const [element] = indexing.normalizeIndexDefinitions([{ store: 'docs', name: 'lookup', keyPath: 'tags.0' }]);
+        const [arrayLength] = indexing.normalizeIndexDefinitions([
+            { store: 'docs', name: 'lookup', keyPath: 'tags.length' }
+        ]);
+        const elementKey = indexing.extractLogicalIndexKey(element, document);
+        const lengthKey = indexing.extractLogicalIndexKey(arrayLength, document);
+        ok(elementKey !== null, 'array element was skipped');
+        ok(lengthKey !== null, 'array length was skipped');
+        equalBytes(elementKey, codec.indexKey('A'), 'array element');
+        equalBytes(lengthKey, codec.indexKey(2), 'array length');
+    });
     await test('own JSON properties named constructor and __proto__ remain indexable', () => {
         for (const keyPath of ['constructor.name', '__proto__.name']) {
             const [def] = indexing.normalizeIndexDefinitions([{ store: 'docs', name: 'lookup', keyPath }]);

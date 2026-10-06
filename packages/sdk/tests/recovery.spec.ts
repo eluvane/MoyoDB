@@ -43,6 +43,6 @@ for (const failpoint of ['after_wal_flush', 'after_main_flush', 'before_superblo
             }
         }, dbName);
         expect(recovered.base).toBe('ok');
-        expect(['crashy', null]).toContain(recovered.after);
+        expect(recovered.after).toBe('crashy');
     });
 }

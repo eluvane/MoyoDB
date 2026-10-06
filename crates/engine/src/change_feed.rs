@@ -250,6 +250,12 @@ pub(crate) fn decode_change_record_payload_ref(payload: &[u8]) -> Result<ChangeR
             "change log payload magic mismatch".into(),
         ));
     }
+    if payload[5] != 0 {
+        return Err(EngineError::Corruption(format!(
+            "unsupported change log flags {}",
+            payload[5]
+        )));
+    }
 
     let kind = ChangeKind::from_tag(payload[4])?;
     let store_len = usize::from(read_u16_le(payload, 6)?);

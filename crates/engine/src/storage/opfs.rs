@@ -3,7 +3,7 @@ use crate::bytes::encode_db_name;
 use crate::error::{EngineError, Result};
 #[cfg(target_arch = "wasm32")]
 use crate::layout::{MAIN_FILE_KIND, MANIFEST_FILE_KIND, WAL_FILE_KIND};
-use crate::storage::backend::{FileBackend, FileSet};
+use crate::storage::backend::{validate_database_name, FileBackend, FileSet};
 
 #[cfg(target_arch = "wasm32")]
 mod wasm_impl {
@@ -106,6 +106,7 @@ mod wasm_impl {
             db_name: &str,
             create_if_missing: bool,
         ) -> Result<FileSet<OpfsBackend>> {
+            validate_database_name(db_name)?;
             let encoded = encode_db_name(db_name);
             let value =
                 JsFuture::from(opfsOpenActiveDb(&encoded, create_if_missing).map_err(js_err)?)
@@ -119,6 +120,7 @@ mod wasm_impl {
             generation_name: &str,
             create_if_missing: bool,
         ) -> Result<FileSet<OpfsBackend>> {
+            validate_database_name(db_name)?;
             let encoded = encode_db_name(db_name);
             let value = JsFuture::from(
                 opfsOpenGenerationDb(&encoded, generation_name, create_if_missing)
@@ -130,6 +132,7 @@ mod wasm_impl {
         }
 
         pub async fn prepare_rebuild_target(db_name: &str) -> Result<String> {
+            validate_database_name(db_name)?;
             let encoded = encode_db_name(db_name);
             let value = JsFuture::from(opfsPrepareRebuildTarget(&encoded).map_err(js_err)?)
                 .await
@@ -143,6 +146,7 @@ mod wasm_impl {
             generation_name: &str,
             expected_current_generation: Option<String>,
         ) -> Result<()> {
+            validate_database_name(db_name)?;
             let encoded = encode_db_name(db_name);
             JsFuture::from(
                 opfsSwapActiveGeneration(&encoded, generation_name, expected_current_generation)
@@ -154,6 +158,7 @@ mod wasm_impl {
         }
 
         pub async fn read_active_generation(db_name: &str) -> Result<Option<String>> {
+            validate_database_name(db_name)?;
             let encoded = encode_db_name(db_name);
             let value = JsFuture::from(opfsReadActiveGeneration(&encoded).map_err(js_err)?)
                 .await
@@ -167,6 +172,7 @@ mod wasm_impl {
         }
 
         pub async fn cleanup_inactive_entries(db_name: &str) -> Result<()> {
+            validate_database_name(db_name)?;
             let encoded = encode_db_name(db_name);
             JsFuture::from(opfsCleanupInactiveEntries(&encoded).map_err(js_err)?)
                 .await
@@ -175,6 +181,7 @@ mod wasm_impl {
         }
 
         pub async fn db_directory_size(db_name: &str) -> Result<u64> {
+            validate_database_name(db_name)?;
             let encoded = encode_db_name(db_name);
             let value = JsFuture::from(opfsDbDirectorySize(&encoded).map_err(js_err)?)
                 .await
@@ -183,6 +190,7 @@ mod wasm_impl {
         }
 
         pub async fn remove_db(db_name: &str) -> Result<()> {
+            validate_database_name(db_name)?;
             let encoded = encode_db_name(db_name);
             JsFuture::from(opfsRemoveDb(&encoded).map_err(js_err)?)
                 .await
@@ -193,7 +201,13 @@ mod wasm_impl {
 
     impl FileBackend for OpfsBackend {
         fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
-            let mut bytes = vec![0u8; len];
+            let mut bytes = Vec::new();
+            bytes.try_reserve_exact(len).map_err(|err| {
+                EngineError::Storage(format!(
+                    "opfs read allocation failed for {len} bytes: {err}"
+                ))
+            })?;
+            bytes.resize(len, 0);
             // The slice borrows this WASM buffer for the synchronous call only.
             // The shim must not retain the view or call back into WASM.
             let read = opfsReadAtInto(self.session_id, self.file_kind, offset, &mut bytes)
@@ -324,45 +338,53 @@ mod native_impl {
         }
 
         pub async fn open_db(
-            _db_name: &str,
+            db_name: &str,
             _create_if_missing: bool,
         ) -> Result<FileSet<OpfsBackend>> {
+            validate_database_name(db_name)?;
             unsupported_opfs()
         }
 
         pub async fn open_generation(
-            _db_name: &str,
+            db_name: &str,
             _generation_name: &str,
             _create_if_missing: bool,
         ) -> Result<FileSet<OpfsBackend>> {
+            validate_database_name(db_name)?;
             unsupported_opfs()
         }
 
-        pub async fn prepare_rebuild_target(_db_name: &str) -> Result<String> {
+        pub async fn prepare_rebuild_target(db_name: &str) -> Result<String> {
+            validate_database_name(db_name)?;
             unsupported_opfs()
         }
 
         pub async fn swap_active_generation(
-            _db_name: &str,
+            db_name: &str,
             _generation_name: &str,
             _expected_current_generation: Option<String>,
         ) -> Result<()> {
+            validate_database_name(db_name)?;
             unsupported_opfs()
         }
 
-        pub async fn read_active_generation(_db_name: &str) -> Result<Option<String>> {
+        pub async fn read_active_generation(db_name: &str) -> Result<Option<String>> {
+            validate_database_name(db_name)?;
             unsupported_opfs()
         }
 
-        pub async fn cleanup_inactive_entries(_db_name: &str) -> Result<()> {
+        pub async fn cleanup_inactive_entries(db_name: &str) -> Result<()> {
+            validate_database_name(db_name)?;
             unsupported_opfs()
         }
 
-        pub async fn db_directory_size(_db_name: &str) -> Result<u64> {
+        pub async fn db_directory_size(db_name: &str) -> Result<u64> {
+            validate_database_name(db_name)?;
             unsupported_opfs()
         }
 
-        pub async fn remove_db(_db_name: &str) -> Result<()> {
+        pub async fn remove_db(db_name: &str) -> Result<()> {
+            validate_database_name(db_name)?;
             unsupported_opfs()
         }
     }

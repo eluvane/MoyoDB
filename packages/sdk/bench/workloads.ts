@@ -704,7 +704,13 @@ function workload(
 export function selectWorkloads(profile: BenchProfile, workloadNames?: string[]): WorkloadSpec[] {
     const requested = workloadNames?.length ? new Set(workloadNames) : null;
     if (requested) {
-        return WORKLOADS.filter((workload) => requested.has(workload.name));
+        const selected = WORKLOADS.filter((workload) => requested.has(workload.name));
+        if (selected.length !== requested.size) {
+            const known = new Set(WORKLOADS.map((workload) => workload.name));
+            const missing = [...requested].filter((name) => !known.has(name));
+            throw new Error(`Unknown benchmark workload(s): ${missing.join(', ')}`);
+        }
+        return selected;
     }
     return WORKLOADS.filter((workload) => {
         if (workload.tags?.includes('manual')) {

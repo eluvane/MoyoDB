@@ -77,10 +77,25 @@ function buildSuites(browserReports) {
     const cases = [];
     for (const { file, report } of browserReports) {
         for (const result of report.results ?? []) {
-            if (result.status !== 'ok' || !result.stats) {
+            if (result.status === 'error') {
+                throw new Error(
+                    `browser benchmark row failed: ${result.engine}/${result.workloadName}: ${result.error ?? 'unknown error'}`
+                );
+            }
+            if (result.status !== 'ok') {
                 continue;
             }
+            if (!result.stats) {
+                throw new Error(
+                    `browser benchmark row ${result.engine}/${result.workloadName} completed with no samples`
+                );
+            }
             const mean = Number(result.stats.mean);
+            if (!Number.isFinite(mean) || mean < 0) {
+                throw new Error(
+                    `browser benchmark row ${result.engine}/${result.workloadName} has a non-finite mean latency`
+                );
+            }
             cases.push({
                 id: `${result.engine}:${result.workloadName}`,
                 label: `${result.engine} / ${result.workloadName}`,
@@ -105,11 +120,12 @@ function buildSuites(browserReports) {
                     sampleCount: result.sampleCount
                 },
                 metrics: {
-                    opsPerSec: mean > 0 ? 1000 / mean : 0,
+                    // A zero elapsed sample is below timer resolution, not a measured throughput of zero.
+                    opsPerSec: mean > 0 ? 1000 / mean : null,
                     avgLatencyMs: mean,
-                    p50LatencyMs: Number(result.stats.p50),
-                    p95LatencyMs: Number(result.stats.p95),
-                    p99LatencyMs: Number(result.stats.p99)
+                    p50LatencyMs: finiteOrNull(result.stats.p50),
+                    p95LatencyMs: finiteOrNull(result.stats.p95),
+                    p99LatencyMs: finiteOrNull(result.stats.p99)
                 }
             });
         }
@@ -167,11 +183,20 @@ function renderSummary(baseline) {
 }
 
 async function readSuiteMetadata() {
+    const suitePath = path.join(rootDir, '.benchmark', 'suites.json');
     try {
-        return JSON.parse(await readFile(path.join(rootDir, '.benchmark', 'suites.json'), 'utf8'));
-    } catch {
-        return {};
+        return JSON.parse(await readFile(suitePath, 'utf8'));
+    } catch (error) {
+        if (error && error.code === 'ENOENT') {
+            return {};
+        }
+        throw error;
     }
+}
+
+function finiteOrNull(value) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
 }
 
 async function readBrowserReports() {

@@ -19,8 +19,8 @@ import {
     unwrapSnapshotCompression,
     type CompressionOption
 } from './compression';
-import { prefixRange, utf8Encode } from './codec';
-import { isRecord } from './internal';
+import { utf8Encode } from './codec';
+import { clampTimerDelayMs, isRecord } from './internal';
 import {
     INDEX_METADATA_STORE,
     cloneNormalizedIndexDefinitions,
@@ -545,7 +545,7 @@ class OwnershipLease {
             return;
         }
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), ownerWaitMs);
+        const timeout = setTimeout(() => controller.abort(), clampTimerDelayMs(ownerWaitMs));
         let acquiredResolve: (() => void) | null = null;
         const acquiredPromise = new Promise<void>((resolve) => {
             acquiredResolve = resolve;
@@ -1180,7 +1180,7 @@ export class DbWorker implements WorkerApi {
     }
     async getByIndex(txId: number, store: string, indexName: string, key: Uint8Array): Promise<Uint8Array | null> {
         const def = this.resolveIndexDefinition(txId, store, indexName);
-        const page = await this.loadVisibleIndexPage(txId, def, prefixRange(key), null, 1);
+        const page = await this.loadVisibleIndexPage(txId, def, { gte: key, lte: key }, null, 1);
         return page.rows.length === 0 ? null : page.rows[0].value;
     }
     async scanByIndex(txId: number, store: string, indexName: string, range: Range = {}): Promise<ScanItem[]> {

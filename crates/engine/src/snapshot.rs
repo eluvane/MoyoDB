@@ -141,7 +141,13 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotContents> {
         "snapshot store count",
     )?;
     offset += 4;
+    let directory_flags = read_u32_le(bytes, offset).map_err(corruption_from_engine_error)?;
     offset += 4;
+    if directory_flags != 0 {
+        return Err(corruption(format!(
+            "unsupported snapshot directory flags {directory_flags:#x}"
+        )));
+    }
 
     let mut stores = Vec::with_capacity(store_count.min(1024));
     let mut seen_store_names = BTreeSet::new();
@@ -172,15 +178,14 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotContents> {
             let key_len =
                 usize::from(read_u16_le(bytes, offset).map_err(corruption_from_engine_error)?);
             offset += 2;
-            let entry_flags = if version >= 3 {
-                let entry_flags =
-                    read_u16_le(bytes, offset).map_err(corruption_from_engine_error)?;
-                offset += 2;
-                entry_flags
-            } else {
-                offset += 2;
-                0
-            };
+            let raw_flags = read_u16_le(bytes, offset).map_err(corruption_from_engine_error)?;
+            offset += 2;
+            if raw_flags & !SNAPSHOT_ENTRY_FLAG_HAS_EXPIRY != 0 || (version < 3 && raw_flags != 0) {
+                return Err(corruption(format!(
+                    "unsupported snapshot entry flags {raw_flags:#x}"
+                )));
+            }
+            let entry_flags = if version >= 3 { raw_flags } else { 0 };
             let value_len = usize_from_u32(
                 read_u32_le(bytes, offset).map_err(corruption_from_engine_error)?,
                 "snapshot value length",
@@ -319,6 +324,18 @@ fn validate_snapshot_header(bytes: &[u8]) -> Result<u32> {
     if version != 1 && version != 2 && version != SNAPSHOT_VERSION {
         return Err(corruption(format!(
             "unsupported snapshot version {version}"
+        )));
+    }
+    let header_flags = read_u32_le(bytes, 12).map_err(corruption_from_engine_error)?;
+    if header_flags != 0 {
+        return Err(corruption(format!(
+            "unsupported snapshot header flags {header_flags:#x}"
+        )));
+    }
+    let header_tail = read_u32_le(bytes, 28).map_err(corruption_from_engine_error)?;
+    if header_tail != 0 {
+        return Err(corruption(format!(
+            "unsupported snapshot header flags {header_tail:#x}"
         )));
     }
 

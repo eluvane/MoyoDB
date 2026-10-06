@@ -463,12 +463,16 @@ test('recovery_open_through_worker_without_comlink', async ({ page }) => {
         const reopened = await window.moyodb.openDB(name, { requestPersistence: false, ownerWaitMs: 2000 });
         try {
             const base = await reopened.get('kv', window.moyodb.utf8Encode('base'));
-            return base ? window.moyodb.utf8Decode(base) : null;
+            const after = await reopened.get('kv', window.moyodb.utf8Encode('after'));
+            return {
+                base: base ? window.moyodb.utf8Decode(base) : null,
+                after: after ? window.moyodb.utf8Decode(after) : null
+            };
         } finally {
             await reopened.close();
         }
     }, dbName);
-    expect(result).toBe('ok');
+    expect(result).toEqual({ base: 'ok', after: 'crashy' });
 });
 
 test('worker_crash_cleanup', async ({ page }) => {
@@ -493,4 +497,54 @@ test('worker_crash_cleanup', async ({ page }) => {
         }
     }, dbName);
     expect(result).toEqual({ crashed: true, closedError: 'DatabaseClosedError' });
+});
+
+test('oversized ready timeout stays pending until an incompatible response fails the client', async ({ page }) => {
+    await prepareProtocolPage(page);
+    const result = await page.evaluate(async () => {
+        const clientUrl = new URL('/src/worker-client.ts', window.location.href).href;
+        const clientModule = (await import(clientUrl)) as {
+            WorkerProtocolClient: new (
+                transport: {
+                    postMessage: () => void;
+                    addEventListener: (type: string, listener: (event: { data: unknown }) => void) => void;
+                    removeEventListener: (type: string, listener: (event: { data: unknown }) => void) => void;
+                },
+                options: { readyTimeoutMs: number }
+            ) => { whenReady: () => Promise<void>; dispose: () => void };
+        };
+        const listeners = new Map<string, Array<(event: { data: unknown }) => void>>();
+        const transport = {
+            postMessage() {},
+            addEventListener(type: string, listener: (event: { data: unknown }) => void) {
+                const list = listeners.get(type) ?? [];
+                list.push(listener);
+                listeners.set(type, list);
+            },
+            removeEventListener(type: string, listener: (event: { data: unknown }) => void) {
+                listeners.set(
+                    type,
+                    (listeners.get(type) ?? []).filter((entry) => entry !== listener)
+                );
+            }
+        };
+        const client = new clientModule.WorkerProtocolClient(transport, { readyTimeoutMs: 3_000_000_000 });
+        const pending = client.whenReady().then(
+            () => 'ready',
+            () => 'failed'
+        );
+        const early = await Promise.race([
+            pending,
+            new Promise<string>((resolve) => {
+                setTimeout(() => resolve('waiting'), 50);
+            })
+        ]);
+        for (const listener of listeners.get('message') ?? []) {
+            listener({ data: { type: 'moyodb:worker-protocol:response', version: 2, id: 1, ok: false } });
+        }
+        const outcome = await pending;
+        client.dispose();
+        return { early, outcome };
+    });
+    expect(result).toEqual({ early: 'waiting', outcome: 'failed' });
 });

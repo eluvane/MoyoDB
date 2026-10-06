@@ -131,6 +131,28 @@ test('openDB and deleteDB validate database names before touching worker state',
         }
     ]);
 });
+test('openDB and deleteDB reject names the storage layer cannot represent', async ({ page }) => {
+    await prepareMoyoDbPage(page);
+    const result = await page.evaluate(async () => {
+        const settled = await Promise.allSettled([
+            window.moyodb.openDB('\uD800'),
+            window.moyodb.openDB('x'.repeat(128)),
+            window.moyodb.deleteDB('\u00e9'.repeat(64))
+        ]);
+        return settled.map((outcome): string => {
+            if (outcome.status === 'fulfilled') {
+                return 'NO_ERROR';
+            }
+            const reason: unknown = outcome.reason;
+            return reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason);
+        });
+    });
+    expect(result).toEqual([
+        'TypeError: openDB() database name must contain valid Unicode',
+        'TypeError: openDB() database name must contain at most 127 UTF-8 bytes',
+        'TypeError: deleteDB() database name must contain at most 127 UTF-8 bytes'
+    ]);
+});
 test('openDB rejects null option bags with InvalidOpenOptionsError', async ({ page }) => {
     const dbName = uniqueDbName('invalid-open-options-null');
     await prepareMoyoDbPage(page);

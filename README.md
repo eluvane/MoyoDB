@@ -24,7 +24,7 @@ The SDK preserves the Release 1.0.1 API and stored encodings within the 1.x seri
 ## Quick start
 
 ```bash
-npm install @moyodb/sdk@1.0.1
+npm install @moyodb/sdk@1.2.0
 ```
 
 ```ts

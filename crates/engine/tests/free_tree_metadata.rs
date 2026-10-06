@@ -22,7 +22,8 @@ fn pager_with_images(images: &[(u64, Vec<u8>)]) -> Result<Pager<MemoryBackend>> 
     for (page_id, bytes) in images {
         pager.write_page_image(*page_id, bytes)?;
     }
-    Ok(pager)
+    // Cached images skip load-time checks; reopen over the same bytes.
+    Ok(Pager::new(pager.into_inner(), images.len().max(1)))
 }
 
 fn rejected_retirement(images: &[(u64, Vec<u8>)], expected_message: &str) -> Result<Vec<u64>> {
@@ -183,12 +184,13 @@ fn free_tree_rejects_invalid_and_repeated_child_links() -> Result<()> {
         ],
     )?;
     let leaf = encode_leaf_page(2, 0, 0, &[inline_cell(b"a")])?;
-    assert_eq!(
+    assert!(
         rejected_retirement(
             &[(1, repeated_child), (2, leaf)],
-            "page 2 is reachable twice in one tree",
-        )?,
-        vec![1, 2]
+            "internal page 1 repeats child page 2",
+        )?
+        .is_empty(),
+        "a repeated child must be rejected before either page is retired"
     );
     Ok(())
 }

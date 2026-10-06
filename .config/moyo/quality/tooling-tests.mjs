@@ -207,6 +207,109 @@ test('workflow policy checks npm install flags in unnamed run steps', (t) => {
     assert.match(result.output, /npm ci must include --ignore-scripts/u);
 });
 
+test('workflow policy rejects an unpinned cargo install inside a multiline run', (t) => {
+    const directory = fixture(t, [workflowScript]);
+    write(
+        directory,
+        '.github/workflows/witness.yml',
+        [
+            'permissions: {}',
+            'jobs:',
+            '  check:',
+            '    runs-on: ubuntu-24.04',
+            '    steps:',
+            '      - run: |',
+            '          set -euo pipefail',
+            '          cargo install --locked cargo-deny'
+        ].join('\n')
+    );
+    const result = run(directory, workflowScript);
+    assert.equal(result.status, 1, result.output);
+    assert.match(result.output, /cargo install must pin --version/u);
+});
+
+test('workflow policy accepts a version-pinned cargo install inside a multiline run', (t) => {
+    const directory = fixture(t, [workflowScript]);
+    write(
+        directory,
+        '.github/workflows/witness.yml',
+        [
+            'permissions: {}',
+            'jobs:',
+            '  check:',
+            '    runs-on: ubuntu-24.04',
+            '    steps:',
+            '      - run: |',
+            '          set -euo pipefail',
+            '          cargo install --locked cargo-deny --version 0.20.2'
+        ].join('\n')
+    );
+    const result = run(directory, workflowScript);
+    assert.equal(result.status, 0, result.output);
+});
+
+test('workflow policy rejects a checkout whose credential pin is only counted on another step', (t) => {
+    const directory = fixture(t, [workflowScript]);
+    write(
+        directory,
+        '.github/workflows/witness.yml',
+        [
+            'permissions: {}',
+            'jobs:',
+            '  check:',
+            '    runs-on: ubuntu-24.04',
+            '    steps:',
+            '      - uses: actions/checkout@v7',
+            '        with:',
+            '          persist-credentials: false',
+            '          persist-credentials: false',
+            '      - uses: actions/checkout@v7'
+        ].join('\n')
+    );
+    const result = run(directory, workflowScript);
+    assert.equal(result.status, 1, result.output);
+    assert.match(result.output, /must set persist-credentials: false/u);
+});
+
+const docsScript = '.config/moyo/quality/check-docs-links.mjs';
+const rootCommands = [
+    'format',
+    'format:check',
+    'lint',
+    'lint:typescript',
+    'lint:rust',
+    'lint:lean',
+    'lint:repo',
+    'quality',
+    'security',
+    'test',
+    'build',
+    'check',
+    'check:all'
+];
+
+function docsFixture(t, qualityReadme) {
+    const directory = fixture(t, [docsScript]);
+    write(directory, 'package.json', { scripts: Object.fromEntries(rootCommands.map((script) => [script, 'true'])) });
+    write(directory, 'packages/sdk/package.json', { scripts: { build: 'true' } });
+    write(directory, 'README.md', '# Moyo\n');
+    write(directory, '.config/moyo/README.md', qualityReadme);
+    return directory;
+}
+
+test('docs policy requires each root command, not a longer command that shares its prefix', (t) => {
+    const documented = rootCommands.map((script) => `npm run ${script}`).join('\n');
+    const present = run(docsFixture(t, `${documented}\n`), docsScript);
+    assert.equal(present.status, 0, present.output);
+    const prefixOnly = documented
+        .split('\n')
+        .filter((line) => line !== 'npm run format')
+        .join('\n');
+    const missing = run(docsFixture(t, `${prefixOnly}\n`), docsScript);
+    assert.equal(missing.status, 1, missing.output);
+    assert.match(missing.output, /does not document root command: npm run format$/mu);
+});
+
 const jsonScript = '.config/moyo/quality/check-json-files.mjs';
 for (const [name, source] of [
     ['adjacent number tokens separated by an empty comment', '{"value": 1/**/2}'],

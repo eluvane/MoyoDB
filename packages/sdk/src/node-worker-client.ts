@@ -9,6 +9,7 @@ export interface NodeWorkerData {
     lockToken: string;
     ownerWaitMs: number;
     encodedDbName: string;
+    createIfMissing: boolean;
 }
 
 export class NodeWorkerTransport {

@@ -6,6 +6,10 @@ import { isMainThread } from 'node:worker_threads';
 const LOCK_DIRECTORY = '.moyodb.lock';
 const PENDING_PREFIX = '.moyodb.pending-';
 const TOKEN_PATTERN = /^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i;
+// NativeFileBackend rejects a larger record without deleting it.
+const MAX_LEASE_RECORD_BYTES = 1024;
+const MAX_LEASE_PID = 0xffffffff;
+export const MISSING_DATABASE_MESSAGE = 'database missing and create_if_missing=false';
 let installedStorage = null;
 
 function namedError(name, message, cause) {
@@ -84,9 +88,12 @@ function readLease(directory, token) {
     const lockDirectory = join(directory, LOCK_DIRECTORY);
     entryStat(lockDirectory, 'directory');
     const recordPath = join(lockDirectory, `${validateToken(token)}.json`);
-    entryStat(recordPath, 'file');
+    const stat = entryStat(recordPath, 'file');
+    if (stat.size > MAX_LEASE_RECORD_BYTES) {
+        throw namedError('DatabaseBusyError', 'storage lock owner cannot be verified');
+    }
     const owner = JSON.parse(fs.readFileSync(recordPath, 'utf8'));
-    if (owner.token !== token || !Number.isSafeInteger(owner.pid) || owner.pid <= 0) {
+    if (owner.token !== token || !Number.isSafeInteger(owner.pid) || owner.pid <= 0 || owner.pid > MAX_LEASE_PID) {
         throw namedError('DatabaseBusyError', 'storage lock owner cannot be verified');
     }
     return { lockDirectory, recordPath, owner };
@@ -556,7 +563,26 @@ function mountedRoot(storage, encodedDbName) {
     return new MountedDirectoryHandle(storage, '', 'stackdb', () => stackdb);
 }
 
-export async function installNodeStorage(directory, { lockToken = randomUUID(), encodedDbName } = {}) {
+export function ensureStorageRoot(directory, createIfMissing = true) {
+    const path = validateDirectory(directory);
+    if (!createIfMissing) {
+        try {
+            entryStat(path, 'directory');
+        } catch (error) {
+            if (error?.code === 'ENOENT') throw namedError('StorageError', MISSING_DATABASE_MESSAGE);
+            if (error?.name === 'TypeMismatchError' || error?.name === 'SecurityError') throw error;
+            throw storageError(error);
+        }
+        return path;
+    }
+    fs.mkdirSync(path, { recursive: true });
+    return path;
+}
+
+export async function installNodeStorage(
+    directory,
+    { lockToken = randomUUID(), encodedDbName, createIfMissing = true } = {}
+) {
     if (isMainThread) throw new Error('Node storage must be installed in a dedicated worker');
     if (installedStorage) throw new Error('Node storage is already installed in this worker');
     const path = validateDirectory(directory);
@@ -566,6 +592,15 @@ export async function installNodeStorage(directory, { lockToken = randomUUID(), 
         (typeof encodedDbName !== 'string' || !/^(?:[a-f\d]{2})+$/.test(encodedDbName))
     ) {
         throw new TypeError('encodedDbName must be the lowercase hexadecimal UTF-8 database name');
+    }
+    if (createIfMissing === false) {
+        try {
+            entryStat(path, 'directory');
+        } catch (error) {
+            if (error?.code === 'ENOENT') throw namedError('StorageError', MISSING_DATABASE_MESSAGE);
+            if (error?.name === 'TypeMismatchError' || error?.name === 'SecurityError') throw error;
+            throw storageError(error);
+        }
     }
     let canonical;
     try {

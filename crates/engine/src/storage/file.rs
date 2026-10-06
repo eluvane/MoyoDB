@@ -1,6 +1,6 @@
 use crate::bytes::encode_db_name;
 use crate::error::{EngineError, Result};
-use crate::storage::backend::{FileBackend, FileSet};
+use crate::storage::backend::{validate_database_name, FileBackend, FileSet};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -116,11 +116,7 @@ impl NativeFileBackend {
         db_name: &str,
         create_if_missing: bool,
     ) -> Result<FileSet<Self>> {
-        if db_name.is_empty() || db_name.len() > 127 {
-            return Err(EngineError::Storage(
-                "native database name must contain 1 to 127 UTF-8 bytes".into(),
-            ));
-        }
+        validate_database_name(db_name)?;
         let root = absolute_path(root.as_ref())?;
         ensure_directory(&root, create_if_missing)?;
         let stackdb = root.join("stackdb");
@@ -573,19 +569,32 @@ fn process_alive(pid: u32) -> Result<bool> {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+        fn GetExitCodeProcess(handle: *mut c_void, code: *mut u32) -> i32;
         fn CloseHandle(handle: *mut c_void) -> i32;
     }
-    // SAFETY: OpenProcess takes value parameters. Its handle remains local.
-    let handle = unsafe { OpenProcess(0x1000, 0, pid) };
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    // OpenProcess fails with this code when the process id no longer exists.
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+    // GetExitCodeProcess uses this sentinel while the process is still running.
+    // A real exit code of 259 cannot be distinguished and stays locked.
+    const STILL_ACTIVE: u32 = 259;
+    // SAFETY: OpenProcess takes value parameters. The handle stays local.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if handle.is_null() {
         let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(87) {
+        if err.raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
             return Ok(false);
         }
         return Err(EngineError::DatabaseBusy(format!(
             "native lease process cannot be inspected: {err}"
         )));
     }
+    // The process object outlives the process while any handle remains open.
+    // OpenProcess succeeding is not evidence that the owner is still running.
+    let mut code = STILL_ACTIVE;
+    // SAFETY: `code` is a local u32 and the handle came from OpenProcess.
+    let queried = unsafe { GetExitCodeProcess(handle, &mut code) };
+    let query_error = io::Error::last_os_error();
     // SAFETY: This handle came from OpenProcess and is closed exactly once.
     let closed = unsafe { CloseHandle(handle) };
     if closed == 0 {
@@ -594,7 +603,12 @@ fn process_alive(pid: u32) -> Result<bool> {
             io::Error::last_os_error()
         )));
     }
-    Ok(true)
+    if queried == 0 {
+        return Err(EngineError::DatabaseBusy(format!(
+            "native lease process cannot be inspected: {query_error}"
+        )));
+    }
+    Ok(code == STILL_ACTIVE)
 }
 
 #[cfg(unix)]

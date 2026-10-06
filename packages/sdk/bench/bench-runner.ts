@@ -204,6 +204,16 @@ async function runOneWorkload(
             await yieldToBrowser();
         }
         console.info(`[bench] done ${runner.engine}/${workload.name}`);
+        if (rawSamples.length === 0 || rawSamples.some((sample) => !Number.isFinite(sample) || sample < 0)) {
+            return {
+                ...base,
+                status: 'error',
+                warmupSamples,
+                rawSamples,
+                contentChecksums,
+                error: 'benchmark sample timings were empty or non-finite'
+            };
+        }
         return {
             ...base,
             status: 'ok',

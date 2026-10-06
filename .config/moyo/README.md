@@ -119,11 +119,13 @@ The root `package.json` and `package-lock.json` are not shims; they are the cano
 
 Lean checks follow the project-local best-practices baseline supplied with this maintenance pass:
 
-\- exact Lean toolchain, no floating `stable` or `nightly` alias;\
-\- source scan for `sorry`, `admit`, `axiom`, `unsafe`, `partial`, disabled diagnostics, and suspicious Lake/build-time shell usage;\
-\- `lake build --wfail`;\
-\- `lake lint --builtin-lint`;\
+\- exact Lean toolchain `leanprover/lean4:v4.31.0`, no floating `stable` or `nightly` alias;\
+\- source scan for `sorry`, `admit`, `sorryAx`, `axiom`, `unsafe`, `partial`, disabled diagnostics, `#eval!`, `import all`, and suppressed Batteries lints;\
+\- `lake build --wfail MoyoDbProofs`;\
+\- `lake lint --lint-all`, which runs the built-in linters and the Heron, JunkLinter, and Batteries driver;\
 \- `lake env leanchecker --fresh MoyoDbProofs`;\
-\- committed exported trace artifacts checked for drift.
+\- `lake exe export_artifacts`, then a clean diff of the committed `proofs/artifacts` traces.
+
+`npm run lint:lean` runs the source scan, `lake lint --lint-all`, and `leanchecker`. The build, B-tree page gate, and artifact diff run in the Lean CI job.
 
 These gates establish that the Lean package builds without holes or custom axioms. They do not widen what its theorems cover: the package is an executable specification of an abstract model (association-list store, record-list WAL, write-batch transactions), and its traces are conformance scenarios for the Rust engine. Durability of the real engine is exercised by the crash-matrix and fault-injection tests, not by Lean.

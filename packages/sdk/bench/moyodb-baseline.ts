@@ -1059,7 +1059,6 @@ async function opfsRawWrite(dbName: string, workload: WorkloadSpec): Promise<voi
         size: OPFS_DIAGNOSTIC_BYTES,
         chunkSize: workload.batchSize
     });
-    await postWorker(worker, { op: 'delete', name: `${dbName}-raw-write` });
 }
 
 async function opfsRawReadRandom(dbName: string, workload: WorkloadSpec, sampleIndex: number): Promise<void> {

@@ -388,12 +388,11 @@ function normalizeValue(column: SqlColumnDefinition, value: SqlValue): SqlValue 
         }
         case 'REAL':
             if (typeof value === 'number' && Number.isFinite(value)) return Object.is(value, -0) ? 0 : value;
-            if (
-                typeof value === 'bigint' &&
-                value >= BigInt(Number.MIN_SAFE_INTEGER) &&
-                value <= BigInt(Number.MAX_SAFE_INTEGER)
-            )
-                return Number(value);
+            if (typeof value === 'bigint') {
+                const asNumber = Number(value);
+                // Reject bigints Number would round. Exact powers of two above 2^53 stay finite REAL values.
+                if (Number.isFinite(asNumber) && BigInt(asNumber) === value) return asNumber;
+            }
             break;
         case 'TEXT':
             if (typeof value === 'string') {

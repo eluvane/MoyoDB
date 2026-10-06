@@ -201,6 +201,7 @@ test('parameter holes, undefined, objects and lossy numbers are rejected', () =>
         Infinity,
         -Infinity,
         9007199254740992,
+        1e16,
         9223372036854775808n,
         -9223372036854775809n,
         '\ud800'
@@ -212,6 +213,8 @@ test('parameter holes, undefined, objects and lossy numbers are rejected', () =>
     const bound = bindSqlParameters(parsed, [buffer]);
     buffer[0] = 100;
     assert.equal(bound[0][0], 4);
+    assert.deepEqual(bindSqlParameters(parsed, [1e20]), [1e20]);
+    assert.deepEqual(bindSqlParameters(parsed, [-1e308]), [-1e308]);
 });
 
 test('signed 64-bit integer literals retain precision across safe number boundaries', () => {
@@ -237,6 +240,7 @@ test('REAL syntax accepts bounded numbers and rejects overflow or hidden fractio
         '1e309',
         '-1e309',
         '1e-999',
+        '1e16',
         '9007199254740992.0',
         '9007199254740991.1',
         '1.00000000000000000001',
@@ -249,6 +253,10 @@ test('REAL syntax accepts bounded numbers and rejects overflow or hidden fractio
     ]) {
         rejects(`INSERT INTO docs VALUES (${value})`);
     }
+    assert.deepEqual(
+        parseSql('INSERT INTO docs VALUES (1e20, -1e20, 1.5e20, 1e308)').statement.rows[0].map((value) => value.value),
+        [1e20, -1e20, 1.5e20, 1e308]
+    );
 });
 
 test('LIMIT and OFFSET require non-negative safe integers', () => {
@@ -380,4 +388,99 @@ test('input length, token count, numeric length and WHERE depth are bounded', ()
         parseSql(`SELECT * FROM docs WHERE ${'('.repeat(64)}id = 1${')'.repeat(64)}`).statement.where.column,
         'id'
     );
+});
+
+test('REAL columns preserve magnitudes above the signed 64-bit range', async () => {
+    const urls = new Map();
+    const moduleUrl = (source) => `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`;
+    for (const name of ['errors', 'internal', 'codec', 'sql-types', 'indexing', 'sql-parser', 'sql']) {
+        let source = await compile(name);
+        source = source.replace(/from '\.\/([^']+)'/g, (_match, dependency) => {
+            const url = urls.get(dependency);
+            if (!url) {
+                throw new Error(`missing ${dependency} while loading ${name}`);
+            }
+            return `from '${url}'`;
+        });
+        urls.set(name, moduleUrl(source));
+    }
+    const { createSqlClient, SqlTypeError } = await import(urls.get('sql'));
+    const { StoreExistsError, StoreNotFoundError } = await import(urls.get('errors'));
+    const copy = (bytes) => Uint8Array.from(bytes);
+    const identity = (bytes) => Buffer.from(bytes).toString('hex');
+    const stores = new Map();
+    const database = {
+        async begin(mode) {
+            return {
+                mode,
+                async get(store, key) {
+                    const rows = stores.get(store);
+                    if (!rows) {
+                        throw new StoreNotFoundError(store);
+                    }
+                    const value = rows.get(identity(key));
+                    return value ? copy(value) : null;
+                },
+                async has(store, key) {
+                    return (await this.get(store, key)) !== null;
+                },
+                async createStore(name) {
+                    if (stores.has(name)) {
+                        throw new StoreExistsError(name);
+                    }
+                    stores.set(name, new Map());
+                },
+                async put(store, key, value) {
+                    const rows = stores.get(store);
+                    if (!rows) {
+                        throw new StoreNotFoundError(store);
+                    }
+                    rows.set(identity(key), copy(value));
+                },
+                async putMany(store, entries) {
+                    for (const [key, value] of entries) {
+                        await this.put(store, key, value);
+                    }
+                },
+                async scan(store) {
+                    const rows = stores.get(store);
+                    if (!rows) {
+                        throw new StoreNotFoundError(store);
+                    }
+                    return [...rows].map(([encoded, value]) => ({
+                        key: copy(Buffer.from(encoded, 'hex')),
+                        value: copy(value)
+                    }));
+                },
+                async commit() {},
+                async rollback() {}
+            };
+        }
+    };
+    const sql = createSqlClient(database);
+    await sql.execute('CREATE TABLE readings (id INTEGER PRIMARY KEY, value REAL NOT NULL)');
+    await sql.execute('INSERT INTO readings VALUES (1, 1e20), (2, -1e20), (3, 10000000000000000)');
+    await sql.execute('INSERT INTO readings VALUES (?, ?)', [4, 1e20]);
+    await sql.execute('INSERT INTO readings VALUES (?, ?)', [5, 10000000000000000n]);
+    await assert.rejects(
+        () => sql.execute('INSERT INTO readings VALUES (?, ?)', [6, 9007199254740993n]),
+        (error) => error instanceof SqlTypeError
+    );
+    await assert.rejects(
+        () => sql.execute('INSERT INTO readings VALUES (1e20, 1)'),
+        (error) => error instanceof SqlTypeError
+    );
+    assert.deepEqual(await sql.query('SELECT id, value FROM readings ORDER BY value, id'), [
+        { id: 2, value: -1e20 },
+        { id: 3, value: 1e16 },
+        { id: 5, value: 1e16 },
+        { id: 1, value: 1e20 },
+        { id: 4, value: 1e20 }
+    ]);
+    assert.deepEqual(await sql.query('SELECT id FROM readings WHERE value >= ? ORDER BY id', [10000000000000000n]), [
+        { id: 1 },
+        { id: 3 },
+        { id: 4 },
+        { id: 5 }
+    ]);
 });

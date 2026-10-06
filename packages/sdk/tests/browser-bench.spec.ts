@@ -16,10 +16,16 @@ const engineFromLifecycle =
           : (proc?.env?.MOYODB_BENCH_ENGINE ?? 'all');
 const profile = normalizeBenchProfile(proc?.env?.MOYODB_BENCH_PROFILE);
 const workloadNames = normalizeWorkloadNames(proc?.env?.MOYODB_BENCH_WORKLOADS);
-const sampleCountOverride = normalizeOptionalCount(proc?.env?.MOYODB_BENCH_SAMPLE_COUNT);
-const warmupCountOverride = normalizeOptionalCount(proc?.env?.MOYODB_BENCH_WARMUP_COUNT);
-const workloadTimeoutMs = normalizeOptionalCount(proc?.env?.MOYODB_BENCH_WORKLOAD_TIMEOUT_MS);
-const testTimeoutMs = normalizeOptionalCount(proc?.env?.MOYODB_BENCH_TEST_TIMEOUT_MS);
+const sampleCountOverride = normalizeOptionalCount(proc?.env?.MOYODB_BENCH_SAMPLE_COUNT, 'MOYODB_BENCH_SAMPLE_COUNT');
+const warmupCountOverride = normalizeOptionalCount(proc?.env?.MOYODB_BENCH_WARMUP_COUNT, 'MOYODB_BENCH_WARMUP_COUNT');
+const workloadTimeoutMs = normalizeOptionalCount(
+    proc?.env?.MOYODB_BENCH_WORKLOAD_TIMEOUT_MS,
+    'MOYODB_BENCH_WORKLOAD_TIMEOUT_MS'
+);
+const testTimeoutMs = normalizeOptionalCount(proc?.env?.MOYODB_BENCH_TEST_TIMEOUT_MS, 'MOYODB_BENCH_TEST_TIMEOUT_MS');
+if (sampleCountOverride === 0) {
+    throw new Error('MOYODB_BENCH_SAMPLE_COUNT must be a positive integer');
+}
 const effectiveWorkloadTimeoutMs = workloadTimeoutMs ?? (profile === 'smoke' ? 30_000 : undefined);
 const gitSha = proc?.env?.MOYODB_BENCH_GIT_SHA ?? proc?.env?.GITHUB_SHA ?? 'unknown';
 const indexedDbDurability = normalizeDurability(proc?.env?.MOYODB_BENCH_IDB_DURABILITY);
@@ -149,14 +155,23 @@ test.describe('browser benchmark smoke', () => {
 });
 
 function normalizeBenchProfile(value: string | undefined): BenchProfile {
+    if (value === undefined || value.trim() === '' || value === 'smoke') {
+        return 'smoke';
+    }
     if (value === 'standard' || value === 'full') {
         return value;
     }
-    return 'smoke';
+    throw new Error('MOYODB_BENCH_PROFILE must be smoke, standard, or full');
 }
 
 function normalizeDurability(value: string | undefined): IDBTransactionDurability {
-    return value === 'relaxed' || value === 'default' ? value : 'strict';
+    if (value === undefined || value.trim() === '' || value === 'strict') {
+        return 'strict';
+    }
+    if (value === 'relaxed' || value === 'default') {
+        return value;
+    }
+    throw new Error('MOYODB_BENCH_IDB_DURABILITY must be strict, relaxed, or default');
 }
 
 function normalizeWorkloadNames(value: string | undefined): string[] | undefined {
@@ -167,12 +182,15 @@ function normalizeWorkloadNames(value: string | undefined): string[] | undefined
     return names && names.length > 0 ? names : undefined;
 }
 
-function normalizeOptionalCount(value: string | undefined): number | undefined {
+function normalizeOptionalCount(value: string | undefined, name: string): number | undefined {
     if (value === undefined || value.trim() === '') {
         return undefined;
     }
     const parsed = Number(value);
-    return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
+    if (!Number.isSafeInteger(parsed) || parsed < 0) {
+        throw new Error(`${name} must be a non-negative integer`);
+    }
+    return parsed;
 }
 
 function safeFileSegment(value: string): string {
