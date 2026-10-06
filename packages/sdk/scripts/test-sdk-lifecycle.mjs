@@ -1,18 +1,15 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import ts from 'typescript';
+import { emitTranspiledModule, readFlagValue } from './fixture-emit.mjs';
 
 // Production SDK, registry, subscriptions, protocol and scheduler. Only the
 // browser surfaces and WorkerApi storage boundary are deterministic doubles.
 const here = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
-const sourceIndex = args.indexOf('--source-root');
-if (sourceIndex >= 0 && (!args[sourceIndex + 1] || args[sourceIndex + 1].startsWith('--'))) {
-    throw new Error('missing --source-root value');
-}
-const source = resolve(sourceIndex < 0 ? join(here, '../src') : args[sourceIndex + 1]);
+const source = resolve(readFlagValue(args, '--source-root') ?? join(here, '../src'));
 const temporaryRoot = resolve(here, '../../../.tmp');
 await mkdir(temporaryRoot, { recursive: true });
 const output = await mkdtemp(join(temporaryRoot, 'sdk-lifecycle-'));
@@ -308,16 +305,12 @@ try {
         'errors',
         'internal'
     ]) {
-        const result = ts.transpileModule(await readFile(join(source, `${name}.ts`), 'utf8'), {
-            fileName: `${name}.ts`,
-            reportDiagnostics: true,
-            compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
+        await emitTranspiledModule({
+            name,
+            input: join(source, `${name}.ts`),
+            outputDir: output,
+            reportErrors: 'assert'
         });
-        assert.equal(
-            (result.diagnostics ?? []).filter((item) => item.category === ts.DiagnosticCategory.Error).length,
-            0
-        );
-        await writeFile(join(output, `${name}.mjs`), result.outputText.replace(/from '(\.\/[^']+)'/g, "from '$1.mjs'"));
     }
     const sdk = await import(pathToFileURL(join(output, 'index.mjs')).href);
     const { exposeWorkerApi } = await import(pathToFileURL(join(output, 'worker-server.mjs')).href);

@@ -119,16 +119,22 @@ fn walk_chain<B: FileBackend>(
     Ok(())
 }
 
-pub fn read_overflow_value<B: FileBackend>(
-    pager: &mut Pager<B>,
-    head_page_id: u64,
-    total_len: usize,
-) -> Result<Vec<u8>> {
+#[inline]
+fn require_overflow_head(head_page_id: u64) -> Result<()> {
     if head_page_id == 0 {
         return Err(EngineError::Corruption(
             "overflow value is missing its head page".into(),
         ));
     }
+    Ok(())
+}
+
+pub fn read_overflow_value<B: FileBackend>(
+    pager: &mut Pager<B>,
+    head_page_id: u64,
+    total_len: usize,
+) -> Result<Vec<u8>> {
+    require_overflow_head(head_page_id)?;
     validate_declared_len(total_len)?;
     let mut out = Vec::with_capacity(total_len);
     walk_chain(pager, head_page_id, total_len, true, |_, chunk| {
@@ -146,11 +152,7 @@ pub(crate) fn read_overflow_stored_value<B: FileBackend>(
     total_len: usize,
     store_flags: u64,
 ) -> Result<StoredValue> {
-    if head_page_id == 0 {
-        return Err(EngineError::Corruption(
-            "overflow value is missing its head page".into(),
-        ));
-    }
+    require_overflow_head(head_page_id)?;
     validate_declared_len(total_len)?;
     let enveloped =
         store_uses_value_envelope(store_flags) && !store_uses_system_raw_values(store_flags);
@@ -196,11 +198,7 @@ fn read_overflow_stored_value_parts_into<B: FileBackend>(
     store_flags: u64,
     mut write: impl FnMut(&[u8]) -> Result<()>,
 ) -> Result<(Option<u64>, Option<ValueRevision>)> {
-    if head_page_id == 0 {
-        return Err(EngineError::Corruption(
-            "overflow value is missing its head page".into(),
-        ));
-    }
+    require_overflow_head(head_page_id)?;
     validate_declared_len(total_len)?;
     let enveloped =
         store_uses_value_envelope(store_flags) && !store_uses_system_raw_values(store_flags);
@@ -267,11 +265,7 @@ pub(crate) fn read_overflow_value_envelope<B: FileBackend>(
     total_len: usize,
     store_flags: u64,
 ) -> Result<(Option<u64>, Option<ValueRevision>)> {
-    if head_page_id == 0 {
-        return Err(EngineError::Corruption(
-            "overflow value is missing its head page".into(),
-        ));
-    }
+    require_overflow_head(head_page_id)?;
     let wanted = store_value_prefix_len(store_flags).min(total_len);
     let mut prefix = [0; VALUE_REVISION_ENVELOPE_HEADER_SIZE];
     let mut prefix_len = 0;
@@ -297,11 +291,7 @@ pub fn read_overflow_prefix<B: FileBackend>(
     total_len: usize,
     prefix_len: usize,
 ) -> Result<Vec<u8>> {
-    if head_page_id == 0 {
-        return Err(EngineError::Corruption(
-            "overflow value is missing its head page".into(),
-        ));
-    }
+    require_overflow_head(head_page_id)?;
     let wanted = prefix_len.min(total_len);
     let mut out = Vec::with_capacity(wanted);
     if wanted == 0 {

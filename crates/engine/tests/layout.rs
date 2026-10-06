@@ -11,6 +11,28 @@ use moyodb_engine::page::{
     LeafCell,
 };
 
+fn inline_a_page(page_id: u64) -> Vec<u8> {
+    encode_leaf_page(
+        page_id,
+        0,
+        0,
+        &[LeafCell {
+            key: b"a".to_vec(),
+            value: b"1".to_vec(),
+            value_kind: ValueKind::Inline,
+            total_value_len: 1,
+            overflow_head_page_id: 0,
+        }],
+    )
+    .unwrap()
+}
+
+fn rewrite_page_checksum(page: &mut [u8]) {
+    let checksum = checksum_with_zeroed_region(page, PAGE_HEADER_CHECKSUM_OFFSET, 4);
+    page[PAGE_HEADER_CHECKSUM_OFFSET..PAGE_HEADER_CHECKSUM_OFFSET + 4]
+        .copy_from_slice(&checksum.to_le_bytes());
+}
+
 #[test]
 fn leaf_page_roundtrip() {
     let page = encode_leaf_page(
@@ -89,25 +111,10 @@ fn superblock_encode_decode_and_selection() {
 
 #[test]
 fn decode_rejects_overlapping_page_bounds() {
-    let mut page = encode_leaf_page(
-        1,
-        0,
-        0,
-        &[LeafCell {
-            key: b"a".to_vec(),
-            value: b"1".to_vec(),
-            value_kind: ValueKind::Inline,
-            total_value_len: 1,
-            overflow_head_page_id: 0,
-        }],
-    )
-    .unwrap();
-
+    let mut page = inline_a_page(1);
     page[20..22].copy_from_slice(&(PAGE_SIZE as u16).to_le_bytes());
     page[22..24].copy_from_slice(&(0u16).to_le_bytes());
-    let checksum = checksum_with_zeroed_region(&page, PAGE_HEADER_CHECKSUM_OFFSET, 4);
-    page[PAGE_HEADER_CHECKSUM_OFFSET..PAGE_HEADER_CHECKSUM_OFFSET + 4]
-        .copy_from_slice(&checksum.to_le_bytes());
+    rewrite_page_checksum(&mut page);
 
     let err = decode_page(&page).unwrap_err();
     assert_eq!(err.code(), "CorruptionError");
@@ -115,28 +122,13 @@ fn decode_rejects_overlapping_page_bounds() {
 
 #[test]
 fn decode_rejects_invalid_inline_leaf_metadata() {
-    let mut page = encode_leaf_page(
-        2,
-        0,
-        0,
-        &[LeafCell {
-            key: b"a".to_vec(),
-            value: b"1".to_vec(),
-            value_kind: ValueKind::Inline,
-            total_value_len: 1,
-            overflow_head_page_id: 0,
-        }],
-    )
-    .unwrap();
-
+    let mut page = inline_a_page(2);
     let decoded = decode_page(&page).unwrap();
     let slot_offset = PAGE_HEADER_SIZE;
     let cell_offset = u16::from_le_bytes([page[slot_offset], page[slot_offset + 1]]) as usize;
     let total_len_offset = cell_offset + 4;
     page[total_len_offset..total_len_offset + 4].copy_from_slice(&(2u32).to_le_bytes());
-    let checksum = checksum_with_zeroed_region(&page, PAGE_HEADER_CHECKSUM_OFFSET, 4);
-    page[PAGE_HEADER_CHECKSUM_OFFSET..PAGE_HEADER_CHECKSUM_OFFSET + 4]
-        .copy_from_slice(&checksum.to_le_bytes());
+    rewrite_page_checksum(&mut page);
 
     let err = decode_page(&page).unwrap_err();
     assert_eq!(err.code(), "CorruptionError");

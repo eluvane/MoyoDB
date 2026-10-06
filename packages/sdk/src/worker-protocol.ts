@@ -1,4 +1,4 @@
-import type { AutocommitCommand, IndexScanPage, WorkerApi, WorkerScanPage } from './worker-api';
+import type { IndexScanPage, WorkerApi, WorkerScanPage } from './worker-api';
 import type { BatchOp } from './types';
 import { isRecord } from './internal';
 
@@ -81,7 +81,13 @@ export const AUTOCOMMIT_COMMANDS = [
     'createStore',
     'dropStore',
     'clearStore'
-] as const satisfies readonly AutocommitCommand[];
+] as const;
+
+/**
+ * Commands supported in one autocommit request. The worker replies after
+ * commit (readwrite) or rollback (readonly).
+ */
+export type AutocommitCommand = (typeof AUTOCOMMIT_COMMANDS)[number];
 
 const AUTOCOMMIT_COMMAND_SET = new Set<string>(AUTOCOMMIT_COMMANDS);
 
@@ -136,6 +142,11 @@ interface PackedBatchOpsV1 {
 
 export interface PackedOptionalValuesV1 {
     __moyodbPacked: typeof PACKED_OPTIONAL_VALUES_V1;
+    bytes: Uint8Array;
+}
+
+interface PackedBytes {
+    __moyodbPacked: string;
     bytes: Uint8Array;
 }
 
@@ -312,11 +323,7 @@ export function deserializeWorkerError(error: unknown): Error {
         deserialized.stack = error.stack;
     }
     if (error.code) {
-        Object.defineProperty(deserialized, 'code', {
-            value: error.code,
-            enumerable: true,
-            configurable: true
-        });
+        defineErrorCode(deserialized, error.code);
     }
     return deserialized;
 }
@@ -324,12 +331,16 @@ export function deserializeWorkerError(error: unknown): Error {
 export function workerProtocolError(name: string, message: string, code = name): Error {
     const error = new Error(message);
     error.name = name;
+    defineErrorCode(error, code);
+    return error;
+}
+
+function defineErrorCode(error: Error, code: string): void {
     Object.defineProperty(error, 'code', {
         value: code,
         enumerable: true,
         configurable: true
     });
-    return error;
 }
 
 export function prepareWorkerCommandPayload<M extends WorkerCommand>(
@@ -438,7 +449,7 @@ export function decodeWorkerCommandPayload<M extends WorkerCommand>(
     if (command === 'getMany' || command === 'deleteMany') {
         const [txId, store, keys] = args as WorkerCommandArgs<'getMany'> | WorkerCommandArgs<'deleteMany'>;
         if (!Array.isArray(keys)) {
-            if (!isPackedBinaryList(keys)) {
+            if (!isPackedPayload(keys, PACKED_BINARY_LIST_V1)) {
                 throw workerProtocolError('WorkerProtocolError', 'invalid packed binary-list argument');
             }
             return [txId, store, unpackBinaryList(keys)] as WorkerCommandArgs<M>;
@@ -448,20 +459,20 @@ export function decodeWorkerCommandPayload<M extends WorkerCommand>(
     if (command === 'putMany') {
         const [txId, store, entries, options] = args as WorkerCommandArgs<'putMany'>;
         if (!Array.isArray(entries)) {
-            if (!isPackedBinaryList(entries)) {
+            if (!isPackedPayload(entries, PACKED_BINARY_LIST_V1)) {
                 throw workerProtocolError('WorkerProtocolError', 'invalid packed putMany argument');
             }
-            return [txId, store, unpackBinaryPairs(entries), options] as WorkerCommandArgs<M>;
+            return [txId, store, unpackPutManyPayload(entries, false), options] as WorkerCommandArgs<M>;
         }
     }
 
     if (command === 'applyBatch') {
         const [txId, store, ops] = args as WorkerCommandArgs<'applyBatch'>;
         if (!Array.isArray(ops)) {
-            if (!isPackedBatchOps(ops)) {
+            if (!isPackedPayload(ops, PACKED_BATCH_OPS_V1)) {
                 throw workerProtocolError('WorkerProtocolError', 'invalid packed batch argument');
             }
-            return [txId, store, unpackBatchOps(ops)] as WorkerCommandArgs<M>;
+            return [txId, store, unpackBatchPayload(ops, false)] as WorkerCommandArgs<M>;
         }
     }
 
@@ -469,11 +480,11 @@ export function decodeWorkerCommandPayload<M extends WorkerCommand>(
 }
 
 export function packedBinaryListBytes(value: unknown): Uint8Array | null {
-    return isPackedBinaryList(value) ? value.bytes : null;
+    return isPackedPayload(value, PACKED_BINARY_LIST_V1) ? value.bytes : null;
 }
 
 export function packedBatchOpsBytes(value: unknown): Uint8Array | null {
-    return isPackedBatchOps(value) ? value.bytes : null;
+    return isPackedPayload(value, PACKED_BATCH_OPS_V1) ? value.bytes : null;
 }
 
 export function unpackPackedBinaryList(bytes: Uint8Array): Uint8Array[] {
@@ -481,19 +492,19 @@ export function unpackPackedBinaryList(bytes: Uint8Array): Uint8Array[] {
 }
 
 export function unpackPackedBinaryPairs(bytes: Uint8Array): Array<[Uint8Array, Uint8Array]> {
-    return unpackBinaryPairs({ __moyodbPacked: PACKED_BINARY_LIST_V1, bytes });
+    return unpackPutManyPayload({ __moyodbPacked: PACKED_BINARY_LIST_V1, bytes }, false);
 }
 
 export function unpackPackedBinaryPairKeys(bytes: Uint8Array): Uint8Array[] {
-    return unpackBinaryPairKeys({ __moyodbPacked: PACKED_BINARY_LIST_V1, bytes });
+    return unpackPutManyPayload({ __moyodbPacked: PACKED_BINARY_LIST_V1, bytes }, true);
 }
 
 export function unpackPackedBatchOps(bytes: Uint8Array): Array<BatchOp> {
-    return unpackBatchOps({ __moyodbPacked: PACKED_BATCH_OPS_V1, bytes });
+    return unpackBatchPayload({ __moyodbPacked: PACKED_BATCH_OPS_V1, bytes }, false);
 }
 
 export function unpackPackedBatchOpKeys(bytes: Uint8Array): PackedBatchOpKey[] {
-    return unpackBatchOpKeys({ __moyodbPacked: PACKED_BATCH_OPS_V1, bytes });
+    return unpackBatchPayload({ __moyodbPacked: PACKED_BATCH_OPS_V1, bytes }, true);
 }
 
 export function packedOptionalValues(bytes: Uint8Array): PackedOptionalValuesV1 {
@@ -538,13 +549,13 @@ export function prepareWorkerResponsePayload<M extends WorkerCommand>(
 ): { result: unknown; transfer: Transferable[] } {
     if (
         (command === 'scan' || command === 'scanByIndex') &&
-        (isPackedEngineScanRows(result) || isPackedScanRows(result))
+        (isPackedEngineScanRows(result) || isPackedPayload(result, PACKED_SCAN_ROWS_V1))
     ) {
         return { result, transfer: collectDirectBinaryTransferable(result.bytes) };
     }
     if (command === 'scanPage') {
         const page = result as WorkerScanPage;
-        if (isRecord(page) && (isPackedEngineScanRows(page.rows) || isPackedScanRows(page.rows))) {
+        if (isRecord(page) && (isPackedEngineScanRows(page.rows) || isPackedPayload(page.rows, PACKED_SCAN_ROWS_V1))) {
             return { result: page, transfer: collectDirectBinaryTransferable(page.rows.bytes) };
         }
         if (isRecord(page) && Array.isArray(page.rows)) {
@@ -555,7 +566,7 @@ export function prepareWorkerResponsePayload<M extends WorkerCommand>(
             };
         }
     }
-    if (command === 'getMany' && isPackedOptionalValues(result)) {
+    if (command === 'getMany' && isPackedPayload(result, PACKED_OPTIONAL_VALUES_V1)) {
         return {
             result,
             transfer: collectDirectBinaryTransferable(result.bytes)
@@ -564,7 +575,7 @@ export function prepareWorkerResponsePayload<M extends WorkerCommand>(
 
     if (command === 'scanByIndexPage') {
         const page = result as WorkerCommandResult<'scanByIndexPage'>;
-        if (isRecord(page) && isPackedScanRows(page.rows)) {
+        if (isRecord(page) && isPackedPayload(page.rows, PACKED_SCAN_ROWS_V1)) {
             return { result: page, transfer: collectTransferablesForValue(page) };
         }
         if (isRecord(page) && Array.isArray(page.rows)) {
@@ -655,7 +666,7 @@ export function decodeWorkerResponsePayload<M extends WorkerCommand>(
         }
         const rows = isPackedEngineScanRows(result.rows)
             ? unpackPackedScanRows(result.rows.bytes)
-            : isPackedScanRows(result.rows)
+            : isPackedPayload(result.rows, PACKED_SCAN_ROWS_V1)
               ? unpackScanRows(result.rows)
               : result.rows;
         if (!Array.isArray(rows)) throw workerProtocolError('WorkerProtocolError', 'invalid scan page rows');
@@ -672,11 +683,11 @@ export function decodeWorkerResponsePayload<M extends WorkerCommand>(
     if ((command === 'scan' || command === 'scanByIndex') && isPackedEngineScanRows(result)) {
         return unpackPackedScanRows(result.bytes) as WorkerCommandResult<M>;
     }
-    if (command === 'getMany' && isPackedNullableBinaryList(result)) {
+    if (command === 'getMany' && isPackedPayload(result, PACKED_NULLABLE_BINARY_LIST_V1)) {
         return unpackNullableBinaryList(result);
     }
 
-    if (command === 'getMany' && isPackedOptionalValues(result)) {
+    if (command === 'getMany' && isPackedPayload(result, PACKED_OPTIONAL_VALUES_V1)) {
         return unpackPackedOptionalValues(result.bytes) as WorkerCommandResult<M>;
     }
 
@@ -687,16 +698,16 @@ export function decodeWorkerResponsePayload<M extends WorkerCommand>(
     if (command === 'scanByIndexPage') {
         if (
             !isRecord(result) ||
-            (!Array.isArray(result.rows) && !isPackedScanRows(result.rows)) ||
+            (!Array.isArray(result.rows) && !isPackedPayload(result.rows, PACKED_SCAN_ROWS_V1)) ||
             (result.cursor !== null && !(result.cursor instanceof Uint8Array))
         ) {
             throw workerProtocolError('WorkerProtocolError', 'invalid packed index scan page response');
         }
-        const rows = isPackedScanRows(result.rows) ? unpackScanRows(result.rows) : result.rows;
+        const rows = isPackedPayload(result.rows, PACKED_SCAN_ROWS_V1) ? unpackScanRows(result.rows) : result.rows;
         return { rows, cursor: result.cursor } as WorkerCommandResult<M>;
     }
 
-    if ((command === 'scan' || command === 'scanByIndex') && isPackedScanRows(result)) {
+    if ((command === 'scan' || command === 'scanByIndex') && isPackedPayload(result, PACKED_SCAN_ROWS_V1)) {
         return unpackScanRows(result);
     }
 
@@ -980,7 +991,7 @@ function packBinaryList(items: Uint8Array[]): PackedBinaryListV1 {
     };
 }
 
-function unpackBinaryList(payload: PackedBinaryListV1): Uint8Array[] {
+function unpackBinaryList(payload: PackedBytes): Uint8Array[] {
     const bytes = payload.bytes;
     if (!(bytes instanceof Uint8Array) || bytes.byteLength < 4) {
         throw workerProtocolError('WorkerProtocolError', 'invalid packed binary-list payload');
@@ -1012,7 +1023,9 @@ function unpackBinaryList(payload: PackedBinaryListV1): Uint8Array[] {
     return items;
 }
 
-function unpackBinaryPairs(payload: PackedBinaryListV1): Array<[Uint8Array, Uint8Array]> {
+function unpackPutManyPayload(payload: PackedBytes, keysOnly: true): Uint8Array[];
+function unpackPutManyPayload(payload: PackedBytes, keysOnly: false): Array<[Uint8Array, Uint8Array]>;
+function unpackPutManyPayload(payload: PackedBytes, keysOnly: boolean): Uint8Array[] | Array<[Uint8Array, Uint8Array]> {
     const bytes = payload.bytes;
     if (!(bytes instanceof Uint8Array) || bytes.byteLength < 4) {
         throw workerProtocolError('WorkerProtocolError', 'invalid packed putMany payload');
@@ -1029,7 +1042,7 @@ function unpackBinaryPairs(payload: PackedBinaryListV1): Array<[Uint8Array, Uint
     }
 
     const entryCount = itemCount / 2;
-    const entries = new Array<[Uint8Array, Uint8Array]>(entryCount);
+    const entries = new Array<Uint8Array | [Uint8Array, Uint8Array]>(entryCount);
     let metadataOffset = 4;
     let readOffset = payloadOffset;
     for (let index = 0; index < entryCount; index += 1) {
@@ -1045,55 +1058,17 @@ function unpackBinaryPairs(payload: PackedBinaryListV1): Array<[Uint8Array, Uint
         if (valueEnd > U32_MAX || valueEnd > bytes.byteLength) {
             throw workerProtocolError('WorkerProtocolError', 'packed putMany value exceeds payload length');
         }
-        entries[index] = [bytes.subarray(readOffset, keyEnd), bytes.subarray(keyEnd, valueEnd)];
+        if (keysOnly) {
+            entries[index] = bytes.subarray(readOffset, keyEnd);
+        } else {
+            entries[index] = [bytes.subarray(readOffset, keyEnd), bytes.subarray(keyEnd, valueEnd)];
+        }
         readOffset = valueEnd;
     }
     if (readOffset !== bytes.byteLength) {
         throw workerProtocolError('WorkerProtocolError', 'packed putMany payload has trailing bytes');
     }
-    return entries;
-}
-
-function unpackBinaryPairKeys(payload: PackedBinaryListV1): Uint8Array[] {
-    const bytes = payload.bytes;
-    if (!(bytes instanceof Uint8Array) || bytes.byteLength < 4) {
-        throw workerProtocolError('WorkerProtocolError', 'invalid packed putMany payload');
-    }
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    const itemCount = view.getUint32(0, true);
-    if (itemCount % 2 !== 0) {
-        throw workerProtocolError('WorkerProtocolError', 'packed putMany payload has an odd item count');
-    }
-    const metadataBytes = checkedByteCount(itemCount, 4, 'packed putMany metadata');
-    const payloadOffset = checkedAdd(4, metadataBytes, 'packed putMany header');
-    if (payloadOffset > bytes.byteLength) {
-        throw workerProtocolError('WorkerProtocolError', 'packed putMany metadata exceeds payload length');
-    }
-
-    const entryCount = itemCount / 2;
-    const keys = new Array<Uint8Array>(entryCount);
-    let metadataOffset = 4;
-    let readOffset = payloadOffset;
-    for (let index = 0; index < entryCount; index += 1) {
-        const keyLength = view.getUint32(metadataOffset, true);
-        const valueLength = view.getUint32(metadataOffset + 4, true);
-        metadataOffset += 8;
-
-        const keyEnd = readOffset + keyLength;
-        if (keyEnd > U32_MAX || keyEnd > bytes.byteLength) {
-            throw workerProtocolError('WorkerProtocolError', 'packed putMany key exceeds payload length');
-        }
-        const valueEnd = keyEnd + valueLength;
-        if (valueEnd > U32_MAX || valueEnd > bytes.byteLength) {
-            throw workerProtocolError('WorkerProtocolError', 'packed putMany value exceeds payload length');
-        }
-        keys[index] = bytes.subarray(readOffset, keyEnd);
-        readOffset = valueEnd;
-    }
-    if (readOffset !== bytes.byteLength) {
-        throw workerProtocolError('WorkerProtocolError', 'packed putMany payload has trailing bytes');
-    }
-    return keys;
+    return entries as Uint8Array[] | Array<[Uint8Array, Uint8Array]>;
 }
 
 function packNullableBinaryList(items: Array<Uint8Array | null>): PackedNullableBinaryListV1 | null {
@@ -1151,7 +1126,7 @@ function packNullableBinaryList(items: Array<Uint8Array | null>): PackedNullable
     };
 }
 
-function unpackNullableBinaryList(payload: PackedNullableBinaryListV1): Array<Uint8Array | null> {
+function unpackNullableBinaryList(payload: PackedBytes): Array<Uint8Array | null> {
     const bytes = payload.bytes;
     if (!(bytes instanceof Uint8Array) || bytes.byteLength < 4) {
         throw workerProtocolError('WorkerProtocolError', 'invalid packed nullable binary-list payload');
@@ -1246,7 +1221,7 @@ function packScanRows(rows: Array<{ key: Uint8Array; value: Uint8Array }>): Pack
     };
 }
 
-function unpackScanRows(payload: PackedScanRowsV1): Array<{ key: Uint8Array; value: Uint8Array }> {
+function unpackScanRows(payload: PackedBytes): Array<{ key: Uint8Array; value: Uint8Array }> {
     const bytes = payload.bytes;
     if (!(bytes instanceof Uint8Array) || bytes.byteLength < 4) {
         throw workerProtocolError('WorkerProtocolError', 'invalid packed scan row payload');
@@ -1343,7 +1318,9 @@ function packBatchOps(ops: Array<BatchOp>): PackedBatchOpsV1 {
     };
 }
 
-function unpackBatchOps(payload: PackedBatchOpsV1): Array<BatchOp> {
+function unpackBatchPayload(payload: PackedBytes, keysOnly: true): PackedBatchOpKey[];
+function unpackBatchPayload(payload: PackedBytes, keysOnly: false): Array<BatchOp>;
+function unpackBatchPayload(payload: PackedBytes, keysOnly: boolean): PackedBatchOpKey[] | Array<BatchOp> {
     const bytes = payload.bytes;
     if (!(bytes instanceof Uint8Array) || bytes.byteLength < 4) {
         throw workerProtocolError('WorkerProtocolError', 'invalid packed batch payload');
@@ -1356,7 +1333,7 @@ function unpackBatchOps(payload: PackedBatchOpsV1): Array<BatchOp> {
         throw workerProtocolError('WorkerProtocolError', 'packed batch metadata exceeds payload length');
     }
 
-    const ops = new Array<BatchOp>(count);
+    const ops = new Array<BatchOp | PackedBatchOpKey>(count);
     let metadataOffset = 4;
     let readOffset = payloadOffset;
     for (let index = 0; index < count; index += 1) {
@@ -1387,88 +1364,21 @@ function unpackBatchOps(payload: PackedBatchOpsV1): Array<BatchOp> {
         if (valueEnd > U32_MAX || valueEnd > bytes.byteLength) {
             throw workerProtocolError('WorkerProtocolError', 'packed batch value exceeds payload length');
         }
-        ops[index] = { kind: 'put', key, value: bytes.subarray(readOffset, valueEnd) };
+        if (keysOnly) {
+            ops[index] = { kind: 'put', key };
+        } else {
+            ops[index] = { kind: 'put', key, value: bytes.subarray(readOffset, valueEnd) };
+        }
         readOffset = valueEnd;
     }
     if (readOffset !== bytes.byteLength) {
         throw workerProtocolError('WorkerProtocolError', 'packed batch payload has trailing bytes');
     }
-    return ops;
+    return ops as PackedBatchOpKey[] | Array<BatchOp>;
 }
 
-function unpackBatchOpKeys(payload: PackedBatchOpsV1): PackedBatchOpKey[] {
-    const bytes = payload.bytes;
-    if (!(bytes instanceof Uint8Array) || bytes.byteLength < 4) {
-        throw workerProtocolError('WorkerProtocolError', 'invalid packed batch payload');
-    }
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    const count = view.getUint32(0, true);
-    const metadataBytes = checkedByteCount(count, 9, 'packed batch metadata');
-    const payloadOffset = checkedAdd(4, metadataBytes, 'packed batch header');
-    if (payloadOffset > bytes.byteLength) {
-        throw workerProtocolError('WorkerProtocolError', 'packed batch metadata exceeds payload length');
-    }
-
-    const ops = new Array<PackedBatchOpKey>(count);
-    let metadataOffset = 4;
-    let readOffset = payloadOffset;
-    for (let index = 0; index < count; index += 1) {
-        const kind = view.getUint8(metadataOffset);
-        const keyLength = view.getUint32(metadataOffset + 1, true);
-        const valueLength = view.getUint32(metadataOffset + 5, true);
-        metadataOffset += 9;
-
-        const keyEnd = readOffset + keyLength;
-        if (keyEnd > U32_MAX || keyEnd > bytes.byteLength) {
-            throw workerProtocolError('WorkerProtocolError', 'packed batch key exceeds payload length');
-        }
-        const key = bytes.subarray(readOffset, keyEnd);
-        readOffset = keyEnd;
-
-        if (kind === BATCH_OP_DELETE) {
-            if (valueLength !== 0) {
-                throw workerProtocolError('WorkerProtocolError', 'packed delete operation has a value payload');
-            }
-            ops[index] = { kind: 'delete', key };
-            continue;
-        }
-
-        if (kind !== BATCH_OP_PUT) {
-            throw workerProtocolError('WorkerProtocolError', `packed batch operation has invalid kind byte: ${kind}`);
-        }
-        const valueEnd = readOffset + valueLength;
-        if (valueEnd > U32_MAX || valueEnd > bytes.byteLength) {
-            throw workerProtocolError('WorkerProtocolError', 'packed batch value exceeds payload length');
-        }
-        ops[index] = { kind: 'put', key };
-        readOffset = valueEnd;
-    }
-    if (readOffset !== bytes.byteLength) {
-        throw workerProtocolError('WorkerProtocolError', 'packed batch payload has trailing bytes');
-    }
-    return ops;
-}
-
-function isPackedBinaryList(value: unknown): value is PackedBinaryListV1 {
-    return isRecord(value) && value.__moyodbPacked === PACKED_BINARY_LIST_V1 && value.bytes instanceof Uint8Array;
-}
-
-function isPackedNullableBinaryList(value: unknown): value is PackedNullableBinaryListV1 {
-    return (
-        isRecord(value) && value.__moyodbPacked === PACKED_NULLABLE_BINARY_LIST_V1 && value.bytes instanceof Uint8Array
-    );
-}
-
-function isPackedScanRows(value: unknown): value is PackedScanRowsV1 {
-    return isRecord(value) && value.__moyodbPacked === PACKED_SCAN_ROWS_V1 && value.bytes instanceof Uint8Array;
-}
-
-function isPackedBatchOps(value: unknown): value is PackedBatchOpsV1 {
-    return isRecord(value) && value.__moyodbPacked === PACKED_BATCH_OPS_V1 && value.bytes instanceof Uint8Array;
-}
-
-function isPackedOptionalValues(value: unknown): value is PackedOptionalValuesV1 {
-    return isRecord(value) && value.__moyodbPacked === PACKED_OPTIONAL_VALUES_V1 && value.bytes instanceof Uint8Array;
+function isPackedPayload(value: unknown, tag: string): value is PackedBytes {
+    return isRecord(value) && value.__moyodbPacked === tag && value.bytes instanceof Uint8Array;
 }
 
 function checkedByteCount(count: number, itemBytes: number, what: string): number {

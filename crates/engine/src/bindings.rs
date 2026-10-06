@@ -1305,14 +1305,7 @@ mod wasm {
             let report =
                 self.inner_mut()?
                     .put_many_with_ttl_report(tx_id, &store, &entries, options.ttl);
-            match report.error {
-                Some(error) => Err(js_error_with_partial(error, &report.completed)),
-                None => Ok(report
-                    .completed
-                    .iter()
-                    .map(|flag| u8::from(*flag))
-                    .collect()),
-            }
+            finish_flag_report(report.error, &report.completed)
         }
 
         #[wasm_bindgen]
@@ -1393,14 +1386,7 @@ mod wasm {
         ) -> std::result::Result<Vec<u8>, JsValue> {
             let keys = parse_packed_binary_list(keys, "packed deleteMany")?;
             let report = self.inner_mut()?.delete_many_report(tx_id, &store, &keys);
-            match report.error {
-                Some(error) => Err(js_error_with_partial(error, &report.completed)),
-                None => Ok(report
-                    .completed
-                    .iter()
-                    .map(|flag| u8::from(*flag))
-                    .collect()),
-            }
+            finish_flag_report(report.error, &report.completed)
         }
 
         #[wasm_bindgen]
@@ -1698,22 +1684,80 @@ mod wasm {
         Ok(out)
     }
 
-    /// Returns slices that borrow the packed payload without copying its bytes.
-    fn parse_packed_binary_list<'a>(
-        bytes: &'a [u8],
-        what: &str,
-    ) -> std::result::Result<Vec<&'a [u8]>, JsValue> {
+    #[inline]
+    fn finish_flag_report(
+        error: Option<EngineError>,
+        completed: &Vec<bool>,
+    ) -> std::result::Result<Vec<u8>, JsValue> {
+        match error {
+            Some(error) => Err(js_error_with_partial(error, completed)),
+            None => Ok(completed.iter().map(|flag| u8::from(*flag)).collect()),
+        }
+    }
+
+    #[inline]
+    fn packed_item_count(bytes: &[u8], what: &str) -> std::result::Result<usize, JsValue> {
         if bytes.len() < 4 {
             return Err(js_error_from_display(format!("invalid {what} payload")));
         }
-        let count = read_u32_le(bytes, 0, what)?;
-        let metadata_bytes = checked_byte_count(count, 4, what)?;
+        read_u32_le(bytes, 0, what)
+    }
+
+    #[inline]
+    fn packed_payload_offset(
+        bytes: &[u8],
+        count: usize,
+        stride: usize,
+        what: &str,
+    ) -> std::result::Result<usize, JsValue> {
+        let metadata_bytes = checked_byte_count(count, stride, what)?;
         let payload_offset = checked_add_usize(4, metadata_bytes, what)?;
         if payload_offset > bytes.len() {
             return Err(js_error_from_display(format!(
                 "{what} metadata exceeds payload length"
             )));
         }
+        Ok(payload_offset)
+    }
+
+    #[inline]
+    fn take_packed_span<'a>(
+        bytes: &'a [u8],
+        start: usize,
+        len: usize,
+        what: &str,
+        field: &str,
+    ) -> std::result::Result<(&'a [u8], usize), JsValue> {
+        let end = checked_add_usize(start, len, what)?;
+        if end > bytes.len() {
+            return Err(js_error_from_display(format!(
+                "{what} {field} exceeds payload length"
+            )));
+        }
+        Ok((&bytes[start..end], end))
+    }
+
+    #[inline]
+    fn reject_trailing_packed_bytes(
+        read_offset: usize,
+        bytes_len: usize,
+        what: &str,
+    ) -> std::result::Result<(), JsValue> {
+        if read_offset != bytes_len {
+            return Err(js_error_from_display(format!(
+                "{what} payload has trailing bytes"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Returns slices that borrow the packed payload without copying its bytes.
+    fn parse_packed_binary_list<'a>(
+        bytes: &'a [u8],
+        what: &str,
+    ) -> std::result::Result<Vec<&'a [u8]>, JsValue> {
+        let count = packed_item_count(bytes, what)?;
+        let payload_offset = packed_payload_offset(bytes, count, 4, what)?;
 
         let mut items = Vec::with_capacity(count);
         let mut metadata_offset = 4;
@@ -1721,20 +1765,11 @@ mod wasm {
         for _ in 0..count {
             let byte_length = read_u32_le(bytes, metadata_offset, what)?;
             metadata_offset += 4;
-            let end = checked_add_usize(read_offset, byte_length, what)?;
-            if end > bytes.len() {
-                return Err(js_error_from_display(format!(
-                    "{what} item exceeds payload length"
-                )));
-            }
-            items.push(&bytes[read_offset..end]);
+            let (item, end) = take_packed_span(bytes, read_offset, byte_length, what, "item")?;
+            items.push(item);
             read_offset = end;
         }
-        if read_offset != bytes.len() {
-            return Err(js_error_from_display(format!(
-                "{what} payload has trailing bytes"
-            )));
-        }
+        reject_trailing_packed_bytes(read_offset, bytes.len(), what)?;
         Ok(items)
     }
 
@@ -1744,22 +1779,13 @@ mod wasm {
         bytes: &[u8],
     ) -> std::result::Result<Vec<PackedBinaryPair<'_>>, JsValue> {
         let what = "packed putMany";
-        if bytes.len() < 4 {
-            return Err(js_error_from_display("invalid packed putMany payload"));
-        }
-        let item_count = read_u32_le(bytes, 0, what)?;
+        let item_count = packed_item_count(bytes, what)?;
         if item_count % 2 != 0 {
             return Err(js_error_from_display(
                 "packed putMany payload has an odd item count",
             ));
         }
-        let metadata_bytes = checked_byte_count(item_count, 4, what)?;
-        let payload_offset = checked_add_usize(4, metadata_bytes, what)?;
-        if payload_offset > bytes.len() {
-            return Err(js_error_from_display(
-                "packed putMany metadata exceeds payload length",
-            ));
-        }
+        let payload_offset = packed_payload_offset(bytes, item_count, 4, what)?;
 
         let entry_count = item_count / 2;
         let mut entries = Vec::with_capacity(entry_count);
@@ -1769,42 +1795,19 @@ mod wasm {
             let key_length = read_u32_le(bytes, metadata_offset, what)?;
             let value_length = read_u32_le(bytes, metadata_offset + 4, what)?;
             metadata_offset += 8;
-            let key_end = checked_add_usize(read_offset, key_length, what)?;
-            if key_end > bytes.len() {
-                return Err(js_error_from_display(
-                    "packed putMany key exceeds payload length",
-                ));
-            }
-            let value_end = checked_add_usize(key_end, value_length, what)?;
-            if value_end > bytes.len() {
-                return Err(js_error_from_display(
-                    "packed putMany value exceeds payload length",
-                ));
-            }
-            entries.push((&bytes[read_offset..key_end], &bytes[key_end..value_end]));
+            let (key, key_end) = take_packed_span(bytes, read_offset, key_length, what, "key")?;
+            let (value, value_end) = take_packed_span(bytes, key_end, value_length, what, "value")?;
+            entries.push((key, value));
             read_offset = value_end;
         }
-        if read_offset != bytes.len() {
-            return Err(js_error_from_display(
-                "packed putMany payload has trailing bytes",
-            ));
-        }
+        reject_trailing_packed_bytes(read_offset, bytes.len(), what)?;
         Ok(entries)
     }
 
     fn parse_packed_batch_ops(bytes: &[u8]) -> std::result::Result<Vec<BatchOpRef<'_>>, JsValue> {
         let what = "packed batch";
-        if bytes.len() < 4 {
-            return Err(js_error_from_display("invalid packed batch payload"));
-        }
-        let count = read_u32_le(bytes, 0, what)?;
-        let metadata_bytes = checked_byte_count(count, 9, what)?;
-        let payload_offset = checked_add_usize(4, metadata_bytes, what)?;
-        if payload_offset > bytes.len() {
-            return Err(js_error_from_display(
-                "packed batch metadata exceeds payload length",
-            ));
-        }
+        let count = packed_item_count(bytes, what)?;
+        let payload_offset = packed_payload_offset(bytes, count, 9, what)?;
 
         let mut ops = Vec::with_capacity(count);
         let mut metadata_offset = 4;
@@ -1815,13 +1818,7 @@ mod wasm {
             let value_length = read_u32_le(bytes, metadata_offset + 5, what)?;
             metadata_offset += 9;
 
-            let key_end = checked_add_usize(read_offset, key_length, what)?;
-            if key_end > bytes.len() {
-                return Err(js_error_from_display(
-                    "packed batch key exceeds payload length",
-                ));
-            }
-            let key = &bytes[read_offset..key_end];
+            let (key, key_end) = take_packed_span(bytes, read_offset, key_length, what, "key")?;
             read_offset = key_end;
 
             if kind == PACKED_BATCH_OP_DELETE {
@@ -1839,23 +1836,12 @@ mod wasm {
                     "packed batch operation has invalid kind byte: {kind}"
                 )));
             }
-            let value_end = checked_add_usize(read_offset, value_length, what)?;
-            if value_end > bytes.len() {
-                return Err(js_error_from_display(
-                    "packed batch value exceeds payload length",
-                ));
-            }
-            ops.push(BatchOpRef::Put {
-                key,
-                value: &bytes[read_offset..value_end],
-            });
+            let (value, value_end) =
+                take_packed_span(bytes, read_offset, value_length, what, "value")?;
+            ops.push(BatchOpRef::Put { key, value });
             read_offset = value_end;
         }
-        if read_offset != bytes.len() {
-            return Err(js_error_from_display(
-                "packed batch payload has trailing bytes",
-            ));
-        }
+        reject_trailing_packed_bytes(read_offset, bytes.len(), what)?;
         Ok(ops)
     }
 

@@ -128,6 +128,18 @@ fn decoding_copies_each_owned_store_name_once() {
     assert_eq!(large_work - small_work, 32 * (240 - 32));
 }
 
+fn kv_snapshot(entries: Vec<SnapshotEntry>) -> SnapshotContents {
+    SnapshotContents {
+        source_last_committed_txid: 1,
+        schema_version: 0,
+        stores: vec![SnapshotStore {
+            name: "kv".into(),
+            flags: 0,
+            entries,
+        }],
+    }
+}
+
 fn reseal(bytes: &mut [u8]) {
     bytes[SNAPSHOT_CHECKSUM_OFFSET..SNAPSHOT_CHECKSUM_OFFSET + 4].fill(0);
     let checksum = crc32fast::hash(bytes);
@@ -137,22 +149,16 @@ fn reseal(bytes: &mut [u8]) {
 
 #[test]
 fn valid_checksum_duplicates_keep_value_validation_and_checksum_order() {
-    let contents = SnapshotContents {
-        source_last_committed_txid: 1,
-        schema_version: 0,
-        stores: vec![SnapshotStore {
-            name: "kv".into(),
-            flags: 0,
-            entries: (*b"ab")
-                .into_iter()
-                .map(|key| SnapshotEntry {
-                    key: vec![key],
-                    value: Vec::new(),
-                    expires_at_ms: None,
-                })
-                .collect(),
-        }],
-    };
+    let contents = kv_snapshot(
+        (*b"ab")
+            .into_iter()
+            .map(|key| SnapshotEntry {
+                key: vec![key],
+                value: Vec::new(),
+                expires_at_ms: None,
+            })
+            .collect(),
+    );
     let mut bytes = encode_snapshot(&contents).unwrap();
     let first_entry = SNAPSHOT_HEADER_SIZE
         + SNAPSHOT_BODY_PREFIX_SIZE
@@ -209,19 +215,11 @@ fn valid_checksum_duplicate_store_names_keep_the_original_error() {
 
 #[test]
 fn oversized_snapshot_value_is_rejected_before_copying_payload() {
-    let contents = SnapshotContents {
-        source_last_committed_txid: 1,
-        schema_version: 0,
-        stores: vec![SnapshotStore {
-            name: "kv".into(),
-            flags: 0,
-            entries: vec![SnapshotEntry {
-                key: Vec::new(),
-                value: Vec::new(),
-                expires_at_ms: None,
-            }],
-        }],
-    };
+    let contents = kv_snapshot(vec![SnapshotEntry {
+        key: Vec::new(),
+        value: Vec::new(),
+        expires_at_ms: None,
+    }]);
     let mut bytes = encode_snapshot(&contents).unwrap();
     let entry_start = SNAPSHOT_HEADER_SIZE
         + SNAPSHOT_BODY_PREFIX_SIZE

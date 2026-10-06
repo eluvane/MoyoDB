@@ -4,13 +4,16 @@ import type { WorkerApi } from '../src/worker-api';
 import type * as WorkerServerModule from '../src/worker-server';
 import { prepareMoyoDbPage, uniqueDbName } from './support';
 
+type ProtocolHarness = {
+    worker: Worker;
+    client: WorkerProtocolClient;
+    cleanup: () => void;
+};
+
 declare global {
     interface Window {
-        createWorkerProtocolHarness: () => Promise<{
-            worker: Worker;
-            client: WorkerProtocolClient;
-            cleanup: () => void;
-        }>;
+        createWorkerProtocolHarness: () => Promise<ProtocolHarness>;
+        withWorkerProtocol: <T>(run: (harness: ProtocolHarness) => Promise<T>) => Promise<T>;
     }
 }
 
@@ -109,11 +112,24 @@ window.createWorkerProtocolHarness = async function createWorkerProtocolHarness(
     }
   };
 };
+window.withWorkerProtocol = async function withWorkerProtocol(run) {
+  const harness = await window.createWorkerProtocolHarness();
+  try {
+    return await run(harness);
+  } finally {
+    harness.cleanup();
+  }
+};
 `;
 
 async function prepareProtocolPage(page: Page): Promise<void> {
     await page.goto('/');
     await page.addScriptTag({ content: protocolHarnessScript });
+}
+
+async function evaluateProtocol<T>(page: Page, run: () => Promise<T>): Promise<T> {
+    await prepareProtocolPage(page);
+    return page.evaluate(run);
 }
 
 test('worker server rejects foreign origins and accepts dedicated-worker messages', async ({ page }) => {
@@ -165,39 +181,29 @@ test('worker server rejects foreign origins and accepts dedicated-worker message
 });
 
 test('worker_protocol_request_response', async ({ page }) => {
-    await prepareProtocolPage(page);
-    const value = await page.evaluate(async () => {
-        const { client, cleanup } = await window.createWorkerProtocolHarness();
-        try {
-            return await client.begin('readwrite');
-        } finally {
-            cleanup();
-        }
-    });
+    const value = await evaluateProtocol(page, async () =>
+        window.withWorkerProtocol(async ({ client }) => client.begin('readwrite'))
+    );
     expect(value).toBe(7);
 });
 
 test('worker_protocol_error_response', async ({ page }) => {
-    await prepareProtocolPage(page);
-    const errorName = await page.evaluate(async () => {
-        const { client, cleanup } = await window.createWorkerProtocolHarness();
-        try {
-            await client.setFailpoint('after_wal_flush');
-            return 'NO_ERROR';
-        } catch (error) {
-            return (error as Error).name;
-        } finally {
-            cleanup();
-        }
-    });
+    const errorName = await evaluateProtocol(page, async () =>
+        window.withWorkerProtocol(async ({ client }) => {
+            try {
+                await client.setFailpoint('after_wal_flush');
+                return 'NO_ERROR';
+            } catch (error) {
+                return (error as Error).name;
+            }
+        })
+    );
     expect(errorName).toBe('InjectedFailureError');
 });
 
 test('worker_protocol_unknown_command', async ({ page }) => {
-    await prepareProtocolPage(page);
-    const result = await page.evaluate(async () => {
-        const { worker, client, cleanup } = await window.createWorkerProtocolHarness();
-        try {
+    const result = await evaluateProtocol(page, async () =>
+        window.withWorkerProtocol(async ({ worker, client }) => {
             await client.whenReady();
             return await new Promise<{ ok: boolean; name: string; message: string }>((resolve) => {
                 const id = 99;
@@ -230,77 +236,65 @@ test('worker_protocol_unknown_command', async ({ page }) => {
                     args: []
                 });
             });
-        } finally {
-            cleanup();
-        }
-    });
+        })
+    );
     expect(result.ok).toBe(false);
     expect(result.name).toBe('WorkerProtocolError');
     expect(result.message).toContain('unsupported worker command');
 });
 
 test('worker_client_rejects_after_close', async ({ page }) => {
-    await prepareProtocolPage(page);
-    const errorName = await page.evaluate(async () => {
-        const { client, cleanup } = await window.createWorkerProtocolHarness();
-        try {
-            await client.whenReady();
-            client.dispose();
-            await client.stats();
-            return 'NO_ERROR';
-        } catch (error) {
-            return (error as Error).name;
-        } finally {
-            cleanup();
-        }
-    });
+    const errorName = await evaluateProtocol(page, async () =>
+        window.withWorkerProtocol(async ({ client }) => {
+            try {
+                await client.whenReady();
+                client.dispose();
+                await client.stats();
+                return 'NO_ERROR';
+            } catch (error) {
+                return (error as Error).name;
+            }
+        })
+    );
     expect(errorName).toBe('WorkerTerminatedError');
 });
 
 test('worker_pending_requests_reject_on_terminate', async ({ page }) => {
-    await prepareProtocolPage(page);
-    const errorMessage = await page.evaluate(async () => {
-        const { client, worker, cleanup } = await window.createWorkerProtocolHarness();
-        const pending = client.storageInfo();
-        client.dispose(new Error('test termination'));
-        worker.terminate();
-        try {
-            await pending;
-            return 'NO_ERROR';
-        } catch (error) {
-            return (error as Error).message;
-        } finally {
-            cleanup();
-        }
-    });
+    const errorMessage = await evaluateProtocol(page, async () =>
+        window.withWorkerProtocol(async ({ client, worker }) => {
+            const pending = client.storageInfo();
+            client.dispose(new Error('test termination'));
+            worker.terminate();
+            try {
+                await pending;
+                return 'NO_ERROR';
+            } catch (error) {
+                return (error as Error).message;
+            }
+        })
+    );
     expect(errorMessage).toBe('test termination');
 });
 
 test('binary_payload_roundtrip', async ({ page }) => {
-    await prepareProtocolPage(page);
-    const result = await page.evaluate(async () => {
-        const { client, cleanup } = await window.createWorkerProtocolHarness();
-        const input = new Uint8Array([1, 2, 3, 4, 5]);
-        try {
+    const result = await evaluateProtocol(page, async () =>
+        window.withWorkerProtocol(async ({ client }) => {
+            const input = new Uint8Array([1, 2, 3, 4, 5]);
             await client.importSnapshot(input.subarray(1, 4));
             const output = await client.exportSnapshot();
             return {
                 inputByteLength: input.byteLength,
                 output: Array.from(output)
             };
-        } finally {
-            cleanup();
-        }
-    });
+        })
+    );
     expect(result.inputByteLength).toBe(5);
     expect(result.output).toEqual([2, 3, 4]);
 });
 
 test('packed_binary_response_roundtrip', async ({ page }) => {
-    await prepareProtocolPage(page);
-    const result = await page.evaluate(async () => {
-        const { client, cleanup } = await window.createWorkerProtocolHarness();
-        try {
+    const result = await evaluateProtocol(page, async () =>
+        window.withWorkerProtocol(async ({ client }) => {
             const many = await client.getMany(1, 'kv', [new Uint8Array([1]), new Uint8Array([2])]);
             const scan = await client.scan(1, 'kv', {});
             const indexScan = await client.scanByIndex(1, 'kv', 'by_test', {});
@@ -309,43 +303,35 @@ test('packed_binary_response_roundtrip', async ({ page }) => {
                 scan: scan.map((row) => ({ key: Array.from(row.key), value: Array.from(row.value) })),
                 indexScan: indexScan.map((row) => ({ key: Array.from(row.key), value: Array.from(row.value) }))
             };
-        } finally {
-            cleanup();
-        }
-    });
+        })
+    );
     expect(result.many).toEqual([[9, 8, 7], null]);
     expect(result.scan).toEqual([{ key: [1], value: [9, 8, 7] }]);
     expect(result.indexScan).toEqual([{ key: [2], value: [9, 8, 7] }]);
 });
 
 test('transferable_payload_roundtrip_if_supported', async ({ page }) => {
-    await prepareProtocolPage(page);
-    const result = await page.evaluate(async () => {
-        const { client, cleanup } = await window.createWorkerProtocolHarness();
-        try {
+    const result = await evaluateProtocol(page, async () =>
+        window.withWorkerProtocol(async ({ client }) => {
             const bytes = await client.exportSnapshot();
             const stats = await client.stats();
             return {
                 receivedLength: bytes.byteLength,
                 workerBufferLengthAfterPost: stats.manifest_len
             };
-        } finally {
-            cleanup();
-        }
-    });
+        })
+    );
     expect(result.receivedLength).toBe(64 * 1024);
     expect(result.workerBufferLengthAfterPost).toBe(0);
 });
 
 test('packed_bulk_binary_arguments_preserve_caller_buffers', async ({ page }) => {
-    await prepareProtocolPage(page);
-    const result = await page.evaluate(async () => {
-        const { client, cleanup } = await window.createWorkerProtocolHarness();
-        const keyA = new Uint8Array([9, 1, 2, 8]);
-        const valueA = new Uint8Array([3, 4, 5]);
-        const keyB = new Uint8Array([6, 7]);
-        const valueB = new Uint8Array([11, 12, 13, 14]);
-        try {
+    const result = await evaluateProtocol(page, async () =>
+        window.withWorkerProtocol(async ({ client }) => {
+            const keyA = new Uint8Array([9, 1, 2, 8]);
+            const valueA = new Uint8Array([3, 4, 5]);
+            const keyB = new Uint8Array([6, 7]);
+            const valueB = new Uint8Array([11, 12, 13, 14]);
             await client.putMany(1, 'kv', [
                 [keyA.subarray(1, 3), valueA],
                 [keyB, valueB.subarray(1, 4)]
@@ -364,10 +350,8 @@ test('packed_bulk_binary_arguments_preserve_caller_buffers', async ({ page }) =>
                 deleteMany: { count: afterDeleteMany.main_len, checksum: afterDeleteMany.wal_len },
                 batch: { count: afterBatch.main_len, checksum: afterBatch.wal_len }
             };
-        } finally {
-            cleanup();
-        }
-    });
+        })
+    );
     expect(result.callerBuffers).toEqual([4, 3, 2, 4]);
     expect(result.putMany).toEqual({ count: 2, checksum: 13 });
     expect(result.deleteMany).toEqual({ count: 2, checksum: 7 });

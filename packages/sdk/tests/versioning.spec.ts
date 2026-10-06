@@ -1,8 +1,29 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 import { prepareMoyoDbPage, uniqueDbName } from './support';
+
+type MoyoDb = Awaited<ReturnType<Window['moyodb']['openDB']>>;
+
+declare global {
+    interface Window {
+        __moyoRequiredValue: (db: MoyoDb, store: string, key: Uint8Array) => Promise<Uint8Array>;
+    }
+}
+
+async function installRequiredValue(page: Page): Promise<void> {
+    await page.evaluate(() => {
+        window.__moyoRequiredValue = async (db, store, key) => {
+            const value = await db.get(store, key);
+            if (value === null) {
+                throw new Error(`missing value in ${store}`);
+            }
+            return value;
+        };
+    });
+}
 test('openDB runs migrate on first versioned open and skips same-version reopens', async ({ page }) => {
     const dbName = uniqueDbName('version-init');
     await prepareMoyoDbPage(page);
+    await installRequiredValue(page);
     const result = await page.evaluate(async (name) => {
         const calls: Array<{
             oldVersion: number;
@@ -10,17 +31,7 @@ test('openDB runs migrate on first versioned open and skips same-version reopens
         }> = [];
         const encode = window.moyodb.utf8Encode;
         const decode = window.moyodb.utf8Decode;
-        const requiredValue = async (
-            db: Awaited<ReturnType<typeof window.moyodb.openDB>>,
-            store: string,
-            key: Uint8Array
-        ) => {
-            const value = await db.get(store, key);
-            if (value === null) {
-                throw new Error(`missing value in ${store}`);
-            }
-            return value;
-        };
+        const requiredValue = window.__moyoRequiredValue;
         const first = await window.moyodb.openDB(name, {
             version: 1,
             migrate: async ({ db, oldVersion, newVersion }) => {
@@ -78,20 +89,11 @@ test('openDB runs migrate on first versioned open and skips same-version reopens
 test('openDB upgrades atomically and rejects downgrades', async ({ page }) => {
     const dbName = uniqueDbName('version-upgrade');
     await prepareMoyoDbPage(page);
+    await installRequiredValue(page);
     const result = await page.evaluate(async (name) => {
         const encode = window.moyodb.utf8Encode;
         const decode = window.moyodb.utf8Decode;
-        const requiredValue = async (
-            db: Awaited<ReturnType<typeof window.moyodb.openDB>>,
-            store: string,
-            key: Uint8Array
-        ) => {
-            const value = await db.get(store, key);
-            if (value === null) {
-                throw new Error(`missing value in ${store}`);
-            }
-            return value;
-        };
+        const requiredValue = window.__moyoRequiredValue;
         const v1 = await window.moyodb.openDB(name, {
             version: 1,
             migrate: async ({ db }) => {
@@ -155,20 +157,11 @@ test('openDB upgrades atomically and rejects downgrades', async ({ page }) => {
 test('failed migrations rollback schema and version changes', async ({ page }) => {
     const dbName = uniqueDbName('version-rollback');
     await prepareMoyoDbPage(page);
+    await installRequiredValue(page);
     const result = await page.evaluate(async (name) => {
         const encode = window.moyodb.utf8Encode;
         const decode = window.moyodb.utf8Decode;
-        const requiredValue = async (
-            db: Awaited<ReturnType<typeof window.moyodb.openDB>>,
-            store: string,
-            key: Uint8Array
-        ) => {
-            const value = await db.get(store, key);
-            if (value === null) {
-                throw new Error(`missing value in ${store}`);
-            }
-            return value;
-        };
+        const requiredValue = window.__moyoRequiredValue;
         const base = await window.moyodb.openDB(name, {
             version: 1,
             migrate: async ({ db }) => {

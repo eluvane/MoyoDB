@@ -15,6 +15,9 @@ import type {
     StorageInfo,
     TxMode
 } from './types';
+import type { AutocommitCommand } from './worker-protocol';
+
+export type { AutocommitCommand };
 export interface WorkerRuntimeOpenOptions {
     createIfMissing: boolean;
     ownerWaitMs: number;
@@ -46,25 +49,6 @@ export interface WorkerScanPage {
     done: boolean;
     bytes: number;
 }
-/**
- * Commands supported in one autocommit request. The worker replies after
- * commit (readwrite) or rollback (readonly).
- */
-export type AutocommitCommand =
-    | 'get'
-    | 'getMany'
-    | 'has'
-    | 'put'
-    | 'putMany'
-    | 'delete'
-    | 'deleteMany'
-    | 'applyBatch'
-    | 'scan'
-    | 'getByIndex'
-    | 'scanByIndex'
-    | 'createStore'
-    | 'dropStore'
-    | 'clearStore';
 export interface WorkerApi {
     open: (request: WorkerOpenRequest) => Promise<void>;
     close: () => Promise<void>;

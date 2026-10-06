@@ -8,6 +8,14 @@ fn store_name(index: usize) -> String {
     format!("store-{index:08}")
 }
 
+fn store_meta(created_txid: u64) -> StoreMetadata {
+    StoreMetadata {
+        store_root_page_id: 0,
+        created_txid,
+        flags: 0,
+    }
+}
+
 fn seeded_engine(stores: usize, feed: bool) -> Result<(MemoryBundle, Engine<MemoryBackend>)> {
     let bundle = MemoryBundle::new();
     let mut engine = Engine::open(
@@ -166,11 +174,7 @@ fn empty_and_scalar_only_commits_do_not_detach_a_shared_store_map() -> Result<()
 
 #[test]
 fn catalog_delta_cancels_net_noops_and_hides_tombstoned_base_entries() {
-    let meta = StoreMetadata {
-        store_root_page_id: 0,
-        created_txid: 1,
-        flags: 0,
-    };
+    let meta = store_meta(1);
     let base = CatalogMap::from([("existing".to_string(), meta.clone())]);
     let mut delta = CatalogDelta::default();
     delta.set(&base, "existing", Some(meta.clone()));
@@ -207,14 +211,7 @@ fn install_tree(pager: &mut Pager<MemoryBackend>, built: BuiltTree) -> Result<u6
 fn incremental_catalog_matches_full_builder_bytes_through_mixed_changes() -> Result<()> {
     let mut expected = CatalogState::default();
     for index in 0..512 {
-        expected.stores.insert(
-            store_name(index),
-            StoreMetadata {
-                store_root_page_id: 0,
-                created_txid: 1,
-                flags: 0,
-            },
-        );
+        expected.stores.insert(store_name(index), store_meta(1));
     }
     let mut pager = Pager::new(MemoryBackend::new(), 8);
     let mut alloc = PageAllocator::new(1);
@@ -232,11 +229,7 @@ fn incremental_catalog_matches_full_builder_bytes_through_mixed_changes() -> Res
                 delta.remove(&previous.stores, &name);
                 expected.stores.remove(&name);
             } else {
-                let meta = StoreMetadata {
-                    store_root_page_id: 0,
-                    created_txid: round + 2,
-                    flags: 0,
-                };
+                let meta = store_meta(round + 2);
                 delta.set(&previous.stores, &name, Some(meta.clone()));
                 expected.stores.insert(name, meta);
             }
@@ -290,14 +283,7 @@ fn small_catalog_update_emits_and_retires_paths_not_the_catalog() -> Result<()> 
     for count in [1, 128, 1024, 8192] {
         let mut state = CatalogState::default();
         for index in 0..count {
-            state.stores.insert(
-                store_name(index),
-                StoreMetadata {
-                    store_root_page_id: 0,
-                    created_txid: 1,
-                    flags: 0,
-                },
-            );
+            state.stores.insert(store_name(index), store_meta(1));
         }
         let mut pager = Pager::new(MemoryBackend::new(), 8);
         let mut initial_alloc = PageAllocator::new(1);
@@ -305,15 +291,7 @@ fn small_catalog_update_emits_and_retires_paths_not_the_catalog() -> Result<()> 
         let full_pages = built.page_images.len();
         let root = install_tree(&mut pager, built)?;
         let mut delta = CatalogDelta::default();
-        delta.set(
-            &state.stores,
-            &store_name(0),
-            Some(StoreMetadata {
-                store_root_page_id: 0,
-                created_txid: 2,
-                flags: 0,
-            }),
-        );
+        delta.set(&state.stores, &store_name(0), Some(store_meta(2)));
         let mut alloc = PageAllocator::new(initial_alloc.next_page_id());
         let update = delta.build_tree(
             &mut pager,

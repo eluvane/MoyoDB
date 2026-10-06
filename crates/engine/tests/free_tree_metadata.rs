@@ -7,6 +7,17 @@ use moyodb_engine::pager::Pager;
 use moyodb_engine::storage::memory::MemoryBackend;
 use moyodb_engine::{EngineError, Result};
 
+fn child(separator: &[u8], child_page_id: u64) -> InternalCell {
+    InternalCell {
+        separator: separator.to_vec(),
+        child_page_id,
+    }
+}
+
+fn internal_root(cells: &[InternalCell]) -> Result<Vec<u8>> {
+    encode_internal_page(1, 1, 0, cells)
+}
+
 fn inline_cell(key: &[u8]) -> LeafCell {
     LeafCell {
         key: key.to_vec(),
@@ -111,25 +122,7 @@ fn free_tree_checks_the_last_cell_before_retiring_the_node() -> Result<()> {
             "leaf page 1 keys are not strictly increasing",
         ),
         (
-            encode_internal_page(
-                1,
-                1,
-                0,
-                &[
-                    InternalCell {
-                        separator: b"a".to_vec(),
-                        child_page_id: 2,
-                    },
-                    InternalCell {
-                        separator: b"c".to_vec(),
-                        child_page_id: 3,
-                    },
-                    InternalCell {
-                        separator: b"b".to_vec(),
-                        child_page_id: 4,
-                    },
-                ],
-            )?,
+            internal_root(&[child(b"a", 2), child(b"c", 3), child(b"b", 4)])?,
             "internal page 1 separators are not strictly increasing",
         ),
     ];
@@ -141,48 +134,18 @@ fn free_tree_checks_the_last_cell_before_retiring_the_node() -> Result<()> {
 
 #[test]
 fn free_tree_rejects_invalid_and_repeated_child_links() -> Result<()> {
-    let invalid_child = encode_internal_page(
-        1,
-        1,
-        0,
-        &[InternalCell {
-            separator: b"a".to_vec(),
-            child_page_id: 0,
-        }],
-    )?;
+    let invalid_child = internal_root(&[child(b"a", 0)])?;
     assert!(
         rejected_retirement(&[(1, invalid_child)], "internal cell has child_page_id=0")?.is_empty()
     );
 
-    let self_cycle = encode_internal_page(
-        1,
-        1,
-        0,
-        &[InternalCell {
-            separator: b"a".to_vec(),
-            child_page_id: 1,
-        }],
-    )?;
+    let self_cycle = internal_root(&[child(b"a", 1)])?;
     assert_eq!(
         rejected_retirement(&[(1, self_cycle)], "page 1 is reachable twice in one tree")?,
         vec![1]
     );
 
-    let repeated_child = encode_internal_page(
-        1,
-        1,
-        0,
-        &[
-            InternalCell {
-                separator: b"a".to_vec(),
-                child_page_id: 2,
-            },
-            InternalCell {
-                separator: b"b".to_vec(),
-                child_page_id: 2,
-            },
-        ],
-    )?;
+    let repeated_child = internal_root(&[child(b"a", 2), child(b"b", 2)])?;
     let leaf = encode_leaf_page(2, 0, 0, &[inline_cell(b"a")])?;
     assert!(
         rejected_retirement(

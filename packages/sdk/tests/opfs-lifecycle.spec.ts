@@ -1,5 +1,11 @@
-import { test, expect } from '@playwright/test';
-import { persistentContextTest, prepareMoyoDbPage, requireMoyoDbCapabilities, uniqueDbName } from './support';
+import { test, expect, type Page } from '@playwright/test';
+import {
+    openPairedPages,
+    persistentContextTest,
+    prepareMoyoDbPage,
+    requireMoyoDbCapabilities,
+    uniqueDbName
+} from './support';
 
 declare global {
     interface Window {
@@ -9,57 +15,55 @@ declare global {
     }
 }
 
+async function putClosedKv(page: Page, dbName: string, key: string, value: string): Promise<void> {
+    await page.evaluate(
+        async ({ name, key, value }) => {
+            const db = await window.moyodb.openDB(name, { requestPersistence: false });
+            try {
+                await db.createStore('kv');
+                await db.put('kv', window.moyodb.utf8Encode(key), window.moyodb.utf8Encode(value));
+            } finally {
+                await db.close();
+            }
+        },
+        { name: dbName, key, value }
+    );
+}
+
+async function readClosedKv(page: Page, dbName: string, key: string): Promise<string | null> {
+    return page.evaluate(
+        async ({ name, key }) => {
+            const db = await window.moyodb.openDB(name, { requestPersistence: false });
+            try {
+                const bytes = await db.get('kv', window.moyodb.utf8Encode(key));
+                return bytes ? window.moyodb.utf8Decode(bytes) : null;
+            } finally {
+                await db.close();
+            }
+        },
+        { name: dbName, key }
+    );
+}
+
 test('opfs_reopen_after_reload', async ({ page }) => {
     const dbName = uniqueDbName('opfs-reload');
     await prepareMoyoDbPage(page);
-    await page.evaluate(async (name) => {
-        const db = await window.moyodb.openDB(name, { requestPersistence: false });
-        try {
-            await db.createStore('kv');
-            await db.put('kv', window.moyodb.utf8Encode('reload-key'), window.moyodb.utf8Encode('reload-value'));
-        } finally {
-            await db.close();
-        }
-    }, dbName);
+    await putClosedKv(page, dbName, 'reload-key', 'reload-value');
     await page.reload();
     await requireMoyoDbCapabilities(page);
-    const value = await page.evaluate(async (name) => {
-        const db = await window.moyodb.openDB(name, { requestPersistence: false });
-        try {
-            const bytes = await db.get('kv', window.moyodb.utf8Encode('reload-key'));
-            return bytes ? window.moyodb.utf8Decode(bytes) : null;
-        } finally {
-            await db.close();
-        }
-    }, dbName);
+    const value = await readClosedKv(page, dbName, 'reload-key');
     expect(value).toBe('reload-value');
 });
 
 test('opfs_reopen_after_new_page_same_context', async ({ context, page }) => {
     const dbName = uniqueDbName('opfs-new-page');
     await prepareMoyoDbPage(page);
-    await page.evaluate(async (name) => {
-        const db = await window.moyodb.openDB(name, { requestPersistence: false });
-        try {
-            await db.createStore('kv');
-            await db.put('kv', window.moyodb.utf8Encode('page-key'), window.moyodb.utf8Encode('page-value'));
-        } finally {
-            await db.close();
-        }
-    }, dbName);
+    await putClosedKv(page, dbName, 'page-key', 'page-value');
 
     const page2 = await context.newPage();
     await page2.goto('/');
     await requireMoyoDbCapabilities(page2);
-    const value = await page2.evaluate(async (name) => {
-        const db = await window.moyodb.openDB(name, { requestPersistence: false });
-        try {
-            const bytes = await db.get('kv', window.moyodb.utf8Encode('page-key'));
-            return bytes ? window.moyodb.utf8Decode(bytes) : null;
-        } finally {
-            await db.close();
-        }
-    }, dbName);
+    const value = await readClosedKv(page2, dbName, 'page-key');
     await page2.close();
     expect(value).toBe('page-value');
 });
@@ -69,29 +73,13 @@ persistentContextTest('opfs_reopen_after_new_context', async ({ persistentContex
     const context1 = await persistentContextFactory.launch();
     const page1 = context1.pages()[0] ?? (await context1.newPage());
     await prepareMoyoDbPage(page1);
-    await page1.evaluate(async (name) => {
-        const db = await window.moyodb.openDB(name, { requestPersistence: false });
-        try {
-            await db.createStore('kv');
-            await db.put('kv', window.moyodb.utf8Encode('context-key'), window.moyodb.utf8Encode('context-value'));
-        } finally {
-            await db.close();
-        }
-    }, dbName);
+    await putClosedKv(page1, dbName, 'context-key', 'context-value');
     await context1.close();
 
     const context2 = await persistentContextFactory.launch();
     const page2 = context2.pages()[0] ?? (await context2.newPage());
     await prepareMoyoDbPage(page2);
-    const value = await page2.evaluate(async (name) => {
-        const db = await window.moyodb.openDB(name, { requestPersistence: false });
-        try {
-            const bytes = await db.get('kv', window.moyodb.utf8Encode('context-key'));
-            return bytes ? window.moyodb.utf8Decode(bytes) : null;
-        } finally {
-            await db.close();
-        }
-    }, dbName);
+    const value = await readClosedKv(page2, dbName, 'context-key');
     await context2.close();
     expect(value).toBe('context-value');
 });
@@ -178,12 +166,7 @@ test('deleteDB_removes_opfs_files', async ({ page }) => {
 
 test('second_tab_owner_rejected', async ({ browser }) => {
     const dbName = uniqueDbName('opfs-second-tab');
-    const context = await browser.newContext();
-    const page1 = await context.newPage();
-    const page2 = await context.newPage();
-    await page1.goto('/');
-    await page2.goto('/');
-    await requireMoyoDbCapabilities(page1);
+    const { context, first: page1, second: page2 } = await openPairedPages(browser);
     await page1.evaluate(async (name) => {
         window.__heldDb = await window.moyodb.openDB(name, { requestPersistence: false });
     }, dbName);

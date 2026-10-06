@@ -19,7 +19,7 @@ Rust/WASM transactional database for browsers, Node.js, and native Rust applicat
 
 It provides ordered keys, typed records, SQL queries, indexes, snapshots, TTL, and recovery checks. Browser storage uses OPFS; Node.js and native Rust storage use local files. The SDK runs storage operations in a worker.
 
-Version 1.3.0 creates fresh databases with storage format 2. Format 1 databases are rejected before their files are changed; no in-place migration is provided. Self-contained snapshot versions 1–3 can be imported into a fresh format 2 database. The Release 1.0.1 public API, key and index encodings remain covered by historical fixtures. Unknown storage formats fail before modifying durable data.
+Version 1.4.0 creates fresh databases with storage format 2. Format 1 databases are rejected before their files are changed; no in-place migration is provided. Self-contained snapshot versions 1–3 can be imported into a fresh format 2 database. The Release 1.0.1 public API, key and index encodings remain covered by historical fixtures. Unknown storage formats fail before modifying durable data.
 
 Large values use immutable contiguous `PAY2` extents in the main file. Leaf cells with value kind `External` (3) store a descriptor and an optional prefix. Payload bodies are flushed before their references enter the WAL. B-tree page and WAL record layouts retain `PAG1` and `WAL1`; the manifest's format version distinguishes the new storage contract.
 
@@ -30,7 +30,7 @@ New SDK stores use Snappy compression by default for values of at least 1,024 by
 ## Quick start
 
 ```bash
-npm install @moyodb/sdk@1.3.0
+npm install @moyodb/sdk@1.4.0
 ```
 
 ```ts

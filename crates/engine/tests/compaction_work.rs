@@ -154,6 +154,31 @@ fn seed(engine: &mut Engine<TrackedBackend>, rows: u32, value_len: usize) {
     engine.checkpoint().unwrap();
 }
 
+fn seed_internal_catalog(source: &mut Engine<TrackedBackend>) {
+    let tx = source.begin_tx(TxMode::Readwrite).unwrap();
+    source.set_schema_version(tx, 7).unwrap();
+    for store in [
+        "kv",
+        "empty",
+        "__browserdb:indexes",
+        "__browserdb:index:known",
+        "__browserdb:other",
+    ] {
+        source.create_store(tx, store).unwrap();
+    }
+    source.put(tx, "kv", b"key", b"value").unwrap();
+    for store in [
+        "__browserdb:indexes",
+        "__browserdb:index:known",
+        "__browserdb:other",
+    ] {
+        source
+            .put(tx, store, b"internal", store.as_bytes())
+            .unwrap();
+    }
+    source.commit_tx(tx).unwrap();
+}
+
 #[test]
 fn compaction_batches_consecutive_pages_and_reopens_without_changing_source() {
     let (source_bundle, mut source) = Bundle::open("compact-work-source");
@@ -206,28 +231,7 @@ fn compaction_batches_consecutive_pages_and_reopens_without_changing_source() {
 #[test]
 fn default_compaction_preserves_internal_stores_and_empty_store_metadata() {
     let (_source_bundle, mut source) = Bundle::open("compact-internal-source");
-    let tx = source.begin_tx(TxMode::Readwrite).unwrap();
-    source.set_schema_version(tx, 7).unwrap();
-    for store in [
-        "kv",
-        "empty",
-        "__browserdb:indexes",
-        "__browserdb:index:known",
-        "__browserdb:other",
-    ] {
-        source.create_store(tx, store).unwrap();
-    }
-    source.put(tx, "kv", b"key", b"value").unwrap();
-    for store in [
-        "__browserdb:indexes",
-        "__browserdb:index:known",
-        "__browserdb:other",
-    ] {
-        source
-            .put(tx, store, b"internal", store.as_bytes())
-            .unwrap();
-    }
-    source.commit_tx(tx).unwrap();
+    seed_internal_catalog(&mut source);
     let (target_bundle, mut target) = Bundle::open("compact-internal-target");
     source.compact_into(&mut target).unwrap();
 
@@ -251,28 +255,7 @@ fn default_compaction_preserves_internal_stores_and_empty_store_metadata() {
 #[test]
 fn rebuild_compaction_skips_only_explicit_known_internal_stores() {
     let (_source_bundle, mut source) = Bundle::open("compact-skip-source");
-    let tx = source.begin_tx(TxMode::Readwrite).unwrap();
-    source.set_schema_version(tx, 7).unwrap();
-    for store in [
-        "kv",
-        "empty",
-        "__browserdb:indexes",
-        "__browserdb:index:known",
-        "__browserdb:other",
-    ] {
-        source.create_store(tx, store).unwrap();
-    }
-    source.put(tx, "kv", b"key", b"value").unwrap();
-    for store in [
-        "__browserdb:indexes",
-        "__browserdb:index:known",
-        "__browserdb:other",
-    ] {
-        source
-            .put(tx, store, b"internal", store.as_bytes())
-            .unwrap();
-    }
-    source.commit_tx(tx).unwrap();
+    seed_internal_catalog(&mut source);
     let (target_bundle, mut target) = Bundle::open("compact-skip-target");
     source
         .compact_into_skipping_stores(

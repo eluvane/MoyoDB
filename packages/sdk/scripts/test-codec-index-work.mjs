@@ -1,17 +1,13 @@
-import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve, relative, isAbsolute } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import ts from 'typescript';
+import { emitTranspiledModule, readFlagValue } from './fixture-emit.mjs';
 
 // Tests production codecs against reference behavior without a browser, storage or WASM build.
 const here = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
-const sourceIndex = args.indexOf('--source-root');
-if (sourceIndex >= 0 && (!args[sourceIndex + 1] || args[sourceIndex + 1].startsWith('--'))) {
-    throw new Error('missing --source-root value');
-}
-const source = resolve(sourceIndex >= 0 ? args[sourceIndex + 1] : join(here, '../src'));
+const source = resolve(readFlagValue(args, '--source-root') ?? join(here, '../src'));
 const temporaryRoot = resolve(tmpdir());
 const output = await mkdtemp(join(temporaryRoot, 'moyo-codec-index-work-'));
 const relativeOutput = relative(temporaryRoot, resolve(output));
@@ -30,24 +26,13 @@ try {
         'compression-work-cases'
     ]) {
         const input = name.endsWith('-cases') ? join(here, `../tests/${name}.ts`) : join(source, `${name}.ts`);
-        const result = ts.transpileModule(await readFile(input, 'utf8'), {
-            fileName: `${name}.ts`,
-            reportDiagnostics: true,
-            compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
+        await emitTranspiledModule({
+            name,
+            input,
+            outputDir: output,
+            sourceRoot: source,
+            reportErrors: 'throw'
         });
-        const errors = (result.diagnostics ?? []).filter(
-            (diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error
-        );
-        if (errors.length) {
-            throw new Error(
-                ts.formatDiagnosticsWithColorAndContext(errors, {
-                    getCanonicalFileName: (file) => file,
-                    getCurrentDirectory: () => source,
-                    getNewLine: () => '\n'
-                })
-            );
-        }
-        await writeFile(join(output, `${name}.mjs`), result.outputText.replace(/from '(\.\/[^']+)'/g, "from '$1.mjs'"));
     }
     const [codec, indexing, compression, cases, compressionCases] = await Promise.all(
         ['codec', 'indexing', 'compression', 'codec-index-work-cases', 'compression-work-cases'].map(

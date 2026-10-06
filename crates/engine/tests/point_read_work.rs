@@ -330,6 +330,16 @@ fn page_bytes(image: &[u8], page: u64) -> &[u8] {
     &image[start..start + PAGE_SIZE]
 }
 
+fn wide_entries(prefix_len: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+    (0u8..32)
+        .map(|index| {
+            let mut key = vec![0x51; prefix_len];
+            key.push(index);
+            (key, vec![index; 256])
+        })
+        .collect()
+}
+
 #[test]
 fn has_warm_inline_and_overflow_do_not_allocate_headers() -> Result<()> {
     let mut fixture = Fixture::new(
@@ -429,13 +439,7 @@ fn duplicate_get_many_reads_each_overflow_chain_once() -> Result<()> {
 
 #[test]
 fn get_many_shares_ancestors_without_scanning_unrequested_leaves() -> Result<()> {
-    let entries: Vec<_> = (0u8..32)
-        .map(|index| {
-            let mut key = vec![0x51; 384];
-            key.push(index);
-            (key, vec![index; 256])
-        })
-        .collect();
+    let entries = wide_entries(384);
     let mut fixture = Fixture::new(&entries, 1)?;
     let first = fixture.path(&entries[1].0);
     let last = fixture.path(&entries[30].0);
@@ -715,13 +719,7 @@ trait HasManyOracle {
 
 #[test]
 fn get_many_reuses_a_multilevel_path_and_matches_a_byte_oracle() -> Result<()> {
-    let entries: Vec<_> = (0u8..32)
-        .map(|index| {
-            let mut key = vec![0x51; 799];
-            key.push(index);
-            (key, vec![index; 256])
-        })
-        .collect();
+    let entries = wide_entries(799);
     let mut fixture = Fixture::new(&entries, 1)?;
     let root = fixture.root();
     let header = decode_page(page_bytes(&fixture.images[1], root))?.header;
@@ -800,13 +798,7 @@ impl HasManyOracle for Engine<CountingBackend> {
 
 #[test]
 fn has_many_shares_ancestors_and_matches_the_scalar_oracle() -> Result<()> {
-    let entries: Vec<_> = (0u8..32)
-        .map(|index| {
-            let mut key = vec![0x51; 384];
-            key.push(index);
-            (key, vec![index; 256])
-        })
-        .collect();
+    let entries = wide_entries(384);
     let mut fixture = Fixture::new(&entries, 1)?;
     let mut missing = entries[15].0.clone();
     missing.push(0xff);

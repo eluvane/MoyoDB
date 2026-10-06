@@ -1,4 +1,4 @@
-import { test, type BrowserContext, type BrowserType, type Page } from '@playwright/test';
+import { test, type Browser, type BrowserContext, type BrowserType, type Page } from '@playwright/test';
 
 export interface PersistentContextFactory {
     readonly userDataDir: string;
@@ -125,4 +125,28 @@ export async function prepareMoyoDbPage(page: Page): Promise<void> {
     await page.goto('/');
     await page.waitForFunction(() => typeof window.moyodb.openDB === 'function');
     await requireMoyoDbCapabilities(page);
+}
+
+export async function openPairedPages(browser: Browser): Promise<{
+    context: BrowserContext;
+    first: Page;
+    second: Page;
+}> {
+    const context = await browser.newContext();
+    const first = await context.newPage();
+    const second = await context.newPage();
+    await first.goto('/');
+    await second.goto('/');
+    await requireMoyoDbCapabilities(first);
+    return { context, first, second };
+}
+
+export async function requireCompressionStreams(
+    page: Page,
+    reason = 'browser lacks CompressionStream/DecompressionStream'
+): Promise<void> {
+    const supported = await page.evaluate(
+        () => typeof CompressionStream === 'function' && typeof DecompressionStream === 'function'
+    );
+    test.skip(!supported, reason);
 }

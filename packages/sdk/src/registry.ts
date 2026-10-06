@@ -173,23 +173,15 @@ export function assertCompatibleOptions(dbName: string, current: NormalizedOpenO
         );
     }
 }
-async function queryPersistentStorageState(): Promise<boolean> {
+async function callStorageManager(method: 'persist' | 'persisted'): Promise<boolean> {
     const storage = globalThis.navigator.storage;
-    if (typeof storage.persisted !== 'function') {
+    if (typeof storage[method] !== 'function') {
         return false;
     }
-    return await withTimeout(storage.persisted(), 1000, false);
-}
-async function requestPersistentStorageGrant(): Promise<boolean> {
-    const storage = globalThis.navigator.storage;
-    if (typeof storage.persist !== 'function') {
-        return false;
-    }
-    return await withTimeout(storage.persist(), 1000, false);
+    return await withTimeout(storage[method](), 1000, false);
 }
 async function handlePersistenceBridgeRequest(port: MessagePort, request: PersistenceBridgeRequest): Promise<void> {
-    const granted =
-        request.op === 'persist' ? await requestPersistentStorageGrant() : await queryPersistentStorageState();
+    const granted = await callStorageManager(request.op);
     const response: PersistenceBridgeResponse = {
         type: PERSISTENCE_BRIDGE_RESPONSE,
         id: request.id,

@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { prepareMoyoDbPage, requireMoyoDbCapabilities, uniqueDbName } from './support';
+import { openPairedPages, prepareMoyoDbPage, uniqueDbName } from './support';
 test('db.subscribe(callback) emits one callback per touched store with shared txnId', async ({ page }) => {
     const dbName = uniqueDbName('subscribe-all');
     await prepareMoyoDbPage(page);
@@ -145,12 +145,7 @@ test('db.subscribe(storeName, keyPrefix, callback) filters matching keys inside 
 });
 test('BroadcastChannel publishes detailed commit payloads across tabs', async ({ browser }) => {
     const dbName = uniqueDbName('subscribe-cross-tab');
-    const context = await browser.newContext();
-    const writer = await context.newPage();
-    const observer = await context.newPage();
-    await writer.goto('/');
-    await observer.goto('/');
-    await requireMoyoDbCapabilities(writer);
+    const { first: writer, second: observer } = await openPairedPages(browser);
     await writer.evaluate(async (name) => {
         const db = await window.moyodb.openDB(name);
         try {

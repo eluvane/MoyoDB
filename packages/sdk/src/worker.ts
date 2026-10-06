@@ -1018,10 +1018,7 @@ export class DbWorker implements WorkerApi {
                 throw error;
             }
             if (baselines.length !== entries.length) {
-                throw remoteError(
-                    'InternalError',
-                    `put_many outcome count mismatch: ${baselines.length} != ${entries.length}`
-                );
+                throw outcomeCountMismatch('put_many', baselines.length, entries.length);
             }
             this.recordPutChanges(txId, store, entries, baselines);
             return;
@@ -1073,10 +1070,7 @@ export class DbWorker implements WorkerApi {
             throw error;
         }
         if (baselines.length !== keys.length) {
-            throw remoteError(
-                'InternalError',
-                `put_many_packed outcome count mismatch: ${baselines.length} != ${keys.length}`
-            );
+            throw outcomeCountMismatch('put_many_packed', baselines.length, keys.length);
         }
         this.recordPutKeyChanges(txId, store, keys, baselines);
     }
@@ -1116,10 +1110,7 @@ export class DbWorker implements WorkerApi {
                 throw error;
             }
             if (deleted.length !== keys.length) {
-                throw remoteError(
-                    'InternalError',
-                    `delete_many outcome count mismatch: ${deleted.length} != ${keys.length}`
-                );
+                throw outcomeCountMismatch('delete_many', deleted.length, keys.length);
             }
             for (let i = 0; i < keys.length; i += 1) {
                 this.recordDeleteChange(txId, store, keys[i], deleted[i]);
@@ -1151,10 +1142,7 @@ export class DbWorker implements WorkerApi {
             throw error;
         }
         if (deleted.length !== keys.length) {
-            throw remoteError(
-                'InternalError',
-                `delete_many_packed outcome count mismatch: ${deleted.length} != ${keys.length}`
-            );
+            throw outcomeCountMismatch('delete_many_packed', deleted.length, keys.length);
         }
         for (let i = 0; i < keys.length; i += 1) {
             this.recordDeleteChange(txId, store, keys[i], deleted[i] === 1);
@@ -1175,10 +1163,7 @@ export class DbWorker implements WorkerApi {
                 throw error;
             }
             if (outcomes.length !== ops.length) {
-                throw remoteError(
-                    'InternalError',
-                    `apply_batch outcome count mismatch: ${outcomes.length} != ${ops.length}`
-                );
+                throw outcomeCountMismatch('apply_batch', outcomes.length, ops.length);
             }
             this.recordBatchOutcomes(txId, store, ops, outcomes);
             return;
@@ -1209,14 +1194,11 @@ export class DbWorker implements WorkerApi {
         try {
             flags = this.withEngine((engine) => engine.apply_batch_packed(toWasmU64(txId), store, packedOps));
         } catch (error) {
-            this.recordBatchKeyOutcomes(txId, store, ops, partialBatchOutcomes(error));
+            this.recordBatchOutcomes(txId, store, ops, partialBatchOutcomes(error));
             throw error;
         }
         if (flags.length !== ops.length) {
-            throw remoteError(
-                'InternalError',
-                `apply_batch_packed outcome count mismatch: ${flags.length} != ${ops.length}`
-            );
+            throw outcomeCountMismatch('apply_batch_packed', flags.length, ops.length);
         }
         for (let i = 0; i < ops.length; i += 1) {
             const op = ops[i];
@@ -1420,10 +1402,7 @@ export class DbWorker implements WorkerApi {
                         )
                     );
                     if (visible.length !== sourceRows.length) {
-                        throw remoteError(
-                            'InternalError',
-                            `has_many outcome count mismatch: ${visible.length} != ${sourceRows.length}`
-                        );
+                        throw outcomeCountMismatch('has_many', visible.length, sourceRows.length);
                     }
                     rows = sourceRows.filter((_row, index) => visible[index]);
                 } else {
@@ -1912,23 +1891,7 @@ export class DbWorker implements WorkerApi {
     private recordBatchOutcomes(
         txId: number,
         store: string,
-        ops: Array<BatchOp>,
-        outcomes: Array<WasmBatchOutcome>
-    ): void {
-        for (let i = 0; i < outcomes.length && i < ops.length; i += 1) {
-            const op = ops[i];
-            const outcome = outcomes[i];
-            if (op.kind === 'put' && outcome.kind === 'put') {
-                this.recordPutChange(txId, store, op.key, outcome.baselineExists);
-            } else if (op.kind === 'delete' && outcome.kind === 'delete') {
-                this.recordDeleteChange(txId, store, op.key, outcome.deleted);
-            }
-        }
-    }
-    private recordBatchKeyOutcomes(
-        txId: number,
-        store: string,
-        ops: PackedBatchOpKey[],
+        ops: ReadonlyArray<BatchOp | PackedBatchOpKey>,
         outcomes: Array<WasmBatchOutcome>
     ): void {
         for (let i = 0; i < outcomes.length && i < ops.length; i += 1) {
@@ -2895,10 +2858,7 @@ export class DbWorker implements WorkerApi {
             return null;
         }
         if (loaded.length !== selectedIndices.length) {
-            throw remoteError(
-                'InternalError',
-                `get_many outcome count mismatch: ${loaded.length} != ${selectedIndices.length}`
-            );
+            throw outcomeCountMismatch('get_many', loaded.length, selectedIndices.length);
         }
         for (let index = 0; index < loaded.length; index += 1) {
             values[selectedIndices[index]] = loaded[index];
@@ -3101,6 +3061,9 @@ function normalizeEngineHealth(health: WasmEngineHealth): EngineHealth {
         };
     }
     return { state: health.state };
+}
+function outcomeCountMismatch(operation: string, actual: number, expected: number): Error {
+    return remoteError('InternalError', `${operation} outcome count mismatch: ${actual} != ${expected}`);
 }
 function partialBooleanOutcomes(error: unknown): boolean[] {
     if (!isRecord(error) || !Array.isArray(error.partial)) {

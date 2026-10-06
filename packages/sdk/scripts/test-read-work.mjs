@@ -1,22 +1,16 @@
-import { mkdtemp, mkdir, readFile, writeFile, cp, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, cp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import ts from 'typescript';
 import { createReadSuite } from '../tests/read-work-suite.mjs';
+import { emitTranspiledModule, readFlagValue } from './fixture-emit.mjs';
 
 // Tests production read methods, codecs and packet decoding with WASM and
 // Worker transport fixtures. Storage and latency are outside its scope.
 const here = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
-const value = (flag) => {
-    const index = args.indexOf(flag);
-    if (index < 0) return undefined;
-    if (!args[index + 1] || args[index + 1].startsWith('--')) throw new Error(`missing ${flag} value`);
-    return args[index + 1];
-};
-const source = resolve(value('--source-root') ?? join(here, '../src'));
-const keep = value('--emit-dir');
+const source = resolve(readFlagValue(args, '--source-root') ?? join(here, '../src'));
+const keep = readFlagValue(args, '--emit-dir');
 const output = keep ? resolve(keep) : await mkdtemp(join(tmpdir(), 'moyo-read-work-'));
 const modules = ['worker', 'indexing', 'codec', 'errors', 'internal', 'compression', 'snappy', 'worker-protocol'];
 await mkdir(output, { recursive: true });
@@ -24,21 +18,13 @@ let runtime;
 const originalSelf = globalThis.self;
 try {
     for (const name of modules) {
-        const result = ts.transpileModule(await readFile(join(source, `${name}.ts`), 'utf8'), {
-            fileName: `${name}.ts`,
-            reportDiagnostics: true,
-            compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
+        await emitTranspiledModule({
+            name,
+            input: join(source, `${name}.ts`),
+            outputDir: output,
+            sourceRoot: source,
+            reportErrors: 'throw'
         });
-        const errors = (result.diagnostics ?? []).filter((d) => d.category === ts.DiagnosticCategory.Error);
-        if (errors.length)
-            throw new Error(
-                ts.formatDiagnosticsWithColorAndContext(errors, {
-                    getCanonicalFileName: (f) => f,
-                    getCurrentDirectory: () => source,
-                    getNewLine: () => '\n'
-                })
-            );
-        await writeFile(join(output, `${name}.mjs`), result.outputText.replace(/from '(\.\/[^']+)'/g, "from '$1.mjs'"));
     }
     await writeFile(
         join(output, 'worker-server.mjs'),

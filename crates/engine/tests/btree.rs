@@ -4,9 +4,22 @@ use moyodb_engine::btree::{build_tree, lookup, scan, RangeSpec};
 use moyodb_engine::pager::Pager;
 use moyodb_engine::storage::memory::MemoryBackend;
 
+fn pager_for_entries(
+    entries: &[(Vec<u8>, Vec<u8>)],
+    cache_pages: usize,
+) -> (Pager<MemoryBackend>, u64) {
+    let mut next_page_id = 1;
+    let tree = build_tree(entries, &mut next_page_id).unwrap();
+    let mut pager = Pager::new(MemoryBackend::new(), cache_pages);
+    for (page_id, bytes) in tree.page_images {
+        pager.write_page_image(page_id, &bytes).unwrap();
+    }
+    pager.flush().unwrap();
+    (pager, tree.root_page_id)
+}
+
 #[test]
 fn build_lookup_and_scan() {
-    let mut next_page_id = 1;
     let entries = vec![
         (b"c".to_vec(), b"3".to_vec()),
         (b"a".to_vec(), b"1".to_vec()),
@@ -14,30 +27,20 @@ fn build_lookup_and_scan() {
     ];
     let mut sorted = entries.clone();
     sorted.sort_by(|a, b| a.0.cmp(&b.0));
-    let tree = build_tree(&sorted, &mut next_page_id).unwrap();
-    let main = MemoryBackend::new();
-    let mut pager = Pager::new(main, 32);
-    for (page_id, bytes) in tree.page_images {
-        pager.write_page_image(page_id, &bytes).unwrap();
-    }
-    pager.flush().unwrap();
+    let (mut pager, root_page_id) = pager_for_entries(&sorted, 32);
 
     assert_eq!(
-        lookup(&mut pager, tree.root_page_id, b"a")
-            .unwrap()
-            .unwrap(),
+        lookup(&mut pager, root_page_id, b"a").unwrap().unwrap(),
         b"1".to_vec()
     );
     assert_eq!(
-        lookup(&mut pager, tree.root_page_id, b"b")
-            .unwrap()
-            .unwrap(),
+        lookup(&mut pager, root_page_id, b"b").unwrap().unwrap(),
         b"2".to_vec()
     );
 
     let rows = scan(
         &mut pager,
-        tree.root_page_id,
+        root_page_id,
         &RangeSpec {
             gte: Some(b"a".to_vec()),
             lt: Some(b"c".to_vec()),
@@ -62,21 +65,14 @@ fn root_split_scenario_has_many_pages() {
 
 #[test]
 fn forward_scan_descends_to_lower_bound_and_stops_at_limit() {
-    let mut next_page_id = 1;
     let entries: Vec<(Vec<u8>, Vec<u8>)> = (0u8..160u8)
         .map(|i| (vec![i], vec![i.wrapping_add(1)]))
         .collect();
-    let tree = build_tree(&entries, &mut next_page_id).unwrap();
-    let main = MemoryBackend::new();
-    let mut pager = Pager::new(main, 8);
-    for (page_id, bytes) in tree.page_images {
-        pager.write_page_image(page_id, &bytes).unwrap();
-    }
-    pager.flush().unwrap();
+    let (mut pager, root_page_id) = pager_for_entries(&entries, 8);
 
     let rows = scan(
         &mut pager,
-        tree.root_page_id,
+        root_page_id,
         &RangeSpec {
             gte: Some(vec![120]),
             lt: Some(vec![140]),
@@ -95,19 +91,12 @@ fn forward_scan_descends_to_lower_bound_and_stops_at_limit() {
 
 #[test]
 fn reverse_scan_preserves_upper_bound() {
-    let mut next_page_id = 1;
     let entries: Vec<(Vec<u8>, Vec<u8>)> = (0u8..10u8).map(|i| (vec![i], vec![i])).collect();
-    let tree = build_tree(&entries, &mut next_page_id).unwrap();
-    let main = MemoryBackend::new();
-    let mut pager = Pager::new(main, 16);
-    for (page_id, bytes) in tree.page_images {
-        pager.write_page_image(page_id, &bytes).unwrap();
-    }
-    pager.flush().unwrap();
+    let (mut pager, root_page_id) = pager_for_entries(&entries, 16);
 
     let rows = scan(
         &mut pager,
-        tree.root_page_id,
+        root_page_id,
         &RangeSpec {
             lte: Some(vec![4]),
             reverse: true,

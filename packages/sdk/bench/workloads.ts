@@ -981,6 +981,42 @@ export function isSingleTransactionInsertWorkload(name: string): boolean {
     return name === 'bulk_insert_1m_single_tx' || name === 'cold_insert_1m_single_tx';
 }
 
+type BenchEntry = [Uint8Array<ArrayBuffer>, Uint8Array];
+
+export function effectiveBatchSize(workload: WorkloadSpec): number {
+    if (isSingleTransactionInsertWorkload(workload.name)) {
+        return Math.min(10_000, workload.recordCount);
+    }
+    return Math.max(1, workload.batchSize);
+}
+
+export function shouldUseSingleTransactionPreload(workload: WorkloadSpec): boolean {
+    return workload.recordCount >= 1_000_000;
+}
+
+export function buildEntryBatches(workload: WorkloadSpec, count: number, batchSize: number): BenchEntry[][] {
+    const batches: BenchEntry[][] = [];
+    for (let start = 0; start < count; start += batchSize) {
+        const end = Math.min(start + batchSize, count);
+        const entries: BenchEntry[] = [];
+        for (let i = start; i < end; i += 1) {
+            entries.push([
+                keyBytes(i, workload.keySize),
+                valueBytes(i, workload.valueSize, workloadPolicy(workload).dataset.profile)
+            ]);
+        }
+        batches.push(entries);
+    }
+    return batches;
+}
+
+export function requireValue<T>(engine: 'MoyoDB' | 'IndexedDB', value: T | undefined, what: string, name: string): T {
+    if (value === undefined) {
+        throw new Error(`prepared ${engine} ${what} missing for ${name}`);
+    }
+    return value;
+}
+
 export function isRandomGetWorkload(name: string): boolean {
     return name.startsWith('point_get_random_') || name.startsWith('random_get_');
 }

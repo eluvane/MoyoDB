@@ -1,44 +1,29 @@
-import { mkdtemp, mkdir, readFile, writeFile, cp, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, cp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import ts from 'typescript';
 import { createSuite } from '../tests/minimum-work-suite.mjs';
+import { emitTranspiledModule, readFlagValue } from './fixture-emit.mjs';
 // Measures SDK work with transport and compression fixtures. Index codecs,
 // metadata ownership, mutation planning and paging use production code.
 // WASM and OPFS end-to-end behavior are outside its scope.
 const here = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
-const value = (flag) => {
-    const index = args.indexOf(flag);
-    if (index < 0) return undefined;
-    if (!args[index + 1] || args[index + 1].startsWith('--')) throw new Error(`missing ${flag} value`);
-    return args[index + 1];
-};
-const source = resolve(value('--source-root') ?? join(here, '../src'));
-const keep = value('--emit-dir');
+const source = resolve(readFlagValue(args, '--source-root') ?? join(here, '../src'));
+const keep = readFlagValue(args, '--emit-dir');
 const output = keep ? resolve(keep) : await mkdtemp(join(tmpdir(), 'moyo-minimum-work-'));
 const modules = ['worker', 'indexing', 'codec', 'errors', 'internal'];
 await mkdir(output, { recursive: true });
 try {
     for (const name of modules) {
-        const input = await readFile(join(source, `${name}.ts`), 'utf8');
-        const result = ts.transpileModule(input, {
-            fileName: `${name}.ts`,
-            reportDiagnostics: true,
-            compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
+        await emitTranspiledModule({
+            name,
+            input: join(source, `${name}.ts`),
+            outputDir: output,
+            sourceRoot: source,
+            reportErrors: 'throw'
         });
-        const errors = (result.diagnostics ?? []).filter((d) => d.category === ts.DiagnosticCategory.Error);
-        if (errors.length)
-            throw new Error(
-                ts.formatDiagnosticsWithColorAndContext(errors, {
-                    getCanonicalFileName: (f) => f,
-                    getCurrentDirectory: () => source,
-                    getNewLine: () => '\n'
-                })
-            );
-        const code = result.outputText.replace(/from '(\.\/[^']+)'/g, "from '$1.mjs'");
-        await writeFile(join(output, `${name}.mjs`), code);
     }
     await writeFile(
         join(output, 'worker-server.mjs'),

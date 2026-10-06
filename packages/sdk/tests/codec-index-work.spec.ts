@@ -3,14 +3,11 @@ import type * as Codec from '../src/codec';
 import type * as Indexing from '../src/indexing';
 import type * as Compression from '../src/compression';
 import type * as Cases from './codec-index-work-cases';
-import { prepareMoyoDbPage } from './support';
+import { prepareMoyoDbPage, requireCompressionStreams } from './support';
 
 test('key, JSON, index and compression codecs preserve boundary contracts', async ({ page }) => {
     await prepareMoyoDbPage(page);
-    const supported = await page.evaluate(() => {
-        return typeof CompressionStream === 'function' && typeof DecompressionStream === 'function';
-    });
-    test.skip(!supported, 'browser lacks CompressionStream/DecompressionStream');
+    await requireCompressionStreams(page);
     const result = await page.evaluate(async () => {
         const codecPath = '/src/codec.ts';
         const indexingPath = '/src/indexing.ts';

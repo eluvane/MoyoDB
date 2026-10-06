@@ -1,19 +1,16 @@
-import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import ts from 'typescript';
 import { createTransportSuite } from '../tests/transport-work-suite.mjs';
+import { emitTranspiledModule, readFlagValue } from './fixture-emit.mjs';
 
 // Tests production client, server, protocol and scheduler without a browser, WASM or OPFS.
 // Native structuredClone preserves buffer copy and transfer behavior at the message boundary.
 const here = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
-const sourceIndex = args.indexOf('--source-root');
-if (sourceIndex >= 0 && (!args[sourceIndex + 1] || args[sourceIndex + 1].startsWith('--'))) {
-    throw new Error('missing --source-root value');
-}
-const source = resolve(sourceIndex < 0 ? join(here, '../src') : args[sourceIndex + 1]);
+const source = resolve(readFlagValue(args, '--source-root') ?? join(here, '../src'));
 const output = await mkdtemp(join(tmpdir(), 'moyo-transport-work-'));
 
 function countThenCalls(context) {
@@ -56,23 +53,14 @@ function __transportWorkReceiver(receiver) {
 }
 `
             : '';
-        const result = ts.transpileModule(prefix + input, {
-            fileName: `${name}.ts`,
-            reportDiagnostics: true,
-            compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
+        await emitTranspiledModule({
+            name,
+            sourceText: prefix + input,
+            outputDir: output,
+            sourceRoot: source,
+            reportErrors: 'throw',
             transformers: instrumented ? { before: [countThenCalls] } : undefined
         });
-        const errors = (result.diagnostics ?? []).filter((item) => item.category === ts.DiagnosticCategory.Error);
-        if (errors.length > 0) {
-            throw new Error(
-                ts.formatDiagnosticsWithColorAndContext(errors, {
-                    getCanonicalFileName: (file) => file,
-                    getCurrentDirectory: () => source,
-                    getNewLine: () => '\n'
-                })
-            );
-        }
-        await writeFile(join(output, `${name}.mjs`), result.outputText.replace(/from '(\.\/[^']+)'/g, "from '$1.mjs'"));
     }
     const [client, server, protocol] = await Promise.all(
         ['worker-client', 'worker-server', 'worker-protocol'].map(

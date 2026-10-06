@@ -13,7 +13,8 @@ import {
     unsafeDebugCrashWorker,
     utf8Decode,
     utf8Encode,
-    type DB
+    type DB,
+    type Transaction
 } from './index';
 
 declare global {
@@ -67,74 +68,49 @@ const exportButton = document.getElementById('export-json') as HTMLButtonElement
 
 void renderEnvironment();
 
-bind('open-db', async () => {
-    const db = await ensureDemoDb();
-    try {
+bind('open-db', () =>
+    withDemoDb(async (db) => {
         const stats = await db.stats();
         print({ opened: DEMO_DB, stats });
-    } finally {
-        await db.close();
-    }
-});
+    })
+);
 
-bind('put-get', async () => {
-    const db = await ensureDemoDb();
-    try {
+bind('put-get', () =>
+    withDemoDb(async (db) => {
         await db.put(STORE, utf8Encode('hello'), utf8Encode('moyodb'));
         const value = await db.get(STORE, utf8Encode('hello'));
         print({ key: 'hello', value: value ? utf8Decode(value) : null });
-    } finally {
-        await db.close();
-    }
-});
+    })
+);
 
-bind('range-scan', async () => {
-    const db = await ensureDemoDb();
-    try {
-        const tx = await db.begin('readwrite');
-        try {
+bind('range-scan', () =>
+    withDemoDb(async (db) => {
+        await withWriteTx(db, async (tx) => {
             const entries: Array<[Uint8Array, Uint8Array]> = [];
             for (let i = 0; i < 10; i += 1) {
                 entries.push([utf8Encode(`scan:${i.toString().padStart(2, '0')}`), utf8Encode(`value:${i}`)]);
             }
             await tx.putMany(STORE, entries);
-            await tx.commit();
-        } catch (error) {
-            await tx.rollback().catch(() => undefined);
-            throw error;
-        }
+        });
         const rows = await db.scan(STORE, {
             gte: utf8Encode('scan:03'),
             lte: utf8Encode('scan:07')
         });
         print(rows.map((row) => ({ key: utf8Decode(row.key), value: utf8Decode(row.value) })));
-    } finally {
-        await db.close();
-    }
-});
+    })
+);
 
-bind('bulk-insert', async () => {
-    await deleteMoyoDbIfExists(BULK_DEMO_DB);
-    let db: DB | null = null;
-    try {
-        db = await ensureDemoDb(BULK_DEMO_DB);
-        const openedDb = db;
+bind('bulk-insert', () =>
+    withTemporaryMoyo(async (db) => {
         const result = await time('moyodb_bulk_insert_10k', async () => {
-            await bulkInsertMoyo(openedDb, 10_000, 1000, 128);
+            await bulkInsertMoyo(db, 10_000, 1000, 128);
         });
-        lastBenchmarkJson = {
-            generatedAt: new Date().toISOString(),
-            browser: await browserInfo(),
-            results: [result],
-            notes: ['Minimal demo benchmark; use packages/sdk/bench for reproducible benchmark reports.']
-        };
-        exportButton.disabled = false;
-        print(lastBenchmarkJson);
-    } finally {
-        await db?.close().catch(() => undefined);
-        await deleteMoyoDbIfExists(BULK_DEMO_DB);
-    }
-});
+        await recordBenchmark(
+            [result],
+            ['Minimal demo benchmark; use packages/sdk/bench for reproducible benchmark reports.']
+        );
+    })
+);
 
 bind('bulk-insert-idb', async () => {
     await deleteIndexedDb(IDB_DEMO_DB);
@@ -142,51 +118,33 @@ bind('bulk-insert-idb', async () => {
         const result = await time('indexeddb_bulk_insert_10k', async () => {
             await bulkInsertIndexedDb(IDB_DEMO_DB, 10_000, 1000, 128);
         });
-        lastBenchmarkJson = {
-            generatedAt: new Date().toISOString(),
-            browser: await browserInfo(),
-            results: [result],
-            notes: ['Minimal IndexedDB demo benchmark; use packages/sdk/bench for reproducible benchmark reports.']
-        };
-        exportButton.disabled = false;
-        print(lastBenchmarkJson);
+        await recordBenchmark(
+            [result],
+            ['Minimal IndexedDB demo benchmark; use packages/sdk/bench for reproducible benchmark reports.']
+        );
     } finally {
         await deleteIndexedDb(IDB_DEMO_DB);
     }
 });
 
 bind('compare-idb', async () => {
-    await deleteMoyoDbIfExists(BULK_DEMO_DB);
-    let moyo: DB | null = null;
     try {
-        moyo = await ensureDemoDb(BULK_DEMO_DB);
-        const openedMoyo = moyo;
-        await deleteIndexedDb(IDB_DEMO_DB);
-        const results = [];
-        results.push(
-            await time('moyodb_bulk_insert_10k', async () => {
-                await bulkInsertMoyo(openedMoyo, 10_000, 1000, 128);
-            })
-        );
-        results.push(
-            await time('indexeddb_bulk_insert_10k', async () => {
-                await bulkInsertIndexedDb(IDB_DEMO_DB, 10_000, 1000, 128);
-            })
-        );
-        lastBenchmarkJson = {
-            generatedAt: new Date().toISOString(),
-            browser: await browserInfo(),
-            results,
-            notes: [
+        await withTemporaryMoyo(async (moyo) => {
+            await deleteIndexedDb(IDB_DEMO_DB);
+            const results = [
+                await time('moyodb_bulk_insert_10k', async () => {
+                    await bulkInsertMoyo(moyo, 10_000, 1000, 128);
+                }),
+                await time('indexeddb_bulk_insert_10k', async () => {
+                    await bulkInsertIndexedDb(IDB_DEMO_DB, 10_000, 1000, 128);
+                })
+            ];
+            await recordBenchmark(results, [
                 'Minimal demo comparison only.',
                 'Use npm run bench:browser for raw samples, percentiles, warmups, and comparable transaction boundaries.'
-            ]
-        };
-        exportButton.disabled = false;
-        print(lastBenchmarkJson);
+            ]);
+        });
     } finally {
-        await moyo?.close().catch(() => undefined);
-        await deleteMoyoDbIfExists(BULK_DEMO_DB);
         await deleteIndexedDb(IDB_DEMO_DB);
     }
 });
@@ -220,20 +178,58 @@ async function ensureDemoDb(name = DEMO_DB): Promise<DB> {
     return db;
 }
 
+async function withDemoDb(action: (db: DB) => Promise<void>): Promise<void> {
+    const db = await ensureDemoDb();
+    try {
+        await action(db);
+    } finally {
+        await db.close();
+    }
+}
+
+async function withTemporaryMoyo(action: (db: DB) => Promise<void>): Promise<void> {
+    await deleteMoyoDbIfExists(BULK_DEMO_DB);
+    let db: DB | null = null;
+    try {
+        db = await ensureDemoDb(BULK_DEMO_DB);
+        await action(db);
+    } finally {
+        await db?.close().catch(() => undefined);
+        await deleteMoyoDbIfExists(BULK_DEMO_DB);
+    }
+}
+
+async function withWriteTx(db: DB, action: (tx: Transaction) => Promise<void>): Promise<void> {
+    const tx = await db.begin('readwrite');
+    try {
+        await action(tx);
+        await tx.commit();
+    } catch (error) {
+        await tx.rollback().catch(() => undefined);
+        throw error;
+    }
+}
+
+async function recordBenchmark(results: Array<Record<string, unknown>>, notes: string[]): Promise<void> {
+    lastBenchmarkJson = {
+        generatedAt: new Date().toISOString(),
+        browser: await browserInfo(),
+        results,
+        notes
+    };
+    exportButton.disabled = false;
+    print(lastBenchmarkJson);
+}
+
 async function bulkInsertMoyo(db: DB, count: number, batchSize: number, valueSize: number): Promise<void> {
     for (let start = 0; start < count; start += batchSize) {
-        const tx = await db.begin('readwrite');
-        try {
+        await withWriteTx(db, async (tx) => {
             const entries: Array<[Uint8Array, Uint8Array]> = [];
             for (let i = start; i < Math.min(start + batchSize, count); i += 1) {
                 entries.push([utf8Encode(fixedKey(i)), fixedValue(i, valueSize)]);
             }
             await tx.putMany(STORE, entries);
-            await tx.commit();
-        } catch (error) {
-            await tx.rollback().catch(() => undefined);
-            throw error;
-        }
+        });
     }
 }
 
@@ -326,7 +322,6 @@ async function renderEnvironment(): Promise<void> {
 async function browserInfo(): Promise<Record<string, unknown>> {
     const storage = navigator.storage as StorageManager & {
         getDirectory?: () => Promise<unknown>;
-        estimate?: () => Promise<StorageEstimate>;
         persisted?: () => Promise<boolean>;
     };
     return {
@@ -334,7 +329,7 @@ async function browserInfo(): Promise<Record<string, unknown>> {
         platform: navigator.platform,
         secureContext: window.isSecureContext,
         opfsSupported: typeof storage.getDirectory === 'function',
-        storageEstimate: typeof storage.estimate === 'function' ? await storage.estimate().catch(() => null) : null,
+        storageEstimate: await storageEstimate(),
         persisted: typeof storage.persisted === 'function' ? await storage.persisted().catch(() => false) : false
     };
 }

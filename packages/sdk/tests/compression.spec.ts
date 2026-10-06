@@ -1,11 +1,5 @@
-import { expect, test, type Page } from '@playwright/test';
-import { prepareMoyoDbPage, uniqueDbName } from './support';
-async function requireCompressionStreams(page: Page) {
-    const supported = await page.evaluate(() => {
-        return typeof CompressionStream === 'function' && typeof DecompressionStream === 'function';
-    });
-    test.skip(!supported, 'browser lacks CompressionStream/DecompressionStream');
-}
+import { expect, test } from '@playwright/test';
+import { prepareMoyoDbPage, requireCompressionStreams, uniqueDbName } from './support';
 test('compressed stores decode transparently for get/scan and managed indexes', async ({ page }) => {
     const dbName = uniqueDbName('compression-store');
     await prepareMoyoDbPage(page);

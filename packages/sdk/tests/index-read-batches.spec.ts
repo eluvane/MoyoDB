@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { prepareMoyoDbPage, uniqueDbName } from './support';
+import { prepareMoyoDbPage, requireCompressionStreams, uniqueDbName } from './support';
 import type * as RegistryModule from '../src/registry';
 
 test('secondary pages bound decoded bytes and resume before an unreturned large candidate', async ({ page }) => {
@@ -112,10 +112,7 @@ test('indexed SQL LIMIT one stops before a later malformed persisted row', async
 
 test('paged compressed index reads preserve duplicate order, TTL filtering and old snapshots', async ({ page }) => {
     await prepareMoyoDbPage(page);
-    const compressionSupported = await page.evaluate(
-        () => typeof CompressionStream === 'function' && typeof DecompressionStream === 'function'
-    );
-    test.skip(!compressionSupported, 'browser lacks compression streams');
+    await requireCompressionStreams(page, 'browser lacks compression streams');
     const result = await page.evaluate(async (name) => {
         const sdk = window.moyodb;
         const db = await sdk.openDB(name, {

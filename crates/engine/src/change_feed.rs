@@ -1,6 +1,6 @@
 use crate::bytes::{
-    read_u16_le, read_u32_le, validate_key, validate_store_name, MAX_KEY_BYTES,
-    MAX_STORE_NAME_BYTES,
+    read_u16_le, read_u32_le, try_u16_len, try_u32_len, validate_key, validate_store_name,
+    MAX_KEY_BYTES, MAX_STORE_NAME_BYTES,
 };
 use crate::catalog::CatalogMap;
 use crate::error::{EngineError, Result};
@@ -209,22 +209,10 @@ fn encode_change_record(
     }
 
     let store_bytes = store.as_bytes();
-    let store_len = u16::try_from(store_bytes.len()).map_err(|_| {
-        EngineError::Serialization(format!(
-            "change log store name too long: {}",
-            store_bytes.len()
-        ))
-    })?;
-    let key_len = u16::try_from(key.len()).map_err(|_| {
-        EngineError::Serialization(format!("change log key too long: {}", key.len()))
-    })?;
+    let store_len = try_u16_len(store_bytes.len(), "change log store name too long")?;
+    let key_len = try_u16_len(key.len(), "change log key too long")?;
     let value_bytes = value.unwrap_or(&[]);
-    let value_len = u32::try_from(value_bytes.len()).map_err(|_| {
-        EngineError::Serialization(format!(
-            "change log value too large to encode: {}",
-            value_bytes.len()
-        ))
-    })?;
+    let value_len = try_u32_len(value_bytes.len(), "change log value too large to encode")?;
 
     let mut out = Vec::with_capacity(
         CHANGE_RECORD_HEADER_SIZE
@@ -244,6 +232,13 @@ fn encode_change_record(
         out.extend_from_slice(value_bytes);
     }
     Ok(out)
+}
+
+#[inline]
+fn span_end(start: usize, len: usize, overflow: &'static str) -> Result<usize> {
+    start
+        .checked_add(len)
+        .ok_or_else(|| EngineError::Corruption(overflow.into()))
 }
 
 pub fn decode_change_record_payload(txid: TxId, payload: &[u8]) -> Result<ChangeRecord> {
@@ -294,15 +289,9 @@ pub(crate) fn decode_change_record_prefix_ref(
         .map_err(|_| EngineError::Corruption("change log value length overflow".into()))?;
 
     let header_end = CHANGE_RECORD_HEADER_SIZE;
-    let store_end = header_end
-        .checked_add(store_len)
-        .ok_or_else(|| EngineError::Corruption("change log store length overflow".into()))?;
-    let key_end = store_end
-        .checked_add(key_len)
-        .ok_or_else(|| EngineError::Corruption("change log key length overflow".into()))?;
-    let value_end = key_end
-        .checked_add(value_len)
-        .ok_or_else(|| EngineError::Corruption("change log value length overflow".into()))?;
+    let store_end = span_end(header_end, store_len, "change log store length overflow")?;
+    let key_end = span_end(store_end, key_len, "change log key length overflow")?;
+    let value_end = span_end(key_end, value_len, "change log value length overflow")?;
 
     if total_len != value_end {
         return Err(EngineError::Corruption(format!(

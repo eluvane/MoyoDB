@@ -9,7 +9,6 @@ import {
     utf8Encode
 } from './codec';
 import type { IndexDef, Range } from './types';
-const encoder = new TextEncoder();
 const fatalDecoder = new TextDecoder('utf-8', { fatal: true });
 const MISSING = Symbol('moyodb.indexing.missing');
 const FNV64_OFFSET = BigInt('0xcbf29ce484222325');
@@ -285,7 +284,7 @@ function makeInternalIndexStoreName(store: string, name: string): string {
     const storeToken = base64Url(utf8Encode(store));
     const nameToken = base64Url(utf8Encode(name));
     const candidate = `${INTERNAL_INDEX_STORE_PREFIX}${storeToken}:${nameToken}`;
-    if (encoder.encode(candidate).length <= 255) {
+    if (utf8Encode(candidate).length <= 255) {
         return candidate;
     }
     // Preserve the persisted hash format. Normalization rejects distinct

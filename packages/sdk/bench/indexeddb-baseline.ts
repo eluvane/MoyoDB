@@ -17,10 +17,12 @@ import {
     scanResultIndices,
     scanWindow,
     STORE_NAME,
-    valueBytes,
-    workloadPolicy,
     verificationKind,
-    writeVerificationIndices
+    writeVerificationIndices,
+    buildEntryBatches,
+    effectiveBatchSize,
+    requireValue,
+    shouldUseSingleTransactionPreload
 } from './workloads';
 
 // Use the same key bytes and byte order as MoyoDB so scan results match.
@@ -135,13 +137,16 @@ export const indexedDbBaseline: WorkloadRunner = {
             case 'point-read':
                 return assertChecksum(
                     'IndexedDB point read',
-                    valuesChecksum(requireValue(prepared.readValues, 'read values', ctx.dbName)),
-                    expectedValuesChecksum(ctx.workload, requireValue(prepared.readIndices, 'read indices', ctx.dbName))
+                    valuesChecksum(requireValue('IndexedDB', prepared.readValues, 'read values', ctx.dbName)),
+                    expectedValuesChecksum(
+                        ctx.workload,
+                        requireValue('IndexedDB', prepared.readIndices, 'read indices', ctx.dbName)
+                    )
                 );
             case 'scan':
                 return assertChecksum(
                     'IndexedDB scan',
-                    rowsChecksum(requireValue(prepared.scanResult, 'scan result', ctx.dbName)),
+                    rowsChecksum(requireValue('IndexedDB', prepared.scanResult, 'scan result', ctx.dbName)),
                     expectedRowsChecksum(ctx.workload, scanResultIndices(ctx.workload))
                 );
             case 'write': {
@@ -237,7 +242,7 @@ async function runIndexedDbWorkload(dbName: string, workload: WorkloadSpec): Pro
     ) {
         const prepared = requirePrepared(dbName);
         const db = requirePreparedDb(prepared, dbName);
-        const entries = requireValue(prepared.entries, 'entries', dbName);
+        const entries = requireValue('IndexedDB', prepared.entries, 'entries', dbName);
         if (workload.name === 'small_tx_1000_commits') {
             await smallTxCommits(db, entries, prepared.durability);
         } else {
@@ -254,7 +259,7 @@ async function runIndexedDbWorkload(dbName: string, workload: WorkloadSpec): Pro
     if (isRandomGetWorkload(workload.name)) {
         const prepared = requirePrepared(dbName);
         const db = requirePreparedDb(prepared, dbName);
-        const keys = requireValue(prepared.readKeys, 'read keys', dbName);
+        const keys = requireValue('IndexedDB', prepared.readKeys, 'read keys', dbName);
         const mode = readRequestMode(workload.name);
         if (mode === 'bulk') {
             throw new NotApplicableError('IndexedDB has no multi-key get; see the pipelined row.');
@@ -310,14 +315,7 @@ function requirePrepared(name: string): PreparedIndexedDbSample {
 }
 
 function requirePreparedDb(prepared: PreparedIndexedDbSample, name: string): IDBDatabase {
-    return requireValue(prepared.db, 'database', name);
-}
-
-function requireValue<T>(value: T | undefined, what: string, name: string): T {
-    if (value === undefined) {
-        throw new Error(`prepared IndexedDB ${what} missing for ${name}`);
-    }
-    return value;
+    return requireValue('IndexedDB', prepared.db, 'database', name);
 }
 
 async function openExistingDb(name: string): Promise<IndexedDbHandle> {
@@ -355,33 +353,6 @@ function deleteIndexedDb(name: string): Promise<void> {
         request.onerror = () => resolve();
         request.onblocked = () => resolve();
     });
-}
-
-function effectiveBatchSize(workload: WorkloadSpec): number {
-    if (isSingleTransactionInsertWorkload(workload.name)) {
-        return Math.min(10_000, workload.recordCount);
-    }
-    return Math.max(1, workload.batchSize);
-}
-
-function shouldUseSingleTransactionPreload(workload: WorkloadSpec): boolean {
-    return workload.recordCount >= 1_000_000;
-}
-
-function buildEntryBatches(workload: WorkloadSpec, count: number, batchSize: number): IdbEntry[][] {
-    const batches: IdbEntry[][] = [];
-    for (let start = 0; start < count; start += batchSize) {
-        const end = Math.min(start + batchSize, count);
-        const entries: IdbEntry[] = [];
-        for (let i = start; i < end; i += 1) {
-            entries.push([
-                keyBytes(i, workload.keySize),
-                valueBytes(i, workload.valueSize, workloadPolicy(workload).dataset.profile)
-            ]);
-        }
-        batches.push(entries);
-    }
-    return batches;
 }
 
 function transactionDone<T>(tx: IDBTransaction, label: string, result: () => T): Promise<T> {
