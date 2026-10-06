@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { link, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import ts from 'typescript';
 import {
     emitTranspiledModule,
+    fixtureEmitCacheDir,
     fixtureEmitCacheFile,
     fixtureEmitCacheKey,
     fixtureEmitStats,
@@ -24,6 +25,36 @@ function makeCountThen() {
         return (sourceFile) => ts.visitNode(sourceFile, visit);
     };
 }
+
+test('cache publication does not overwrite a precreated temporary-file hard link', async (t) => {
+    await mkdir(fixtureEmitCacheDir(), { recursive: true });
+    const outputDir = await mkdtemp(join(fixtureEmitCacheDir(), 'test-publish-'));
+    const sourceText = `export const marker = ${JSON.stringify(outputDir)};\n`;
+    const cacheFile = fixtureEmitCacheFile(sourceText, undefined);
+    const victim = join(outputDir, 'victim');
+    const timestamp = 1;
+    const temporary = `${cacheFile}.${process.pid}.${timestamp}.tmp`;
+    const originalNow = Date.now;
+    t.after(async () => {
+        Date.now = originalNow;
+        await rm(temporary, { force: true });
+        await rm(cacheFile, { force: true });
+        await rm(outputDir, { recursive: true, force: true });
+    });
+    await writeFile(victim, 'preserve this file', { flag: 'wx', mode: 0o600 });
+    await link(victim, temporary);
+    Date.now = () => timestamp;
+    await emitTranspiledModule({
+        name: 'published',
+        sourceText,
+        outputDir,
+        sourceRoot: outputDir,
+        reportErrors: 'throw'
+    });
+    assert.equal(await readFile(victim, 'utf8'), 'preserve this file');
+    assert.equal(await readFile(temporary, 'utf8'), 'preserve this file');
+    assert.equal(await readFile(cacheFile, 'utf8'), await readFile(join(outputDir, 'published.mjs'), 'utf8'));
+});
 
 test('cache key includes source, compiler options, and transformer tag', () => {
     const sourceText = 'export const marker = "plain";\n';

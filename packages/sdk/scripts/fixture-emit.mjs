@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { copyFile, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 
 const CACHE_VERSION = 1;
@@ -77,7 +77,7 @@ export function fixtureEmitCacheKey({ sourceText, compilerOptions, transformerTa
 }
 
 export function fixtureEmitCacheDir() {
-    return join(tmpdir(), 'moyodb-fixture-emit');
+    return fileURLToPath(new URL('../../../.tmp/fixture-emit/', import.meta.url));
 }
 
 export function fixtureEmitCacheFile(sourceText, transformers) {
@@ -102,13 +102,17 @@ async function copyCachedEmit(cacheFile, destination) {
 
 async function publishCachedEmit(cacheFile, emitted) {
     await mkdir(fixtureEmitCacheDir(), { recursive: true });
-    const temporary = `${cacheFile}.${process.pid}.${Date.now()}.tmp`;
-    await writeFile(temporary, emitted);
+    const directory = await mkdtemp(join(fixtureEmitCacheDir(), 'publish-'));
+    const temporary = join(directory, 'emitted');
     try {
-        await rename(temporary, cacheFile);
-    } catch (error) {
-        await rm(temporary, { force: true });
-        if (error?.code !== 'EEXIST' && error?.code !== 'EPERM') throw error;
+        await writeFile(temporary, emitted, { flag: 'wx', mode: 0o600 });
+        try {
+            await rename(temporary, cacheFile);
+        } catch (error) {
+            if (error?.code !== 'EEXIST' && error?.code !== 'EPERM') throw error;
+        }
+    } finally {
+        await rm(directory, { recursive: true, force: true });
     }
 }
 
