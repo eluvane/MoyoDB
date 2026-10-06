@@ -1,4 +1,4 @@
-import type { AutocommitCommand, IndexScanPage, WorkerApi } from './worker-api';
+import type { AutocommitCommand, IndexScanPage, WorkerApi, WorkerScanPage } from './worker-api';
 import type { BatchOp } from './types';
 import { isRecord } from './internal';
 
@@ -32,6 +32,8 @@ export const WORKER_COMMANDS = [
     'deleteMany',
     'applyBatch',
     'scan',
+    'scanPage',
+    'closeCursor',
     'getByIndex',
     'scanByIndex',
     'scanByIndexPage',
@@ -97,6 +99,7 @@ type PreparedWorkerCommandArgs<M extends WorkerCommand> = WorkerCommandArgs<M> |
 const PACKED_BINARY_LIST_V1 = 'moyodb:packed-binary-list:v1';
 const PACKED_NULLABLE_BINARY_LIST_V1 = 'moyodb:packed-nullable-binary-list:v1';
 const PACKED_SCAN_ROWS_V1 = 'moyodb:packed-scan-rows:v1';
+const PACKED_ENGINE_SCAN_ROWS_V1 = 'moyodb:packed-engine-scan-rows:v1';
 const PACKED_BATCH_OPS_V1 = 'moyodb:packed-batch-ops:v1';
 // Engine getMany format: u32 count | count x u32 length | concatenated values.
 // Integers are little-endian; u32::MAX marks a missing value. No repacking is needed.
@@ -119,6 +122,10 @@ interface PackedNullableBinaryListV1 {
 
 interface PackedScanRowsV1 {
     __moyodbPacked: typeof PACKED_SCAN_ROWS_V1;
+    bytes: Uint8Array;
+}
+export interface PackedEngineScanRowsV1 {
+    __moyodbPacked: typeof PACKED_ENGINE_SCAN_ROWS_V1;
     bytes: Uint8Array;
 }
 
@@ -529,6 +536,25 @@ export function prepareWorkerResponsePayload<M extends WorkerCommand>(
     command: M,
     result: WorkerCommandResult<M>
 ): { result: unknown; transfer: Transferable[] } {
+    if (
+        (command === 'scan' || command === 'scanByIndex') &&
+        (isPackedEngineScanRows(result) || isPackedScanRows(result))
+    ) {
+        return { result, transfer: collectDirectBinaryTransferable(result.bytes) };
+    }
+    if (command === 'scanPage') {
+        const page = result as WorkerScanPage;
+        if (isRecord(page) && (isPackedEngineScanRows(page.rows) || isPackedScanRows(page.rows))) {
+            return { result: page, transfer: collectDirectBinaryTransferable(page.rows.bytes) };
+        }
+        if (isRecord(page) && Array.isArray(page.rows)) {
+            const packed = packScanRows(page.rows);
+            return {
+                result: { ...page, rows: packed ?? page.rows },
+                transfer: packed ? [packed.bytes.buffer] : collectTransferablesForValue(page.rows)
+            };
+        }
+    }
     if (command === 'getMany' && isPackedOptionalValues(result)) {
         return {
             result,
@@ -538,6 +564,9 @@ export function prepareWorkerResponsePayload<M extends WorkerCommand>(
 
     if (command === 'scanByIndexPage') {
         const page = result as WorkerCommandResult<'scanByIndexPage'>;
+        if (isRecord(page) && isPackedScanRows(page.rows)) {
+            return { result: page, transfer: collectTransferablesForValue(page) };
+        }
         if (isRecord(page) && Array.isArray(page.rows)) {
             const packed = page.rows.length > 0 ? packScanRows(page.rows) : null;
             const response: PackedIndexScanPage = { rows: packed ?? page.rows, cursor: page.cursor };
@@ -609,6 +638,40 @@ export function decodeWorkerResponsePayload<M extends WorkerCommand>(
     command: M,
     result: unknown
 ): WorkerCommandResult<M> {
+    if (command === 'scanPage') {
+        if (
+            !isRecord(result) ||
+            typeof result.done !== 'boolean' ||
+            typeof result.bytes !== 'number' ||
+            !Number.isSafeInteger(result.bytes) ||
+            result.bytes < 4 ||
+            (result.cursorId !== undefined &&
+                (typeof result.cursorId !== 'number' ||
+                    !Number.isSafeInteger(result.cursorId) ||
+                    result.cursorId <= 0)) ||
+            (result.done ? result.cursorId !== undefined : result.cursorId === undefined)
+        ) {
+            throw workerProtocolError('WorkerProtocolError', 'invalid scan page response');
+        }
+        const rows = isPackedEngineScanRows(result.rows)
+            ? unpackPackedScanRows(result.rows.bytes)
+            : isPackedScanRows(result.rows)
+              ? unpackScanRows(result.rows)
+              : result.rows;
+        if (!Array.isArray(rows)) throw workerProtocolError('WorkerProtocolError', 'invalid scan page rows');
+        let bytes = 4;
+        for (const row of rows) {
+            if (!isRecord(row) || !(row.key instanceof Uint8Array) || !(row.value instanceof Uint8Array)) {
+                throw workerProtocolError('WorkerProtocolError', 'invalid scan page row');
+            }
+            bytes += 8 + row.key.byteLength + row.value.byteLength;
+        }
+        if (bytes !== result.bytes) throw workerProtocolError('WorkerProtocolError', 'scan page byte count mismatch');
+        return { rows, cursorId: result.cursorId, done: result.done, bytes: result.bytes } as WorkerCommandResult<M>;
+    }
+    if ((command === 'scan' || command === 'scanByIndex') && isPackedEngineScanRows(result)) {
+        return unpackPackedScanRows(result.bytes) as WorkerCommandResult<M>;
+    }
     if (command === 'getMany' && isPackedNullableBinaryList(result)) {
         return unpackNullableBinaryList(result);
     }
@@ -642,6 +705,40 @@ export function decodeWorkerResponsePayload<M extends WorkerCommand>(
     }
 
     return result;
+}
+export function packedScanRows(bytes: Uint8Array): PackedEngineScanRowsV1 {
+    return { __moyodbPacked: PACKED_ENGINE_SCAN_ROWS_V1, bytes };
+}
+function isPackedEngineScanRows(value: unknown): value is PackedEngineScanRowsV1 {
+    return isRecord(value) && value.__moyodbPacked === PACKED_ENGINE_SCAN_ROWS_V1 && value.bytes instanceof Uint8Array;
+}
+export function unpackPackedScanRows(bytes: Uint8Array): Array<{ key: Uint8Array; value: Uint8Array }> {
+    if (!(bytes instanceof Uint8Array) || bytes.byteLength < 4) {
+        throw workerProtocolError('WorkerProtocolError', 'invalid engine scan packet');
+    }
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const count = view.getUint32(0, true);
+    if (count > (bytes.byteLength - 4) / 8) {
+        throw workerProtocolError('WorkerProtocolError', 'engine scan row count exceeds packet length');
+    }
+    const rows = new Array<{ key: Uint8Array; value: Uint8Array }>(count);
+    let offset = 4;
+    for (let index = 0; index < count; index += 1) {
+        if (offset + 8 > bytes.byteLength)
+            throw workerProtocolError('WorkerProtocolError', 'truncated engine scan row');
+        const keyLength = view.getUint32(offset, true);
+        const valueLength = view.getUint32(offset + 4, true);
+        const keyStart = offset + 8;
+        const valueStart = keyStart + keyLength;
+        const end = valueStart + valueLength;
+        if (end > bytes.byteLength)
+            throw workerProtocolError('WorkerProtocolError', 'engine scan row exceeds packet length');
+        rows[index] = { key: bytes.subarray(keyStart, valueStart), value: bytes.subarray(valueStart, end) };
+        offset = end;
+    }
+    if (offset !== bytes.byteLength)
+        throw workerProtocolError('WorkerProtocolError', 'engine scan packet has trailing bytes');
+    return rows;
 }
 
 export function collectTransferablesForValue(value: unknown): Transferable[] {

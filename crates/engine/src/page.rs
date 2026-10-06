@@ -7,6 +7,7 @@ use crate::layout::{
     unsafe_read_struct, PageHeader, PageKind, ValueKind, INLINE_VALUE_LIMIT,
     PAGE_HEADER_CHECKSUM_OFFSET, PAGE_HEADER_SIZE, PAGE_MAGIC, PAGE_SIZE,
 };
+use crate::payload::decode_payload_descriptor;
 use crate::prepared_value::ValueParts;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -189,6 +190,9 @@ pub(crate) fn decode_leaf_cell_ref<'a>(bytes: &'a [u8], slot: usize) -> Result<L
                     "overflow leaf cell has zero total length".into(),
                 ));
             }
+        }
+        ValueKind::External => {
+            decode_payload_descriptor(overflow_head_page_id, total_value_len, inline_value)?;
         }
     }
     Ok(LeafCellRef {
@@ -457,6 +461,13 @@ pub fn should_overflow_value(value_len: usize) -> bool {
 }
 
 fn encode_leaf_cell_into(dst: &mut [u8], cell: &LeafCell) -> Result<()> {
+    if cell.value_kind == ValueKind::External {
+        decode_payload_descriptor(
+            cell.overflow_head_page_id,
+            cell.total_value_len,
+            &cell.value,
+        )?;
+    }
     let key_len = cell.key.len();
     let use_overflow = cell.value_kind == ValueKind::Overflow;
     let inline_value = if use_overflow {

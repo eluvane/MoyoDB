@@ -21,6 +21,8 @@ pub enum EngineError {
         snapshot_txid: u64,
         current_txid: u64,
     },
+    #[error("transaction conflict: primary value revision changed")]
+    ValueRevisionConflict,
     #[error("readonly transaction cannot commit")]
     ReadonlyTransaction,
     #[error("transaction is already closed")]
@@ -61,6 +63,7 @@ impl EngineError {
             EngineError::StoreNotFound(_) => "StoreNotFoundError",
             EngineError::WriteTransactionAlreadyOpen => "WriteTransactionAlreadyOpenError",
             EngineError::TransactionConflict { .. } => "TransactionConflictError",
+            EngineError::ValueRevisionConflict => "TransactionConflictError",
             EngineError::ReadonlyTransaction => "ReadonlyTransactionError",
             EngineError::TransactionClosed => "TransactionClosedError",
             EngineError::ValueTooLarge(_) => "ValueTooLargeError",

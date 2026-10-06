@@ -7,9 +7,41 @@ use std::collections::{HashMap, VecDeque};
 // Limit the copy buffer while reducing native and OPFS backend calls.
 pub(crate) const PAGE_WRITE_BATCH_PAGES: usize = 64;
 
+const PAGE_READ_WINDOW_PAGES: usize = 64;
+
 // Checkpoint pages are already pinned, so use a larger write buffer.
 // Recovery also holds read buffers and uses the smaller batch limit.
 const DIRTY_PAGE_WRITE_BATCH_PAGES: usize = 1024;
+
+/// Keep one window per traversal, without intervening pager writes.
+#[derive(Debug)]
+pub(crate) struct PageReadWindow {
+    start_page_id: u64,
+    bytes: Vec<u8>,
+    max_pages: usize,
+}
+
+impl PageReadWindow {
+    pub(crate) fn new(max_pages: usize) -> Self {
+        Self {
+            start_page_id: 0,
+            bytes: Vec::new(),
+            max_pages: max_pages.clamp(1, PAGE_READ_WINDOW_PAGES),
+        }
+    }
+
+    fn page(&self, page_id: u64) -> Option<&[u8]> {
+        let index = usize::try_from(page_id.checked_sub(self.start_page_id)?).ok()?;
+        let start = index.checked_mul(PAGE_SIZE)?;
+        self.bytes.get(start..start.checked_add(PAGE_SIZE)?)
+    }
+}
+
+impl Default for PageReadWindow {
+    fn default() -> Self {
+        Self::new(PAGE_READ_WINDOW_PAGES)
+    }
+}
 
 #[derive(Debug)]
 struct CacheEntry {
@@ -18,8 +50,8 @@ struct CacheEntry {
     dirty: bool,
 }
 
-// Main-file reads are verified once: checksum plus cell structure. Image-write
-// callers must supply valid bytes, because cached images bypass both checks.
+// Cached main-file pages are verified on load: checksum plus cell structure.
+// Image-write callers supply valid bytes, because cached images bypass both checks.
 #[derive(Debug)]
 pub struct Pager<B: FileBackend> {
     main: B,
@@ -66,6 +98,16 @@ impl<B: FileBackend> Pager<B> {
         self.page_limit = next_page_id.max(1);
     }
 
+    pub(crate) fn validate_page_range(&self, start: u64, end: u64) -> Result<()> {
+        if start == 0 || start >= end || end > self.page_limit {
+            return Err(EngineError::Corruption(format!(
+                "page range {start}..{end} is beyond the allocated range (next page id {})",
+                self.page_limit
+            )));
+        }
+        Ok(())
+    }
+
     pub fn read_page(&mut self, page_id: u64) -> Result<Vec<u8>> {
         self.with_page(page_id, |bytes| Ok(bytes.to_vec()))
     }
@@ -109,6 +151,55 @@ impl<B: FileBackend> Pager<B> {
         self.main.write_at(page_offset(page_id), bytes)?;
         self.store_cached_page(page_id, bytes.to_vec(), false);
         Ok(())
+    }
+
+    pub(crate) fn with_page_no_fill<R>(
+        &mut self,
+        page_id: u64,
+        window: &mut PageReadWindow,
+        f: impl FnOnce(&[u8]) -> Result<R>,
+    ) -> Result<R> {
+        if page_id == 0 {
+            return Err(EngineError::Corruption("page id 0 is invalid".into()));
+        }
+        if let Some(entry) = self.cache.get(&page_id) {
+            return f(&entry.bytes);
+        }
+        if page_id >= self.page_limit {
+            return Err(EngineError::Corruption(format!(
+                "page id {page_id} is beyond the allocated range (next page id {})",
+                self.page_limit
+            )));
+        }
+        if let Some(bytes) = window.page(page_id) {
+            // Neighbor images are checked only when the traversal selects them.
+            let header = verify_page_image(bytes, page_id)?;
+            validate_tree_page(bytes, &header)?;
+            return f(bytes);
+        }
+        let file_pages = self.main.len()? / PAGE_SIZE as u64;
+        if page_id > file_pages {
+            return Err(EngineError::Corruption(format!(
+                "page id {page_id} is not contained in the main file"
+            )));
+        }
+        let page_count = (file_pages - page_id + 1)
+            .min(self.page_limit - page_id)
+            .min(window.max_pages as u64) as usize;
+        let offset = page_offset(page_id);
+        let mut bytes = match self.main.read_at(offset, page_count * PAGE_SIZE) {
+            Ok(bytes) => bytes,
+            // An unreadable neighbor must not fail the selected page.
+            Err(_) if page_count > 1 => self.main.read_at(offset, PAGE_SIZE)?,
+            Err(err) => return Err(err),
+        };
+        bytes.truncate(page_count * PAGE_SIZE);
+        let selected = bytes.get(..PAGE_SIZE).unwrap_or(&bytes);
+        let header = verify_page_image(selected, page_id)?;
+        validate_tree_page(selected, &header)?;
+        window.start_page_id = page_id;
+        window.bytes = bytes;
+        f(&window.bytes[..PAGE_SIZE])
     }
 
     // Callers supply verified or freshly encoded images and flush before publication.
@@ -176,6 +267,28 @@ impl<B: FileBackend> Pager<B> {
 
     pub(crate) fn dirty_page_count(&self) -> usize {
         self.dirty_count
+    }
+
+    // Dirty generations identify staged images across page-id reuse.
+    pub(crate) fn dirty_page_generation(&self, page_id: u64) -> Option<u64> {
+        self.cache
+            .get(&page_id)
+            .filter(|entry| entry.dirty)
+            .map(|entry| entry.generation)
+    }
+
+    pub(crate) fn discard_dirty_page_if_generation(
+        &mut self,
+        page_id: u64,
+        generation: u64,
+    ) -> bool {
+        if self.dirty_page_generation(page_id) != Some(generation) {
+            return false;
+        }
+        self.cache.remove(&page_id);
+        self.dirty_count -= 1;
+        self.compact_lru_if_needed();
+        true
     }
 
     pub(crate) fn write_back_dirty(&mut self) -> Result<()> {
@@ -275,10 +388,11 @@ impl<B: FileBackend> Pager<B> {
             }
             entry.dirty = dirty;
             if dirty {
-                // Old clean queue records must not match the new dirty entry.
-                entry.generation = 0;
+                entry.generation = self.next_generation;
+                self.next_generation = self.next_generation.wrapping_add(1).max(1);
             }
             self.touch(page_id);
+            self.evict_if_needed(page_id);
             return;
         }
         self.insert_cache(page_id, bytes, dirty);
@@ -288,7 +402,7 @@ impl<B: FileBackend> Pager<B> {
         if dirty {
             self.dirty_count += 1;
         }
-        let generation = if dirty { 0 } else { self.bump_generation() };
+        let generation = self.bump_generation();
         self.cache.insert(
             page_id,
             CacheEntry {
@@ -300,7 +414,6 @@ impl<B: FileBackend> Pager<B> {
         if !dirty {
             self.lru.push_back((page_id, generation));
         }
-        // Protect a freshly loaded clean page when dirty pins exceed the budget.
         self.evict_if_needed(page_id);
         self.compact_lru_if_needed();
     }
@@ -325,7 +438,7 @@ impl<B: FileBackend> Pager<B> {
     }
 
     fn evict_if_needed(&mut self, protected_page_id: u64) {
-        while self.cache.len() > self.cache_pages {
+        while self.cache.len() - self.dirty_count > self.cache_pages {
             let Some((old_page_id, old_generation)) = self.lru.pop_front() else {
                 break;
             };
@@ -338,8 +451,6 @@ impl<B: FileBackend> Pager<B> {
                 _ => continue,
             }
             if old_page_id == protected_page_id {
-                // This is the newest clean entry; no older candidates remain.
-                // Keep it readable even when dirty pins exceed the budget.
                 self.lru.push_back((old_page_id, old_generation));
                 break;
             }
@@ -368,19 +479,36 @@ impl<B: FileBackend> Pager<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::page::encode_leaf_page;
+    use crate::layout::ValueKind;
+    use crate::page::{encode_leaf_page, LeafCell};
     use crate::storage::memory::MemoryBackend;
+    use std::cell::RefCell;
 
     #[derive(Default)]
     struct RecordingBackend {
         inner: MemoryBackend,
+        reads: RefCell<Vec<(u64, usize)>>,
         writes: Vec<(u64, usize)>,
+        fail_read: Option<usize>,
         fail_write: Option<usize>,
+        fail_range_read: bool,
+        fail_len: bool,
+        short_read: bool,
     }
 
     impl FileBackend for RecordingBackend {
         fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
-            self.inner.read_at(offset, len)
+            self.reads.borrow_mut().push((offset, len));
+            if self.fail_read == Some(self.reads.borrow().len())
+                || (self.fail_range_read && len > PAGE_SIZE)
+            {
+                return Err(EngineError::Storage("injected page read failure".into()));
+            }
+            let mut bytes = self.inner.read_at(offset, len)?;
+            if self.short_read {
+                bytes.truncate(PAGE_SIZE - 1);
+            }
+            Ok(bytes)
         }
 
         fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
@@ -397,6 +525,9 @@ mod tests {
         }
 
         fn len(&self) -> Result<u64> {
+            if self.fail_len {
+                return Err(EngineError::Storage("injected page length failure".into()));
+            }
             self.inner.len()
         }
 
@@ -526,6 +657,328 @@ mod tests {
         assert_eq!(pager.read_page(3)?.len(), PAGE_SIZE);
         assert_eq!(pager.read_page(1)?.len(), PAGE_SIZE);
         assert_eq!(pager.read_page(2)?.len(), PAGE_SIZE);
+        Ok(())
+    }
+
+    #[test]
+    fn dirty_pins_preserve_the_clean_read_cache_budget() -> Result<()> {
+        let mut pager = Pager::new(RecordingBackend::default(), 4);
+        for page_id in 1..=8 {
+            pager
+                .main
+                .write_at(page_offset(page_id), &encode_leaf_page(page_id, 0, 0, &[])?)?;
+        }
+        for page_id in 1..=4 {
+            pager.read_page(page_id)?;
+        }
+        assert_eq!(pager.main.reads.borrow().len(), 4);
+        for page_id in 9..=24 {
+            pager.stage_page_image(page_id, encode_leaf_page(page_id, 0, 0, &[])?)?;
+        }
+        assert_eq!(pager.lru_entries_examined, 0);
+        for page_id in 1..=4 {
+            pager.read_page(page_id)?;
+        }
+        assert_eq!(pager.main.reads.borrow().len(), 4);
+        assert_eq!(pager.dirty_page_count(), 16);
+        assert_eq!(pager.cache.len(), 20);
+        for page_id in 5..=8 {
+            pager.read_page(page_id)?;
+        }
+        for page_id in 5..=8 {
+            pager.read_page(page_id)?;
+        }
+        assert_eq!(pager.main.reads.borrow().len(), 8);
+        assert_eq!(pager.cache.len() - pager.dirty_page_count(), 4);
+        assert!(pager.lru_entries_examined <= 8);
+        pager.write_back_dirty()?;
+        pager.flush()?;
+        pager.mark_dirty_clean();
+        assert_eq!(pager.dirty_page_count(), 0);
+        assert_eq!(pager.cache.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn replacing_a_dirty_image_keeps_the_clean_budget_bounded() -> Result<()> {
+        let mut pager = Pager::new(RecordingBackend::default(), 2);
+        for page_id in 1..=4 {
+            pager.stage_page_image(page_id, encode_leaf_page(page_id, 0, 0, &[])?)?;
+        }
+        for page_id in 5..=6 {
+            pager.write_page_image(page_id, &encode_leaf_page(page_id, 0, 0, &[])?)?;
+        }
+        pager.write_page_image(1, &encode_leaf_page(1, 0, 0, &[])?)?;
+        assert_eq!(pager.dirty_page_count(), 3);
+        assert_eq!(pager.cache.len() - pager.dirty_page_count(), 2);
+        assert!(pager.cache.get(&1).is_some_and(|entry| !entry.dirty));
+        for page_id in 2..=4 {
+            assert!(pager.cache.get(&page_id).is_some_and(|entry| entry.dirty));
+        }
+        pager.write_back_dirty()?;
+        pager.mark_dirty_clean();
+        assert_eq!(pager.cache.len(), 2);
+        assert_eq!(pager.dirty_page_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn no_fill_windows_bound_reads_and_preserve_the_hot_cache() -> Result<()> {
+        let mut pager = Pager::new(RecordingBackend::default(), 4);
+        for page_id in 1..=70 {
+            pager
+                .main
+                .write_at(page_offset(page_id), &encode_leaf_page(page_id, 0, 0, &[])?)?;
+        }
+        for page_id in 1..=4 {
+            pager.read_page(page_id)?;
+        }
+        pager.main.reads.borrow_mut().clear();
+        let generation = pager.next_generation;
+        let lru = pager.lru.clone();
+        let mut window = PageReadWindow::new(usize::MAX);
+        for page_id in 5..=70 {
+            pager.with_page_no_fill(page_id, &mut window, |bytes| {
+                assert_eq!(bytes, encode_leaf_page(page_id, 0, 0, &[])?);
+                Ok(())
+            })?;
+        }
+        assert_eq!(
+            *pager.main.reads.borrow(),
+            [
+                (page_offset(5), 64 * PAGE_SIZE),
+                (page_offset(69), 2 * PAGE_SIZE),
+            ]
+        );
+        assert_eq!(pager.cache.len(), 4);
+        assert_eq!(pager.next_generation, generation);
+        assert_eq!(pager.lru, lru);
+        for page_id in 1..=4 {
+            pager.read_page(page_id)?;
+        }
+        assert_eq!(pager.main.reads.borrow().len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn no_fill_windows_respect_allocated_and_physical_page_limits() -> Result<()> {
+        let mut pager = Pager::new(RecordingBackend::default(), 4);
+        for page_id in 1..=70 {
+            pager
+                .main
+                .write_at(page_offset(page_id), &encode_leaf_page(page_id, 0, 0, &[])?)?;
+        }
+        pager.set_page_limit(11);
+        let mut window = PageReadWindow::default();
+        pager.with_page_no_fill(5, &mut window, |_| Ok(()))?;
+        pager.with_page_no_fill(10, &mut window, |_| Ok(()))?;
+        assert!(matches!(
+            pager.with_page_no_fill(11, &mut window, |_| Ok(())),
+            Err(EngineError::Corruption(_))
+        ));
+        assert_eq!(
+            *pager.main.reads.borrow(),
+            [(page_offset(5), 6 * PAGE_SIZE)]
+        );
+        pager.set_page_limit(73);
+        pager
+            .main
+            .write_at(page_offset(71), &vec![0; PAGE_SIZE / 2])?;
+        pager.with_page_no_fill(69, &mut window, |_| Ok(()))?;
+        assert!(matches!(
+            pager.with_page_no_fill(71, &mut window, |_| Ok(())),
+            Err(EngineError::Corruption(_))
+        ));
+        assert_eq!(
+            *pager.main.reads.borrow(),
+            [
+                (page_offset(5), 6 * PAGE_SIZE),
+                (page_offset(69), 2 * PAGE_SIZE),
+            ]
+        );
+        pager.set_page_limit(1);
+        pager.stage_page_image(72, encode_leaf_page(72, 0, 0, &[])?)?;
+        pager.with_page_no_fill(72, &mut window, |_| Ok(()))?;
+        assert!(matches!(
+            pager.with_page_no_fill(0, &mut window, |_| Ok(())),
+            Err(EngineError::Corruption(_))
+        ));
+        assert_eq!(pager.main.reads.borrow().len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn no_fill_reads_use_current_cached_images_before_prefetched_bytes() -> Result<()> {
+        let mut pager = Pager::new(RecordingBackend::default(), 4);
+        for page_id in 1..=3 {
+            pager
+                .main
+                .write_at(page_offset(page_id), &encode_leaf_page(page_id, 0, 0, &[])?)?;
+        }
+        let mut window = PageReadWindow::default();
+        pager.with_page_no_fill(1, &mut window, |_| Ok(()))?;
+        let dirty_image = encode_leaf_page(2, 0, 99, &[])?;
+        let clean_image = encode_leaf_page(3, 0, 88, &[])?;
+        pager.stage_page_image(2, dirty_image.clone())?;
+        pager.write_page_image(3, &clean_image)?;
+        let dirty_generation = pager.dirty_page_generation(2);
+        let generation = pager.next_generation;
+        let lru = pager.lru.clone();
+        pager.with_page_no_fill(2, &mut window, |bytes| {
+            assert_eq!(bytes, dirty_image);
+            Ok(())
+        })?;
+        pager.with_page_no_fill(3, &mut window, |bytes| {
+            assert_eq!(bytes, clean_image);
+            Ok(())
+        })?;
+        assert_eq!(pager.dirty_page_generation(2), dirty_generation);
+        assert_eq!(pager.next_generation, generation);
+        assert_eq!(pager.lru, lru);
+        assert_eq!(pager.main.reads.borrow().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn no_fill_reads_validate_only_selected_pages() -> Result<()> {
+        let mut pager = Pager::new(RecordingBackend::default(), 4);
+        for page_id in 1..=4 {
+            let mut image = encode_leaf_page(page_id, 0, 0, &[])?;
+            if page_id == 2 {
+                image[100] ^= 0xff;
+            } else if page_id == 4 {
+                let cell = LeafCell {
+                    key: b"duplicate".to_vec(),
+                    value: vec![1],
+                    value_kind: ValueKind::Inline,
+                    total_value_len: 1,
+                    overflow_head_page_id: 0,
+                };
+                image = encode_leaf_page(page_id, 0, 0, &[cell.clone(), cell])?;
+                assert!(verify_page_image(&image, page_id).is_ok());
+            }
+            pager.main.write_at(page_offset(page_id), &image)?;
+        }
+        let mut window = PageReadWindow::default();
+        pager.with_page_no_fill(1, &mut window, |_| Ok(()))?;
+        pager.with_page_no_fill(3, &mut window, |_| Ok(()))?;
+        assert!(matches!(
+            pager.with_page_no_fill(2, &mut window, |_| Ok(())),
+            Err(EngineError::Corruption(_))
+        ));
+        assert!(matches!(
+            pager.with_page_no_fill(4, &mut window, |_| Ok(())),
+            Err(EngineError::Corruption(_))
+        ));
+        assert_eq!(pager.main.reads.borrow().len(), 1);
+        assert!(pager.cache.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_no_fill_reads_preserve_the_window_and_retry() -> Result<()> {
+        let mut pager = Pager::new(RecordingBackend::default(), 4);
+        for page_id in 1..=65 {
+            pager
+                .main
+                .write_at(page_offset(page_id), &encode_leaf_page(page_id, 0, 0, &[])?)?;
+        }
+        let mut window = PageReadWindow::default();
+        pager.with_page_no_fill(1, &mut window, |_| Ok(()))?;
+        pager.main.fail_len = true;
+        assert!(matches!(
+            pager.with_page_no_fill(65, &mut window, |_| Ok(())),
+            Err(EngineError::Storage(_))
+        ));
+        assert_eq!(pager.main.reads.borrow().len(), 1);
+        pager.main.fail_len = false;
+        pager.main.fail_read = Some(2);
+        assert!(matches!(
+            pager.with_page_no_fill(65, &mut window, |_| Ok(())),
+            Err(EngineError::Storage(_))
+        ));
+        pager.with_page_no_fill(1, &mut window, |_| Ok(()))?;
+        assert_eq!(pager.main.reads.borrow().len(), 2);
+        pager.main.fail_read = None;
+        pager.main.short_read = true;
+        assert!(matches!(
+            pager.with_page_no_fill(65, &mut window, |_| Ok(())),
+            Err(EngineError::Corruption(_))
+        ));
+        assert_eq!(window.start_page_id, 1);
+        assert_eq!(window.bytes.len(), 64 * PAGE_SIZE);
+        pager.main.short_read = false;
+        pager.with_page_no_fill(65, &mut window, |_| Ok(()))?;
+        assert_eq!(pager.main.reads.borrow().len(), 4);
+        assert!(pager.cache.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn no_fill_range_failures_retry_only_the_selected_page() -> Result<()> {
+        let mut pager = Pager::new(RecordingBackend::default(), 4);
+        for page_id in 1..=3 {
+            pager
+                .main
+                .write_at(page_offset(page_id), &encode_leaf_page(page_id, 0, 0, &[])?)?;
+        }
+        pager.main.fail_range_read = true;
+        pager.main.fail_read = Some(2);
+        let mut window = PageReadWindow::default();
+        assert!(matches!(
+            pager.with_page_no_fill(1, &mut window, |_| Ok(())),
+            Err(EngineError::Storage(_))
+        ));
+        assert!(window.bytes.is_empty());
+        pager.main.fail_read = None;
+        pager.with_page_no_fill(1, &mut window, |_| Ok(()))?;
+        assert_eq!(window.bytes.len(), PAGE_SIZE);
+        assert_eq!(
+            *pager.main.reads.borrow(),
+            [
+                (page_offset(1), 3 * PAGE_SIZE),
+                (page_offset(1), PAGE_SIZE),
+                (page_offset(1), 3 * PAGE_SIZE),
+                (page_offset(1), PAGE_SIZE),
+            ]
+        );
+        let mut prefix_window = PageReadWindow::new(0);
+        pager.with_page_no_fill(2, &mut prefix_window, |_| Ok(()))?;
+        assert_eq!(
+            pager.main.reads.borrow().last(),
+            Some(&(page_offset(2), PAGE_SIZE))
+        );
+        assert!(pager.cache.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn retired_dirty_generations_cannot_discard_reused_page_ids() -> Result<()> {
+        let mut pager = Pager::new(RecordingBackend::default(), 2);
+        pager.stage_page_image(1, encode_leaf_page(1, 0, 0, &[])?)?;
+        let retired_generation = pager.dirty_page_generation(1).ok_or_else(|| {
+            EngineError::Internal("retired dirty page generation is missing".into())
+        })?;
+        assert_ne!(retired_generation, 0);
+        pager.read_page(1)?;
+        assert_eq!(pager.dirty_page_generation(1), Some(retired_generation));
+        pager.stage_page_image(1, encode_leaf_page(1, 0, 2, &[])?)?;
+        let current_generation = pager.dirty_page_generation(1).ok_or_else(|| {
+            EngineError::Internal("current dirty page generation is missing".into())
+        })?;
+        assert_ne!(current_generation, retired_generation);
+        assert!(!pager.discard_dirty_page_if_generation(1, retired_generation));
+        assert_eq!(pager.dirty_page_count(), 1);
+        assert!(pager.discard_dirty_page_if_generation(1, current_generation));
+        assert_eq!(pager.dirty_page_count(), 0);
+        assert!(!pager.discard_dirty_page_if_generation(1, current_generation));
+        pager.stage_page_image(1, encode_leaf_page(1, 0, 3, &[])?)?;
+        assert!(!pager.discard_dirty_page_if_generation(1, current_generation));
+        pager.write_page_image(1, &encode_leaf_page(1, 0, 4, &[])?)?;
+        assert_eq!(pager.dirty_page_generation(1), None);
+        assert!(!pager.discard_dirty_page_if_generation(1, current_generation));
+        assert_eq!(pager.dirty_page_count(), 0);
+        assert_eq!(pager.cache.len(), 1);
         Ok(())
     }
 

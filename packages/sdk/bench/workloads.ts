@@ -1,7 +1,42 @@
-import type { BenchProfile, WorkloadSpec } from './types';
+import type { BenchCompression, BenchPolicy, BenchProfile, DatasetProfile, WorkloadSpec } from './types';
 
 export const STORE_NAME = 'kv';
 export const OPFS_DIAGNOSTIC_BYTES = 100 * 1024 * 1024;
+export const DATASET_SEED = 0x5eed2026;
+// The dataset test checks these values against the SDK codec policy.
+const COMPRESSION_TUNING: BenchPolicy['compressionTuning'] = {
+    algorithm: 'snappy-raw-block',
+    algorithmVersion: 2,
+    thresholdBytes: 1024,
+    minimumSavingPercent: 10,
+    envelopeBytes: 18,
+    sampling: {
+        minimumInputBytes: 65_536,
+        windowBytes: 1024,
+        windowCount: 3,
+        positioning: 'start-middle-end',
+        profitability: 'aggregate-size-plus-one-envelope'
+    }
+};
+export const DATASET_PROFILES: DatasetProfile[] = [
+    'lcg-repeat-256',
+    'high-entropy-binary',
+    'realistic-json',
+    'realistic-text',
+    'precompressed'
+];
+
+export function workloadPolicy(spec: WorkloadSpec): BenchPolicy {
+    return (
+        spec.policy ?? {
+            dataset: { profile: 'lcg-repeat-256', version: 1, seed: 0 },
+            compression: false,
+            compressionTuning: { ...COMPRESSION_TUNING, sampling: { ...COMPRESSION_TUNING.sampling } },
+            changeFeed: { enabled: true, retainTxids: 100_000 },
+            timing: 'run-callback-only-v1'
+        }
+    );
+}
 
 export const WORKLOADS: WorkloadSpec[] = [
     workload(
@@ -671,6 +706,52 @@ export const WORKLOADS: WorkloadSpec[] = [
     )
 ];
 
+for (const profile of DATASET_PROFILES) {
+    for (const size of [1023, 1024, 1025, 4033, 4066, 65_536, 1_048_576]) {
+        for (const compression of [false, 'snappy'] as const) {
+            WORKLOADS.push(datasetWorkload(profile, size, compression));
+        }
+    }
+}
+for (const compression of [false, 'snappy'] as const) {
+    WORKLOADS.push(datasetWorkload('high-entropy-binary', 65_536, compression, false));
+}
+
+export function datasetWorkload(
+    profile: DatasetProfile,
+    size: number,
+    compression: BenchCompression,
+    feed = true
+): WorkloadSpec {
+    const recordCount = size >= 1_048_576 ? 16 : 256;
+    const batchSize = size >= 1_048_576 ? 4 : 64;
+    return {
+        name: `large_value_${profile.replaceAll('-', '_')}_${size}b_${compression === false ? 'raw' : compression}${feed ? '' : '_feed_off'}`,
+        recordCount,
+        keySize: 16,
+        valueSize: size,
+        batchSize,
+        transactionBoundaries: `${recordCount / batchSize} readwrite transactions; ${batchSize} values per transaction`,
+        warmupCount: 1,
+        sampleCount: 3,
+        notes: `Dataset ${profile}; explicit ${compression === false ? 'raw' : compression} store codec; generation, verification and close/checkpoint excluded from run time. Compression ratio is a storage metric, not a speed measurement.`,
+        supports: ['moyodb', 'indexeddb'],
+        smoke: false,
+        tags: ['write', 'dataset', 'manual'],
+        policy: {
+            dataset: {
+                profile,
+                version: 1,
+                seed: profile === 'high-entropy-binary' || profile === 'precompressed' ? DATASET_SEED : 0
+            },
+            compression,
+            compressionTuning: { ...COMPRESSION_TUNING, sampling: { ...COMPRESSION_TUNING.sampling } },
+            changeFeed: { enabled: feed, retainTxids: 100_000 },
+            timing: 'run-callback-only-v1'
+        }
+    };
+}
+
 function workload(
     name: string,
     recordCount: number,
@@ -685,7 +766,7 @@ function workload(
     supports: WorkloadSpec['supports'],
     tags: string[] = []
 ): WorkloadSpec {
-    return {
+    const spec: WorkloadSpec = {
         name,
         recordCount,
         keySize,
@@ -699,6 +780,9 @@ function workload(
         supports,
         tags
     };
+    spec.policy = workloadPolicy(spec);
+    spec.notes += ' Dataset: lcg-repeat-256 (compressible 256-byte period); explicit raw store codec.';
+    return spec;
 }
 
 export function selectWorkloads(profile: BenchProfile, workloadNames?: string[]): WorkloadSpec[] {
@@ -742,14 +826,92 @@ export function keyBytes(index: number, keySize: number): Uint8Array<ArrayBuffer
     return new TextEncoder().encode(keyString(index, keySize));
 }
 
-export function valueBytes(index: number, valueSize: number): Uint8Array {
+export function valueBytes(index: number, valueSize: number, profile: DatasetProfile = 'lcg-repeat-256'): Uint8Array {
+    if (!Number.isSafeInteger(valueSize) || valueSize < 0) throw new RangeError('invalid benchmark value size');
+    if (!DATASET_PROFILES.includes(profile)) throw new TypeError('unknown benchmark dataset profile');
+    if (profile === 'realistic-json' || profile === 'realistic-text') return textValue(index, valueSize, profile);
+    if (profile === 'precompressed') return gzipEntropyValue(index, valueSize);
     const value = new Uint8Array(valueSize);
-    let state = (index + 1) >>> 0;
+    let state =
+        profile === 'high-entropy-binary' ? ((index + 1) ^ DATASET_SEED) >>> 0 || 0x9e3779b9 : (index + 1) >>> 0;
     for (let i = 0; i < value.length; i += 1) {
-        state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
-        value[i] = state & 0xff;
+        if (profile === 'high-entropy-binary') {
+            state ^= state << 13;
+            state ^= state >>> 17;
+            state ^= state << 5;
+            value[i] = state >>> 24;
+        } else {
+            state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+            value[i] = state & 0xff;
+        }
     }
     return value;
+}
+
+const TEXT_ENCODER = new TextEncoder();
+const TEXT_SENTENCES = [
+    'The customer updated the delivery address and confirmed the order. ',
+    'The inventory service recorded the shipment and notified the support team. ',
+    'This event is retained for audit review and offline synchronization. '
+];
+
+function textValue(index: number, size: number, profile: 'realistic-json' | 'realistic-text'): Uint8Array {
+    const prefix =
+        profile === 'realistic-json'
+            ? JSON.stringify({
+                  id: index,
+                  status: index % 3 === 0 ? 'pending' : 'complete',
+                  total: (index % 10_000) / 100,
+                  body: ''
+              })
+            : `Order ${index}: ${TEXT_SENTENCES[index % TEXT_SENTENCES.length]}`;
+    const minimum = profile === 'realistic-json' ? prefix.length : 0;
+    if (size < minimum) throw new RangeError('benchmark JSON value is smaller than its record fields');
+    const remaining = Math.max(0, size - prefix.length);
+    const events: string[] = [];
+    let length = 0;
+    for (let eventIndex = 0; length < remaining; eventIndex += 1) {
+        const event = (Math.imul(index + 1, 2654435761) + Math.imul(eventIndex + 1, 2246822519)) >>> 0;
+        const detail = `Event ${index}-${eventIndex}: item ${event % 100_000}, quantity ${1 + (event % 12)}, amount ${((event % 100_000) / 100).toFixed(2)}. ${TEXT_SENTENCES[event % TEXT_SENTENCES.length]}`;
+        events.push(detail);
+        length += detail.length;
+    }
+    const padding = events.join('').slice(0, remaining);
+    const text =
+        profile === 'realistic-json' ? `${prefix.slice(0, -2)}${padding}"}` : `${prefix}${padding}`.slice(0, size);
+    return TEXT_ENCODER.encode(text);
+}
+
+const CRC32_TABLE = new Uint32Array(256).map((_, index) => {
+    let crc = index;
+    for (let bit = 0; bit < 8; bit += 1) crc = (crc & 1) !== 0 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
+    return crc >>> 0;
+});
+
+function gzipEntropyValue(index: number, size: number): Uint8Array {
+    // Entropy data uses valid gzip stored blocks, as a compressor would when no smaller coding is available.
+    if (size < 23) throw new RangeError('precompressed benchmark value needs at least 23 bytes');
+    const blocks = Math.ceil((size - 18) / 65_540);
+    const payload = valueBytes(index, size - 18 - blocks * 5, 'high-entropy-binary');
+    const output = new Uint8Array(size);
+    const view = new DataView(output.buffer);
+    output.set([31, 139, 8, 0, 0, 0, 0, 0, 0, 255]);
+    let at = 10;
+    let crc = 0xffffffff;
+    let start = 0;
+    for (let block = 0; block < blocks; block += 1) {
+        const count = Math.min(65_535, payload.length - start);
+        output[at] = block + 1 === blocks ? 1 : 0;
+        view.setUint16(at + 1, count, true);
+        view.setUint16(at + 3, count ^ 0xffff, true);
+        output.set(payload.subarray(start, start + count), at + 5);
+        at += count + 5;
+        start += count;
+    }
+    for (const byte of payload) crc = (crc >>> 8) ^ CRC32_TABLE[(crc ^ byte) & 0xff];
+    view.setUint32(size - 8, (crc ^ 0xffffffff) >>> 0, true);
+    view.setUint32(size - 4, payload.length, true);
+    return output;
 }
 
 function rangeScanCount(name: string): number | null {
@@ -928,7 +1090,7 @@ export class ContentChecksum {
 export function expectedValuesChecksum(workload: WorkloadSpec, indices: number[]): string {
     const checksum = new ContentChecksum();
     for (const index of indices) {
-        checksum.add(valueBytes(index, workload.valueSize));
+        checksum.add(valueBytes(index, workload.valueSize, workloadPolicy(workload).dataset.profile));
     }
     return checksum.digest();
 }
@@ -937,7 +1099,7 @@ export function expectedRowsChecksum(workload: WorkloadSpec, indices: number[]):
     const checksum = new ContentChecksum();
     for (const index of indices) {
         checksum.add(keyBytes(index, workload.keySize));
-        checksum.add(valueBytes(index, workload.valueSize));
+        checksum.add(valueBytes(index, workload.valueSize, workloadPolicy(workload).dataset.profile));
     }
     return checksum.digest();
 }

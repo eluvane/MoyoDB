@@ -1,12 +1,15 @@
 mod common;
 
-use moyodb_engine::bytes::{MAX_KEY_BYTES, MAX_STORE_NAME_BYTES, MAX_VALUE_BYTES};
+use moyodb_engine::bytes::{
+    MAX_KEY_BYTES, MAX_STORED_VALUE_BYTES, MAX_STORE_NAME_BYTES, MAX_VALUE_BYTES,
+};
 use moyodb_engine::engine::{Failpoint, TxMode};
 use moyodb_engine::layout::{
-    PageKind, ValueKind, WalTag, INLINE_VALUE_LIMIT, MAIN_FILE_KIND, MANIFEST_FILE_KIND, PAGE_SIZE,
-    SUPERBLOCK_SLOT_SIZE, WAL_FILE_KIND,
+    PageKind, ValueKind, WalTag, FORMAT_VERSION, INLINE_VALUE_LIMIT, MAIN_FILE_KIND,
+    MANIFEST_FILE_KIND, PAGE_SIZE, SUPERBLOCK_SLOT_SIZE, WAL_FILE_KIND,
 };
 use moyodb_engine::page::encode_leaf_page;
+use moyodb_engine::payload::{PAYLOAD_DESCRIPTOR_SIZE, PAYLOAD_HEADER_SIZE};
 use moyodb_engine::wal::{append_commit_record, append_page_image_record, CommitRecord};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -14,7 +17,10 @@ use std::collections::BTreeMap;
 #[test]
 fn derived_constants_match_runtime_values() {
     let value = common::read_artifact("derived_constants.json");
-    assert_eq!(value["format_version"].as_u64().unwrap(), 1);
+    assert_eq!(
+        value["format_version"].as_u64().unwrap(),
+        u64::from(FORMAT_VERSION)
+    );
     assert_eq!(value["superblock_magic"].as_str().unwrap(), "STKDB001");
     assert_eq!(value["wal_magic"].as_str().unwrap(), "WAL1");
     assert_eq!(value["page_magic"].as_str().unwrap(), "PAG1");
@@ -60,6 +66,21 @@ fn derived_constants_match_runtime_values() {
         u64::from(ValueKind::Overflow as u8)
     );
     assert_eq!(
+        value["value_kinds"]["external"].as_u64().unwrap(),
+        u64::from(ValueKind::External as u8)
+    );
+    assert_eq!(value["external_payload"]["magic"].as_str().unwrap(), "PAY2");
+    assert_eq!(
+        value["external_payload"]["header_size"].as_u64().unwrap(),
+        PAYLOAD_HEADER_SIZE as u64
+    );
+    assert_eq!(
+        value["external_payload"]["descriptor_size"]
+            .as_u64()
+            .unwrap(),
+        PAYLOAD_DESCRIPTOR_SIZE as u64
+    );
+    assert_eq!(
         value["record_tags"]["page_image"].as_u64().unwrap(),
         u64::from(WalTag::PageImage as u8)
     );
@@ -78,6 +99,10 @@ fn derived_constants_match_runtime_values() {
     assert_eq!(
         value["limits"]["value_bytes"].as_u64().unwrap(),
         MAX_VALUE_BYTES as u64
+    );
+    assert_eq!(
+        value["limits"]["stored_value_bytes"].as_u64().unwrap(),
+        MAX_STORED_VALUE_BYTES as u64
     );
     let failpoints: Vec<&str> = value["failpoints"]
         .as_array()

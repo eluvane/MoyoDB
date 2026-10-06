@@ -12,17 +12,22 @@ use std::sync::Arc;
 const LARGE_VALUE_LEN: usize = 64 * 1024;
 
 thread_local! {
-    static VALUE_ALLOCATIONS: Cell<Option<usize>> = const { Cell::new(None) };
+    static VALUE_ALLOCATIONS: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
+    static BACKEND_READ_ALLOCATION: Cell<bool> = const { Cell::new(false) };
     static APPEND_OFFSET_CALLS: Cell<usize> = const { Cell::new(0) };
 }
 
 struct ValueAllocator;
 
 fn record_allocation(size: usize) {
-    if size == LARGE_VALUE_LEN {
+    if size >= LARGE_VALUE_LEN {
         VALUE_ALLOCATIONS.with(|counter| {
-            if let Some(count) = counter.get() {
-                counter.set(Some(count + 1));
+            if let Some((copies, chunks)) = counter.get() {
+                counter.set(Some(if BACKEND_READ_ALLOCATION.with(Cell::get) {
+                    (copies, chunks + 1)
+                } else {
+                    (copies + 1, chunks)
+                }));
             }
         });
     }
@@ -66,6 +71,14 @@ struct CountingBackend {
 
 impl FileBackend for CountingBackend {
     fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+        struct ResetReadAllocation(bool);
+        impl Drop for ResetReadAllocation {
+            fn drop(&mut self) {
+                BACKEND_READ_ALLOCATION.with(|active| active.set(self.0));
+            }
+        }
+        let previous = BACKEND_READ_ALLOCATION.with(|active| active.replace(true));
+        let _reset = ResetReadAllocation(previous);
         self.inner.read_at(offset, len)
     }
 
@@ -195,43 +208,109 @@ fn commits_use_backend_append_offsets_but_stats_and_recovery_read_length() -> Re
 
 #[test]
 fn filtered_change_feed_does_not_allocate_excluded_value_copies() -> Result<()> {
-    let (mut engine, _) = open_engine(deferred_config(), true)?;
-    let before = engine.stats()?.last_committed_txid;
-    let tx = engine.begin_tx(TxMode::Readwrite)?;
-    let value = vec![0x47; LARGE_VALUE_LEN];
-    for key in 0u32..4 {
-        engine.put(tx, "source", &key.to_be_bytes(), &value)?;
-    }
-    let latest = engine.commit_tx(tx)?;
-    // Warm the same tree and overflow pages outside the allocation measurement.
-    assert_eq!(
-        engine
-            .changes_since(before, ChangeFeedOptions::default())?
+    for value_len in [LARGE_VALUE_LEN, 1024 * 1024] {
+        let (mut engine, _) = open_engine(deferred_config(), true)?;
+        let before = engine.stats()?.last_committed_txid;
+        let tx = engine.begin_tx(TxMode::Readwrite)?;
+        let value = vec![0x47; value_len];
+        for key in 0u32..4 {
+            engine.put(tx, "source", &key.to_be_bytes(), &value)?;
+        }
+        let latest = engine.commit_tx(tx)?;
+        // Warm the tree before measuring value and transport allocations separately.
+        assert_eq!(
+            engine
+                .changes_since(before, ChangeFeedOptions::default())?
+                .changes
+                .len(),
+            4
+        );
+        let options = ChangeFeedOptions {
+            stores: Some(vec!["wanted".to_string()]),
+            limit: None,
+        };
+        VALUE_ALLOCATIONS.with(|counter| counter.set(Some((0, 0))));
+        let result = engine.changes_since(before, options);
+        let (copies, chunks) = VALUE_ALLOCATIONS
+            .with(|counter| counter.replace(None))
+            .unwrap_or_default();
+        let feed = result?;
+        assert!(feed.changes.is_empty());
+        assert_eq!(feed.latest_tx_id, latest);
+        assert_eq!(
+            copies, 0,
+            "excluded values must not be materialized or cloned into change records"
+        );
+        let expected_chunks =
+            4 * value_len.div_ceil(moyodb_engine::payload::PAYLOAD_READ_CHUNK_BYTES);
+        assert_eq!(
+            chunks, expected_chunks,
+            "CRC validation must stream bounded backend reads"
+        );
+        VALUE_ALLOCATIONS.with(|counter| counter.set(Some((0, 0))));
+        let result = engine.changes_since(before, ChangeFeedOptions::default());
+        let (copies, chunks) = VALUE_ALLOCATIONS
+            .with(|counter| counter.replace(None))
+            .unwrap();
+        let feed = result?;
+        assert_eq!(
+            copies, 4,
+            "included values need one owned allocation per record"
+        );
+        assert_eq!(chunks, expected_chunks);
+        assert!(feed
             .changes
-            .len(),
-        4
-    );
-    let options = ChangeFeedOptions {
-        stores: Some(vec!["wanted".to_string()]),
-        limit: None,
-    };
-    VALUE_ALLOCATIONS.with(|counter| counter.set(Some(0)));
-    let result = engine.changes_since(before, options);
-    let allocations = VALUE_ALLOCATIONS
-        .with(|counter| counter.replace(None))
-        .unwrap_or_default();
-    let feed = result?;
-    assert!(feed.changes.is_empty());
-    assert_eq!(feed.latest_tx_id, latest);
-    assert_eq!(
-        allocations, 0,
-        "excluded values must not be cloned into change records"
-    );
-    let feed = engine.changes_since(before, ChangeFeedOptions::default())?;
-    assert!(feed
-        .changes
-        .iter()
-        .all(|record| record.value.as_deref() == Some(value.as_slice())));
+            .iter()
+            .all(|record| record.value.as_deref() == Some(value.as_slice())));
+    }
+    Ok(())
+}
+
+#[test]
+fn filtered_change_feed_still_reports_corrupt_excluded_external_bodies() -> Result<()> {
+    use moyodb_engine::layout::page_offset;
+    use moyodb_engine::page::decode_page;
+    use moyodb_engine::pager::Pager;
+    use moyodb_engine::payload::{decode_payload_descriptor, PAYLOAD_HEADER_SIZE};
+    use moyodb_engine::storage::memory::MemoryBundle;
+
+    let mut bundle = MemoryBundle::new();
+    let mut engine = Engine::open(
+        "excluded-external-corruption",
+        bundle.files(),
+        deferred_config(),
+    )?;
+    let tx = engine.begin_tx(TxMode::Readwrite)?;
+    engine.create_store(tx, "source")?;
+    engine.create_store(tx, "wanted")?;
+    let before = engine.commit_tx(tx)?;
+    let tx = engine.begin_tx(TxMode::Readwrite)?;
+    engine.put(tx, "source", b"key", &vec![0x47; LARGE_VALUE_LEN])?;
+    engine.commit_tx(tx)?;
+    engine.checkpoint()?;
+    let mut pager = Pager::new(bundle.main.clone(), 1);
+    let page = decode_page(&pager.read_page(engine.catalog()["source"].store_root_page_id)?)?;
+    let cell = &page.leaf_cells[0];
+    let reference = decode_payload_descriptor(
+        cell.overflow_head_page_id,
+        cell.total_value_len,
+        &cell.value,
+    )?
+    .0;
+    let offset = page_offset(reference.first_page_id)
+        + PAYLOAD_HEADER_SIZE as u64
+        + LARGE_VALUE_LEN as u64 / 2;
+    bundle.main.write_at(offset, &[0x48])?;
+    let error = engine
+        .changes_since(
+            before,
+            ChangeFeedOptions {
+                stores: Some(vec!["wanted".into()]),
+                limit: None,
+            },
+        )
+        .expect_err("excluded external bodies still require their complete CRC validation");
+    assert!(matches!(error, EngineError::Corruption(_)));
     Ok(())
 }
 

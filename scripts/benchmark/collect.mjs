@@ -116,6 +116,7 @@ function buildSuites(browserReports) {
                     valueSize: result.valueSize,
                     batchSize: result.batchSize,
                     transactionBoundaries: result.transactionBoundaries,
+                    benchmarkPolicy: result.policy,
                     warmupCount: result.warmupCount,
                     sampleCount: result.sampleCount
                 },

@@ -24,6 +24,7 @@ import {
     type WorkerProtocolSuccessMessage,
     type WorkerCommand
 } from './worker-protocol';
+import { isRecord } from './internal';
 
 type PackedWorkerApi = WorkerApi & {
     getManyPacked?: (txId: number, store: string, packedKeys: Uint8Array) => Promise<unknown>;
@@ -95,15 +96,57 @@ class RequestScheduler {
     #lanes = new Map<number | string, Promise<void>>();
     #inFlight = new Set<Promise<void>>();
     #barrier: Promise<void> = Promise.resolve();
+    #cursorLanes = new Map<number, number | string>();
 
     schedule<T>(command: WorkerCommand, args: unknown[], task: () => Promise<T>): Promise<T> {
         if (UNSCHEDULED_COMMANDS.has(command)) {
             return task();
         }
         if (EXCLUSIVE_COMMANDS.has(command)) {
-            return this.#runExclusive(task);
+            if (this.#cursorLanes.size === 0) return this.#runExclusive(task);
+            return this.#runExclusive(async () => {
+                const result = await task();
+                this.#cursorLanes.clear();
+                return result;
+            });
         }
-        return this.#runShared(laneFor(command, args), task);
+        if (
+            command !== 'scanPage' &&
+            command !== 'closeCursor' &&
+            !((command === 'commit' || command === 'rollback') && this.#cursorLanes.size > 0)
+        ) {
+            return this.#runShared(laneFor(command, args), task);
+        }
+        const request = command === 'scanPage' && isRecord(args[0]) ? args[0] : null;
+        const cursorId = request?.cursorId ?? (command === 'closeCursor' ? args[0] : undefined);
+        const cursorLane = typeof cursorId === 'number' ? this.#cursorLanes.get(cursorId) : undefined;
+        // Explicit cursors share their transaction lane. Implicit cursors own a separate read snapshot.
+        const lane =
+            cursorLane ??
+            (request && typeof request.txId === 'number'
+                ? request.txId
+                : typeof cursorId === 'number'
+                  ? `cursor:${cursorId}`
+                  : laneFor(command, args));
+        return this.#runShared(lane, async () => {
+            try {
+                const result = await task();
+                if (request && isRecord(result)) {
+                    if (typeof cursorId === 'number') this.#cursorLanes.delete(cursorId);
+                    if (typeof result.cursorId === 'number') {
+                        this.#cursorLanes.set(result.cursorId, lane ?? `cursor:${result.cursorId}`);
+                    }
+                }
+                return result;
+            } finally {
+                if (command === 'closeCursor' && typeof cursorId === 'number') this.#cursorLanes.delete(cursorId);
+                if (command === 'commit' || command === 'rollback') {
+                    for (const [cursor, ownerLane] of this.#cursorLanes) {
+                        if (ownerLane === args[0]) this.#cursorLanes.delete(cursor);
+                    }
+                }
+            }
+        });
     }
 
     #runShared<T>(lane: number | string | null, task: () => Promise<T>): Promise<T> {

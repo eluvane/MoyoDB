@@ -1,4 +1,4 @@
-use crate::bytes::compare_keys;
+use crate::bytes::{compare_keys, read_u32_le};
 use crate::catalog::{
     decode_change_feed_floor_txid, decode_change_feed_policy, decode_schema_version,
     decode_store_metadata, encode_change_feed_floor_txid, encode_change_feed_policy,
@@ -9,7 +9,8 @@ use crate::error::{EngineError, Result};
 use crate::layout::{PageKind, ValueKind, PAGE_HEADER_SIZE, PAGE_SIZE};
 use crate::overflow::{
     free_overflow_chain, read_overflow_expiry, read_overflow_prefix, read_overflow_stored_value,
-    read_overflow_value, write_overflow_value,
+    read_overflow_stored_value_into, read_overflow_value, read_overflow_value_envelope,
+    write_overflow_value,
 };
 use crate::page::{
     decode_internal_cell_ref, decode_leaf_cell_ref, decode_page_header_verified,
@@ -17,10 +18,17 @@ use crate::page::{
     should_overflow_value, InternalCell, LeafCell, PageHeaderInfo, MAX_TREE_LEVEL,
 };
 use crate::pager::Pager;
+use crate::payload::{
+    decode_payload_descriptor, encode_payload_descriptor, read_payload_into,
+    read_payload_metadata_prefix, read_payload_prefix, PayloadRef,
+};
 use crate::prepared_value::ValueSource;
 use crate::storage::backend::FileBackend;
 use crate::value::{
-    decode_envelope_expiry, store_uses_system_raw_values, store_uses_value_envelope, StoredValue,
+    decode_value_envelope, store_compression_from_flags, store_uses_system_raw_values,
+    store_uses_value_envelope, store_value_prefix_len, validate_store_value,
+    validate_store_value_prefix, StoreCompression, StoredValue, ValueRevision, ValueState,
+    COMPRESSION_VALUE_HEADER_SIZE,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -117,6 +125,8 @@ pub struct PageAllocator {
     next_page_id: u64,
     reusable: Vec<u64>,
     freed: Vec<u64>,
+    added_payload_refs: Vec<PayloadRef>,
+    dropped_payload_refs: Vec<PayloadRef>,
 }
 
 impl PageAllocator {
@@ -131,6 +141,8 @@ impl PageAllocator {
             next_page_id: next_page_id.max(1),
             reusable,
             freed: Vec::new(),
+            added_payload_refs: Vec::new(),
+            dropped_payload_refs: Vec::new(),
         }
     }
 
@@ -141,6 +153,25 @@ impl PageAllocator {
         let page_id = self.next_page_id;
         self.next_page_id += 1;
         page_id
+    }
+
+    /// Reserve a contiguous range outside the reusable tree-page pool.
+    pub(crate) fn reserve_fresh_pages(&mut self, count: u64) -> Result<u64> {
+        if count == 0 {
+            return Err(EngineError::Internal("empty fresh page reservation".into()));
+        }
+        let next_page_id = self
+            .next_page_id
+            .checked_add(count)
+            .filter(|next| {
+                next.checked_sub(1)
+                    .and_then(|pages| pages.checked_mul(PAGE_SIZE as u64))
+                    .is_some()
+            })
+            .ok_or_else(|| EngineError::Storage("fresh page range overflow".into()))?;
+        let first_page_id = self.next_page_id;
+        self.next_page_id = next_page_id;
+        Ok(first_page_id)
     }
 
     /// Retires a page reachable from the committed state this commit replaces.
@@ -159,6 +190,14 @@ impl PageAllocator {
 
     pub fn freed(&self) -> &[u64] {
         &self.freed
+    }
+
+    pub(crate) fn added_payload_refs(&self) -> &[PayloadRef] {
+        &self.added_payload_refs
+    }
+
+    pub(crate) fn dropped_payload_refs(&self) -> &[PayloadRef] {
+        &self.dropped_payload_refs
     }
 
     /// `(next_page_id, unused reusable ids, freed ids)`.
@@ -188,10 +227,7 @@ pub fn lookup_prefix<B: FileBackend>(
 ) -> Result<Option<Vec<u8>>> {
     match lookup_pending(pager, root_page_id, key, prefix_len)? {
         Some(PendingValue::Inline(value)) => Ok(Some(value)),
-        Some(PendingValue::Overflow {
-            head_page_id,
-            total_len,
-        }) => read_overflow_prefix(pager, head_page_id, total_len, prefix_len).map(Some),
+        Some(value) => pending_value_prefix(pager, &value, prefix_len).map(Some),
         None => Ok(None),
     }
 }
@@ -202,13 +238,17 @@ fn lookup_pending<B: FileBackend>(
     key: &[u8],
     inline_prefix_len: usize,
 ) -> Result<Option<PendingValue>> {
-    lookup_cell(
+    let value = lookup_cell(
         pager,
         root_page_id,
         key,
-        |cell| Ok(pending_value_from_leaf_ref(cell, inline_prefix_len)),
+        |cell| pending_value_from_leaf_ref(cell, inline_prefix_len),
         None,
-    )
+    )?;
+    if let Some(value) = value.as_ref() {
+        validate_pending_payload_range(pager, value)?;
+    }
+    Ok(value)
 }
 
 /// Retains the current internal path for a sorted batch.
@@ -319,23 +359,365 @@ pub(crate) fn lookup_stored_value<B: FileBackend>(
         |cell| {
             if cell.value_kind == ValueKind::Inline {
                 StoredValue::decode_for_store(store_flags, cell.inline_value)
-                    .map(PointValue::Inline)
-            } else {
+                    .map(|value| PointValue::Inline(value, None))
+            } else if cell.value_kind == ValueKind::Overflow {
                 Ok(PointValue::Overflow {
                     head_page_id: cell.overflow_head_page_id,
                     total_len: cell.total_value_len as usize,
                 })
+            } else {
+                point_external_value(cell)
             }
         },
         batch,
     )?;
     match value {
         None => Ok(None),
-        Some(PointValue::Inline(value)) => Ok(Some(value)),
+        Some(PointValue::Inline(value, payload)) => {
+            validate_optional_payload_range(pager, payload.as_ref())?;
+            Ok(Some(value))
+        }
         Some(PointValue::Overflow {
             head_page_id,
             total_len,
         }) => read_overflow_stored_value(pager, head_page_id, total_len, store_flags).map(Some),
+        Some(PointValue::External { payload, prefix }) => materialize_pending_stored_value(
+            pager,
+            PendingValue::External { payload, prefix },
+            store_flags,
+        )
+        .map(Some),
+    }
+}
+
+pub(crate) fn lookup_stored_value_info<B: FileBackend>(
+    pager: &mut Pager<B>,
+    root_page_id: u64,
+    key: &[u8],
+    store_flags: u64,
+    batch: Option<&mut PointReadBatch>,
+) -> Result<Option<(usize, Option<u64>)>> {
+    let value = lookup_cell(
+        pager,
+        root_page_id,
+        key,
+        |cell| {
+            if cell.value_kind == ValueKind::Inline {
+                let (value, expiry) = inline_stored_value_parts(store_flags, cell.inline_value)?;
+                Ok(PointValue::Inline((value.len(), expiry), None))
+            } else if cell.value_kind == ValueKind::Overflow {
+                Ok(PointValue::Overflow {
+                    head_page_id: cell.overflow_head_page_id,
+                    total_len: cell.total_value_len as usize,
+                })
+            } else {
+                let (payload, prefix) = decode_payload_descriptor(
+                    cell.overflow_head_page_id,
+                    cell.total_value_len,
+                    cell.inline_value,
+                )?;
+                match external_stored_value_info(&payload, prefix, store_flags) {
+                    Ok(info) => Ok(PointValue::Inline(info, Some(payload))),
+                    Err(EngineError::Corruption(_)) => Ok(PointValue::External {
+                        payload,
+                        prefix: prefix.to_vec(),
+                    }),
+                    Err(error) => Err(error),
+                }
+            }
+        },
+        batch,
+    )?;
+    match value {
+        None => Ok(None),
+        Some(PointValue::Inline(info, payload)) => {
+            validate_optional_payload_range(pager, payload.as_ref())?;
+            Ok(Some(info))
+        }
+        Some(PointValue::Overflow {
+            head_page_id,
+            total_len,
+        }) => {
+            match pending_stored_value_info(
+                pager,
+                &PendingValue::Overflow {
+                    head_page_id,
+                    total_len,
+                },
+                store_flags,
+            ) {
+                Ok(info) => Ok(Some(info)),
+                Err(EngineError::Corruption(_)) => {
+                    read_overflow_stored_value_into(
+                        pager,
+                        head_page_id,
+                        total_len,
+                        store_flags,
+                        |_| Ok(()),
+                    )?;
+                    Err(EngineError::Internal(
+                        "overflow metadata changed during lookup".into(),
+                    ))
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Some(PointValue::External { payload, prefix }) => {
+            write_external_stored_value(pager, &payload, &prefix, store_flags, |_| Ok(()))?;
+            Err(EngineError::Internal(
+                "external metadata changed during lookup".into(),
+            ))
+        }
+    }
+}
+
+pub(crate) fn lookup_stored_value_size<B: FileBackend>(
+    pager: &mut Pager<B>,
+    root_page_id: u64,
+    key: &[u8],
+    store_flags: u64,
+    now_ms: u64,
+    batch: Option<&mut PointReadBatch>,
+) -> Result<Option<usize>> {
+    lookup_stored_value_state(pager, root_page_id, key, store_flags, now_ms, batch).map(|state| {
+        state
+            .filter(|state| state.exists)
+            .map(|state| state.max_length)
+    })
+}
+
+pub(crate) fn lookup_stored_value_state<B: FileBackend>(
+    pager: &mut Pager<B>,
+    root_page_id: u64,
+    key: &[u8],
+    store_flags: u64,
+    now_ms: u64,
+    batch: Option<&mut PointReadBatch>,
+) -> Result<Option<ValueState>> {
+    let value = lookup_cell(
+        pager,
+        root_page_id,
+        key,
+        |cell| {
+            if cell.value_kind == ValueKind::Inline {
+                let mut state = stored_state_from_envelope(
+                    cell.inline_value,
+                    cell.total_value_len as usize,
+                    store_flags,
+                    now_ms,
+                )?;
+                if state.exists {
+                    state.max_length = stored_size_from_header(
+                        &cell.inline_value[store_value_prefix_len(store_flags)..],
+                        state.max_length,
+                        store_flags,
+                    )?;
+                }
+                Ok(PointValue::Inline(state, None))
+            } else if cell.value_kind == ValueKind::Overflow {
+                Ok(PointValue::Overflow {
+                    head_page_id: cell.overflow_head_page_id,
+                    total_len: cell.total_value_len as usize,
+                })
+            } else {
+                let (payload, prefix) = decode_payload_descriptor(
+                    cell.overflow_head_page_id,
+                    cell.total_value_len,
+                    cell.inline_value,
+                )?;
+                let mut state = stored_state_from_envelope(
+                    prefix,
+                    prefix.len() + payload.body_len as usize,
+                    store_flags,
+                    now_ms,
+                )?;
+                if !state.exists {
+                    Ok(PointValue::Inline(state, Some(payload)))
+                } else if store_compression_from_flags(store_flags)? == StoreCompression::None {
+                    state.max_length = stored_size_from_header(&[], state.max_length, store_flags)?;
+                    Ok(PointValue::Inline(state, Some(payload)))
+                } else {
+                    Ok(PointValue::External {
+                        payload,
+                        prefix: prefix.to_vec(),
+                    })
+                }
+            }
+        },
+        batch,
+    )?;
+    match value {
+        None => Ok(None),
+        Some(PointValue::Inline(state, payload)) => {
+            validate_optional_payload_range(pager, payload.as_ref())?;
+            Ok(Some(state))
+        }
+        Some(PointValue::Overflow {
+            head_page_id,
+            total_len,
+        }) => {
+            let (expiry, revision) =
+                read_overflow_value_envelope(pager, head_page_id, total_len, store_flags)?;
+            let mut state =
+                stored_state_from_parts(total_len, store_flags, now_ms, expiry, revision)?;
+            if !state.exists {
+                return Ok(Some(state));
+            }
+            let skip = store_value_prefix_len(store_flags);
+            let header = if store_compression_from_flags(store_flags)? != StoreCompression::None {
+                read_overflow_prefix(
+                    pager,
+                    head_page_id,
+                    total_len,
+                    skip + COMPRESSION_VALUE_HEADER_SIZE,
+                )?
+            } else {
+                Vec::new()
+            };
+            state.max_length = stored_size_from_header(
+                header.get(skip..).unwrap_or_default(),
+                state.max_length,
+                store_flags,
+            )?;
+            Ok(Some(state))
+        }
+        Some(PointValue::External { payload, prefix }) => {
+            validate_optional_payload_range(pager, Some(&payload))?;
+            let mut state = stored_state_from_envelope(
+                &prefix,
+                prefix.len() + payload.body_len as usize,
+                store_flags,
+                now_ms,
+            )?;
+            if !state.exists {
+                return Ok(Some(state));
+            };
+            let skip = store_value_prefix_len(store_flags);
+            if store_compression_from_flags(store_flags)? == StoreCompression::None {
+                state.max_length = stored_size_from_header(&[], state.max_length, store_flags)?;
+                return Ok(Some(state));
+            }
+            if state.max_length < COMPRESSION_VALUE_HEADER_SIZE {
+                return Err(EngineError::Corruption(
+                    "compression value header is truncated".into(),
+                ));
+            }
+            let mut header = [0; COMPRESSION_VALUE_HEADER_SIZE];
+            let take = (prefix.len() - skip).min(header.len());
+            header[..take].copy_from_slice(&prefix[skip..skip + take]);
+            if take < header.len() {
+                let body = read_payload_metadata_prefix(
+                    pager.backend_ref(),
+                    &payload,
+                    header.len() - take,
+                )?;
+                header[take..take + body.len()].copy_from_slice(&body);
+                if take + body.len() != header.len() {
+                    return Err(EngineError::Corruption(
+                        "compression value header is truncated".into(),
+                    ));
+                }
+            }
+            state.max_length = stored_size_from_header(&header, state.max_length, store_flags)?;
+            Ok(Some(state))
+        }
+    }
+}
+
+fn stored_state_from_envelope(
+    prefix: &[u8],
+    total_len: usize,
+    flags: u64,
+    now_ms: u64,
+) -> Result<ValueState> {
+    let enveloped = store_uses_value_envelope(flags) && !store_uses_system_raw_values(flags);
+    let (expiry, revision) = if enveloped {
+        decode_value_envelope(flags, prefix)?
+    } else {
+        (None, None)
+    };
+    stored_state_from_parts(total_len, flags, now_ms, expiry, revision)
+}
+
+fn stored_state_from_parts(
+    total_len: usize,
+    flags: u64,
+    now_ms: u64,
+    expires_at_ms: Option<u64>,
+    revision: Option<ValueRevision>,
+) -> Result<ValueState> {
+    let expired = matches!(expires_at_ms, Some(expiry) if now_ms >= expiry);
+    let len = total_len
+        .checked_sub(store_value_prefix_len(flags))
+        .ok_or_else(|| {
+            EngineError::Corruption("stored value length is shorter than its envelope".into())
+        })?;
+    Ok(ValueState {
+        exists: !expired,
+        expired,
+        expires_at_ms,
+        revision,
+        max_length: if expired { 0 } else { len },
+    })
+}
+
+fn stored_size_from_header(prefix: &[u8], len: usize, flags: u64) -> Result<usize> {
+    if store_uses_system_raw_values(flags) {
+        return Ok(len);
+    }
+    validate_store_value_prefix(prefix, len, flags).map_err(|error| match error {
+        EngineError::Corruption(_) => error,
+        error => EngineError::Corruption(error.to_string()),
+    })?;
+    if store_compression_from_flags(flags)? == StoreCompression::None {
+        Ok(len)
+    } else {
+        Ok(len.max(read_u32_le(prefix, 10)? as usize))
+    }
+}
+
+pub(crate) fn lookup_stored_value_into<B: FileBackend>(
+    pager: &mut Pager<B>,
+    root_page_id: u64,
+    key: &[u8],
+    store_flags: u64,
+    batch: Option<&mut PointReadBatch>,
+    mut write: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<Option<Option<u64>>> {
+    let value = lookup_cell(
+        pager,
+        root_page_id,
+        key,
+        |cell| {
+            if cell.value_kind == ValueKind::Inline {
+                let (value, expiry) = inline_stored_value_parts(store_flags, cell.inline_value)?;
+                write(value)?;
+                Ok(PointValue::Inline(expiry, None))
+            } else if cell.value_kind == ValueKind::Overflow {
+                Ok(PointValue::Overflow {
+                    head_page_id: cell.overflow_head_page_id,
+                    total_len: cell.total_value_len as usize,
+                })
+            } else {
+                point_external_value(cell)
+            }
+        },
+        batch,
+    )?;
+    match value {
+        None => Ok(None),
+        Some(PointValue::Inline(expiry, payload)) => {
+            validate_optional_payload_range(pager, payload.as_ref())?;
+            Ok(Some(expiry))
+        }
+        Some(PointValue::Overflow {
+            head_page_id,
+            total_len,
+        }) => read_overflow_stored_value_into(pager, head_page_id, total_len, store_flags, write)
+            .map(Some),
+        Some(PointValue::External { payload, prefix }) => {
+            write_external_stored_value(pager, &payload, &prefix, store_flags, write).map(Some)
+        }
     }
 }
 
@@ -354,26 +736,48 @@ pub(crate) fn lookup_value_expiry<B: FileBackend>(
         root_page_id,
         key,
         |cell| {
-            if !enveloped {
-                Ok(PointValue::Inline(None))
+            if cell.value_kind == ValueKind::External {
+                let (payload, prefix) = decode_payload_descriptor(
+                    cell.overflow_head_page_id,
+                    cell.total_value_len,
+                    cell.inline_value,
+                )?;
+                let expiry = if enveloped {
+                    decode_value_envelope(store_flags, prefix)?.0
+                } else {
+                    None
+                };
+                Ok(PointValue::Inline(expiry, Some(payload)))
+            } else if !enveloped {
+                Ok(PointValue::Inline(None, None))
             } else if cell.value_kind == ValueKind::Inline {
-                decode_envelope_expiry(cell.inline_value).map(PointValue::Inline)
-            } else {
+                decode_value_envelope(store_flags, cell.inline_value)
+                    .map(|(expiry, _)| expiry)
+                    .map(|expiry| PointValue::Inline(expiry, None))
+            } else if cell.value_kind == ValueKind::Overflow {
                 Ok(PointValue::Overflow {
                     head_page_id: cell.overflow_head_page_id,
                     total_len: cell.total_value_len as usize,
                 })
+            } else {
+                Err(EngineError::Internal("unknown point value kind".into()))
             }
         },
         batch,
     )?;
     match value {
         None => Ok(None),
-        Some(PointValue::Inline(expiry)) => Ok(Some(expiry)),
+        Some(PointValue::Inline(expiry, payload)) => {
+            validate_optional_payload_range(pager, payload.as_ref())?;
+            Ok(Some(expiry))
+        }
         Some(PointValue::Overflow {
             head_page_id,
             total_len,
-        }) => read_overflow_expiry(pager, head_page_id, total_len).map(Some),
+        }) => read_overflow_expiry(pager, head_page_id, total_len, store_flags).map(Some),
+        Some(PointValue::External { .. }) => Err(EngineError::Internal(
+            "external point expiry was not decoded".into(),
+        )),
     }
 }
 
@@ -687,7 +1091,7 @@ pub(crate) fn apply_value_mutations<B: FileBackend, V: ValueSource + ?Sized>(
 }
 
 enum TreeLinks {
-    Leaf(Vec<(u64, usize)>),
+    Leaf(Vec<(u64, usize)>, Vec<PayloadRef>),
     Internal { level: u8, children: Vec<u64> },
 }
 
@@ -696,6 +1100,23 @@ pub fn free_tree<B: FileBackend>(
     pager: &mut Pager<B>,
     root_page_id: u64,
     alloc: &mut PageAllocator,
+) -> Result<()> {
+    retire_tree(pager, root_page_id, alloc, true)
+}
+
+pub(crate) fn drop_tree_payload_references<B: FileBackend>(
+    pager: &mut Pager<B>,
+    root_page_id: u64,
+    alloc: &mut PageAllocator,
+) -> Result<()> {
+    retire_tree(pager, root_page_id, alloc, false)
+}
+
+fn retire_tree<B: FileBackend>(
+    pager: &mut Pager<B>,
+    root_page_id: u64,
+    alloc: &mut PageAllocator,
+    retire_pages: bool,
 ) -> Result<()> {
     if root_page_id == 0 {
         return Ok(());
@@ -716,6 +1137,7 @@ pub fn free_tree<B: FileBackend>(
             match header.page_kind {
                 PageKind::Leaf => {
                     let mut overflow = Vec::new();
+                    let mut external = Vec::new();
                     for index in 0..count {
                         let slot = read_cell_slot(bytes, &header, index)?;
                         let cell = decode_leaf_cell_ref(bytes, slot)?;
@@ -729,9 +1151,18 @@ pub fn free_tree<B: FileBackend>(
                         if cell.value_kind == ValueKind::Overflow {
                             overflow
                                 .push((cell.overflow_head_page_id, cell.total_value_len as usize));
+                        } else if cell.value_kind == ValueKind::External {
+                            external.push(
+                                decode_payload_descriptor(
+                                    cell.overflow_head_page_id,
+                                    cell.total_value_len,
+                                    cell.inline_value,
+                                )?
+                                .0,
+                            );
                         }
                     }
-                    Ok(TreeLinks::Leaf(overflow))
+                    Ok(TreeLinks::Leaf(overflow, external))
                 }
                 _ => {
                     let mut children = Vec::with_capacity(count);
@@ -755,11 +1186,16 @@ pub fn free_tree<B: FileBackend>(
                 }
             }
         })?;
-        alloc.free(page_id);
+        if retire_pages {
+            alloc.free(page_id);
+        }
         match links {
-            TreeLinks::Leaf(overflow) => {
-                for (head_page_id, total_len) in overflow {
-                    free_overflow_chain(pager, head_page_id, total_len, alloc)?;
+            TreeLinks::Leaf(overflow, external) => {
+                alloc.dropped_payload_refs.extend(external);
+                if retire_pages {
+                    for (head_page_id, total_len) in overflow {
+                        free_overflow_chain(pager, head_page_id, total_len, alloc)?;
+                    }
                 }
             }
             TreeLinks::Internal { level, children } => {
@@ -965,6 +1401,15 @@ impl<'a, B: FileBackend> TreeWriter<'a, B> {
     }
 
     fn release_cell(&mut self, cell: &LeafCell) -> Result<()> {
+        if cell.value_kind == ValueKind::External {
+            let (reference, _) = decode_payload_descriptor(
+                cell.overflow_head_page_id,
+                cell.total_value_len,
+                &cell.value,
+            )?;
+            self.alloc.dropped_payload_refs.push(reference);
+            return Ok(());
+        }
         if cell.value_kind != ValueKind::Overflow {
             return Ok(());
         }
@@ -985,6 +1430,22 @@ impl<'a, B: FileBackend> TreeWriter<'a, B> {
         let parts = value.parts();
         let total_value_len =
             u32::try_from(parts.len()).map_err(|_| EngineError::ValueTooLarge(parts.len()))?;
+        if let Some(reference) = value.external_reference() {
+            if reference.body_len as usize != parts.payload().len() {
+                return Err(EngineError::Internal(
+                    "external reference body length mismatch".into(),
+                ));
+            }
+            let descriptor = encode_payload_descriptor(&reference, parts.prefix())?;
+            self.alloc.added_payload_refs.push(reference);
+            return Ok(LeafCell {
+                key: key.to_vec(),
+                value: descriptor,
+                value_kind: ValueKind::External,
+                total_value_len,
+                overflow_head_page_id: reference.first_page_id,
+            });
+        }
         if should_overflow_value(parts.len()) {
             let chain = write_overflow_value(value, self.alloc)?;
             self.overflow_images.extend(chain.pages);
@@ -1267,9 +1728,9 @@ fn read_node<B: FileBackend, V: ?Sized>(
                         .is_some_and(|(key, _)| *key == cell.key);
                     cells.push(LeafCell {
                         key: cell.key.to_vec(),
-                        // Replaced cells need only metadata to retire their overflow chains.
-                        // merge_leaf removes them before encoding pages.
-                        value: if replaced {
+                        // External descriptors carry the reference to retire.
+                        // Other replaced values need only their cell metadata.
+                        value: if replaced && cell.value_kind != ValueKind::External {
                             Vec::new()
                         } else {
                             cell.inline_value.to_vec()
@@ -1340,13 +1801,27 @@ enum LookupStep<T> {
 }
 
 enum PointValue<T> {
-    Inline(T),
-    Overflow { head_page_id: u64, total_len: usize },
+    Inline(T, Option<PayloadRef>),
+    Overflow {
+        head_page_id: u64,
+        total_len: usize,
+    },
+    External {
+        payload: PayloadRef,
+        prefix: Vec<u8>,
+    },
 }
 
 pub(crate) enum PendingValue {
     Inline(Vec<u8>),
-    Overflow { head_page_id: u64, total_len: usize },
+    Overflow {
+        head_page_id: u64,
+        total_len: usize,
+    },
+    External {
+        payload: PayloadRef,
+        prefix: Vec<u8>,
+    },
 }
 
 pub(crate) struct PendingKvPair {
@@ -1573,6 +2048,7 @@ impl TreeIter {
     ) -> Result<Option<PendingKvPair>> {
         loop {
             if let Some(pair) = self.buffer.pop_front() {
+                validate_pending_payload_range(pager, &pair.value)?;
                 return Ok(Some(pair));
             }
             if let Some(window) = self.window.as_mut() {
@@ -1595,7 +2071,7 @@ impl TreeIter {
                         let cell = decode_leaf_cell_ref(bytes, slot)?;
                         Ok(PendingKvPair {
                             key: cell.key.to_vec(),
-                            value: pending_value_from_leaf_ref(&cell, inline_prefix_len),
+                            value: pending_value_from_leaf_ref(&cell, inline_prefix_len)?,
                         })
                     })?;
                     if self.reverse {
@@ -1603,6 +2079,7 @@ impl TreeIter {
                     } else {
                         window.start += 1;
                     }
+                    validate_pending_payload_range(pager, &pair.value)?;
                     return Ok(Some(pair));
                 }
             }
@@ -1697,7 +2174,7 @@ fn collect_leaf_window(
         if index >= copy_start && index < copy_end {
             pairs.push(PendingKvPair {
                 key: cell.key.to_vec(),
-                value: pending_value_from_leaf_ref(&cell, inline_prefix_len),
+                value: pending_value_from_leaf_ref(&cell, inline_prefix_len)?,
             });
         }
     }
@@ -1797,17 +2274,59 @@ fn child_page_id_at(bytes: &[u8], header: &PageHeaderInfo, index: usize) -> Resu
 fn pending_value_from_leaf_ref(
     cell: &crate::page::LeafCellRef<'_>,
     inline_prefix_len: usize,
-) -> PendingValue {
+) -> Result<PendingValue> {
     if cell.value_kind == ValueKind::Inline {
-        PendingValue::Inline(
+        Ok(PendingValue::Inline(
             cell.inline_value[..inline_prefix_len.min(cell.inline_value.len())].to_vec(),
-        )
-    } else {
-        PendingValue::Overflow {
+        ))
+    } else if cell.value_kind == ValueKind::Overflow {
+        Ok(PendingValue::Overflow {
             head_page_id: cell.overflow_head_page_id,
             total_len: cell.total_value_len as usize,
-        }
+        })
+    } else {
+        let (payload, prefix) = decode_payload_descriptor(
+            cell.overflow_head_page_id,
+            cell.total_value_len,
+            cell.inline_value,
+        )?;
+        Ok(PendingValue::External {
+            payload,
+            prefix: prefix[..inline_prefix_len.min(prefix.len())].to_vec(),
+        })
     }
+}
+
+fn point_external_value<T>(cell: &crate::page::LeafCellRef<'_>) -> Result<PointValue<T>> {
+    let (payload, prefix) = decode_payload_descriptor(
+        cell.overflow_head_page_id,
+        cell.total_value_len,
+        cell.inline_value,
+    )?;
+    Ok(PointValue::External {
+        payload,
+        prefix: prefix.to_vec(),
+    })
+}
+
+fn validate_optional_payload_range<B: FileBackend>(
+    pager: &Pager<B>,
+    payload: Option<&PayloadRef>,
+) -> Result<()> {
+    if let Some(payload) = payload {
+        pager.validate_page_range(payload.first_page_id, payload.end_page_id()?)?;
+    }
+    Ok(())
+}
+
+fn validate_pending_payload_range<B: FileBackend>(
+    pager: &Pager<B>,
+    value: &PendingValue,
+) -> Result<()> {
+    if let PendingValue::External { payload, .. } = value {
+        validate_optional_payload_range(pager, Some(payload))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn materialize_pending_value<B: FileBackend>(
@@ -1820,6 +2339,186 @@ pub(crate) fn materialize_pending_value<B: FileBackend>(
             head_page_id,
             total_len,
         } => read_overflow_value(pager, head_page_id, total_len),
+        PendingValue::External { payload, prefix } => {
+            validate_optional_payload_range(pager, Some(&payload))?;
+            let mut value = Vec::with_capacity(prefix.len() + payload.body_len as usize);
+            value.extend_from_slice(&prefix);
+            read_payload_into(pager.backend_ref(), &payload, |chunk| {
+                value.extend_from_slice(chunk);
+                Ok(())
+            })?;
+            Ok(value)
+        }
+    }
+}
+
+pub(crate) fn materialize_pending_stored_value<B: FileBackend>(
+    pager: &mut Pager<B>,
+    value: PendingValue,
+    store_flags: u64,
+) -> Result<StoredValue> {
+    match value {
+        PendingValue::Inline(value) => StoredValue::decode_owned_for_store(store_flags, value),
+        PendingValue::Overflow {
+            head_page_id,
+            total_len,
+        } => read_overflow_stored_value(pager, head_page_id, total_len, store_flags),
+        PendingValue::External { payload, prefix } => {
+            validate_optional_payload_range(pager, Some(&payload))?;
+            let header_len = if store_uses_value_envelope(store_flags)
+                && !store_uses_system_raw_values(store_flags)
+            {
+                store_value_prefix_len(store_flags)
+            } else {
+                0
+            };
+            let mut value = Vec::with_capacity(
+                (prefix.len() + payload.body_len as usize).saturating_sub(header_len),
+            );
+            let expiry =
+                write_external_stored_value(pager, &payload, &prefix, store_flags, |chunk| {
+                    value.extend_from_slice(chunk);
+                    Ok(())
+                })?;
+            let revision = if header_len > 0 {
+                decode_value_envelope(store_flags, &prefix)?.1
+            } else {
+                None
+            };
+            Ok(StoredValue {
+                value,
+                expires_at_ms: expiry,
+                revision,
+            })
+        }
+    }
+}
+
+fn external_stored_value_info(
+    payload: &PayloadRef,
+    prefix: &[u8],
+    store_flags: u64,
+) -> Result<(usize, Option<u64>)> {
+    let total_len = prefix.len() + payload.body_len as usize;
+    if store_uses_value_envelope(store_flags) && !store_uses_system_raw_values(store_flags) {
+        let expiry = decode_value_envelope(store_flags, prefix)?.0;
+        Ok((total_len - store_value_prefix_len(store_flags), expiry))
+    } else {
+        Ok((total_len, None))
+    }
+}
+
+fn write_external_stored_value<B: FileBackend>(
+    pager: &mut Pager<B>,
+    payload: &PayloadRef,
+    prefix: &[u8],
+    store_flags: u64,
+    mut write: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<Option<u64>> {
+    validate_optional_payload_range(pager, Some(payload))?;
+    let enveloped =
+        store_uses_value_envelope(store_flags) && !store_uses_system_raw_values(store_flags);
+    let skip = if enveloped {
+        store_value_prefix_len(store_flags).min(prefix.len())
+    } else {
+        0
+    };
+    let mut payload_prefix = [0; COMPRESSION_VALUE_HEADER_SIZE];
+    let mut payload_prefix_len = (prefix.len() - skip).min(payload_prefix.len());
+    payload_prefix[..payload_prefix_len].copy_from_slice(&prefix[skip..skip + payload_prefix_len]);
+    write(&prefix[skip..])?;
+    read_payload_into(pager.backend_ref(), payload, |chunk| {
+        let take = (payload_prefix.len() - payload_prefix_len).min(chunk.len());
+        payload_prefix[payload_prefix_len..payload_prefix_len + take]
+            .copy_from_slice(&chunk[..take]);
+        payload_prefix_len += take;
+        write(chunk)
+    })?;
+    let expiry = if enveloped {
+        decode_value_envelope(store_flags, prefix)?.0
+    } else {
+        None
+    };
+    let payload_len = prefix.len() - skip + payload.body_len as usize;
+    if !store_uses_system_raw_values(store_flags) {
+        validate_store_value_prefix(
+            &payload_prefix[..payload_prefix_len],
+            payload_len,
+            store_flags,
+        )
+        .map_err(|error| match error {
+            EngineError::Corruption(_) => error,
+            error => EngineError::Corruption(error.to_string()),
+        })?;
+    }
+    Ok(expiry)
+}
+
+fn inline_stored_value_parts(store_flags: u64, bytes: &[u8]) -> Result<(&[u8], Option<u64>)> {
+    if store_uses_system_raw_values(store_flags) {
+        return Ok((bytes, None));
+    }
+    let (value, expiry) = if store_uses_value_envelope(store_flags) {
+        let expiry = decode_value_envelope(store_flags, bytes)?.0;
+        (&bytes[store_value_prefix_len(store_flags)..], expiry)
+    } else {
+        (bytes, None)
+    };
+    validate_store_value(value, store_flags).map_err(|error| match error {
+        EngineError::Corruption(_) => error,
+        error => EngineError::Corruption(error.to_string()),
+    })?;
+    Ok((value, expiry))
+}
+
+pub(crate) fn pending_stored_value_info<B: FileBackend>(
+    pager: &mut Pager<B>,
+    value: &PendingValue,
+    store_flags: u64,
+) -> Result<(usize, Option<u64>)> {
+    match value {
+        PendingValue::Inline(value) => {
+            let (value, expiry) = inline_stored_value_parts(store_flags, value)?;
+            Ok((value.len(), expiry))
+        }
+        PendingValue::Overflow {
+            head_page_id,
+            total_len,
+        } => {
+            if store_uses_value_envelope(store_flags) && !store_uses_system_raw_values(store_flags)
+            {
+                let expiry = read_overflow_expiry(pager, *head_page_id, *total_len, store_flags)?;
+                Ok((total_len - store_value_prefix_len(store_flags), expiry))
+            } else {
+                Ok((*total_len, None))
+            }
+        }
+        PendingValue::External { payload, prefix } => {
+            validate_optional_payload_range(pager, Some(payload))?;
+            external_stored_value_info(payload, prefix, store_flags)
+        }
+    }
+}
+
+pub(crate) fn write_pending_stored_value<B: FileBackend>(
+    pager: &mut Pager<B>,
+    value: PendingValue,
+    store_flags: u64,
+    mut write: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<Option<u64>> {
+    match value {
+        PendingValue::Inline(value) => {
+            let (value, expiry) = inline_stored_value_parts(store_flags, &value)?;
+            write(value)?;
+            Ok(expiry)
+        }
+        PendingValue::Overflow {
+            head_page_id,
+            total_len,
+        } => read_overflow_stored_value_into(pager, head_page_id, total_len, store_flags, write),
+        PendingValue::External { payload, prefix } => {
+            write_external_stored_value(pager, &payload, &prefix, store_flags, write)
+        }
     }
 }
 
@@ -1834,5 +2533,24 @@ pub(crate) fn pending_value_prefix<B: FileBackend>(
             head_page_id,
             total_len,
         } => read_overflow_prefix(pager, *head_page_id, *total_len, prefix_len),
+        PendingValue::External { payload, prefix } => {
+            validate_optional_payload_range(pager, Some(payload))?;
+            let wanted = prefix_len.min(prefix.len() + payload.body_len as usize);
+            let prefix_take = wanted.min(prefix.len());
+            let mut value = Vec::with_capacity(wanted);
+            value.extend_from_slice(&prefix[..prefix_take]);
+            if wanted > prefix_take {
+                value.extend_from_slice(&read_payload_prefix(
+                    pager.backend_ref(),
+                    payload,
+                    wanted - prefix_take,
+                )?);
+            }
+            Ok(value)
+        }
     }
 }
+
+#[cfg(test)]
+#[path = "btree/external_read_tests.rs"]
+mod external_read_tests;

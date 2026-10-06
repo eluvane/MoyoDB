@@ -1,5 +1,6 @@
 import { utf8Encode } from './codec';
-import type { CompressionKind } from './types';
+import { decodeSnappy, encodeSnappy } from './snappy';
+import type { CompressionKind, SnapshotCompressionKind } from './types';
 export type CompressionOption = CompressionKind | false;
 const STORE_RECORD_MAGIC = utf8Encode('BDBZVAL1');
 const SNAPSHOT_EXPORT_MAGIC = utf8Encode('BDBZSNP1');
@@ -8,13 +9,20 @@ const ENVELOPE_HEADER_SIZE = 18;
 const COMPRESSION_TAG_NONE = 0;
 const COMPRESSION_TAG_GZIP = 1;
 const COMPRESSION_TAG_DEFLATE = 2;
+const COMPRESSION_TAG_SNAPPY = 3;
 const STORE_FLAG_COMPRESSION_SHIFT = 2;
 const STORE_FLAG_COMPRESSION_MASK = 0b11 << STORE_FLAG_COMPRESSION_SHIFT;
 export const STORE_VALUE_COMPRESSION_THRESHOLD = 1024;
+export const STORE_VALUE_MIN_COMPRESSION_SAVING_PERCENT = 10;
+export const STORE_VALUE_COMPRESSION_POLICY_VERSION = 2;
+export const STORE_VALUE_COMPRESSION_PREFLIGHT_MIN_BYTES = 64 * 1024;
+export const STORE_VALUE_COMPRESSION_PREFLIGHT_WINDOW_BYTES = 1024;
+export const STORE_VALUE_COMPRESSION_PREFLIGHT_WINDOW_COUNT = 3;
+export const STORE_VALUE_COMPRESSION_ENVELOPE_BYTES = ENVELOPE_HEADER_SIZE;
 const MAX_DECOMPRESSED_STORE_VALUE_BYTES = 8 * 1024 * 1024;
 const MAX_DECOMPRESSED_SNAPSHOT_BYTES = 256 * 1024 * 1024;
 const CRC32_TABLE = (() => {
-    const table = new Uint32Array(256);
+    const table = new Uint32Array(8 * 256);
     for (let index = 0; index < 256; index += 1) {
         let crc = index;
         for (let bit = 0; bit < 8; bit += 1) {
@@ -26,6 +34,13 @@ const CRC32_TABLE = (() => {
         }
         table[index] = crc >>> 0;
     }
+    for (let index = 0; index < 256; index += 1) {
+        let crc = table[index];
+        for (let slice = 1; slice < 8; slice += 1) {
+            crc = (crc >>> 8) ^ table[crc & 0xff];
+            table[slice * 256 + index] = crc >>> 0;
+        }
+    }
     return table;
 })();
 type EnvelopeHeader = {
@@ -33,6 +48,12 @@ type EnvelopeHeader = {
     kindTag: number;
     rawLength: number;
     payloadChecksum: number;
+};
+export type PreparedStoreValueRecord = {
+    readonly byteLength: number;
+    readonly payload: Uint8Array;
+    readonly rawLength: number;
+    readonly kindTag: number | null;
 };
 function namedError(name: string, message: string): Error {
     const error = new Error(message);
@@ -47,6 +68,8 @@ function compressionTag(kind: CompressionOption): number {
             return COMPRESSION_TAG_GZIP;
         case 'deflate':
             return COMPRESSION_TAG_DEFLATE;
+        case 'snappy':
+            return COMPRESSION_TAG_SNAPPY;
         default:
             throw namedError('InternalError', `unsupported compression kind: ${String(kind)}`);
     }
@@ -59,6 +82,8 @@ function compressionKindFromTag(tag: number): CompressionOption {
             return 'gzip';
         case COMPRESSION_TAG_DEFLATE:
             return 'deflate';
+        case COMPRESSION_TAG_SNAPPY:
+            return 'snappy';
         default:
             throw namedError('CorruptionError', `invalid compression tag: ${tag}`);
     }
@@ -76,21 +101,123 @@ function ensureCompressionRuntime(): void {
 }
 function crc32(bytes: Uint8Array): number {
     let crc = 0xffffffff;
-    for (const byte of bytes) {
-        crc = (crc >>> 8) ^ CRC32_TABLE[(crc ^ byte) & 0xff];
+    let offset = 0;
+    const blockEnd = bytes.byteLength - 7;
+    // Table slices apply eight IEEE CRC32 byte updates in one step.
+    for (; offset < blockEnd; offset += 8) {
+        const first =
+            crc ^ bytes[offset] ^ (bytes[offset + 1] << 8) ^ (bytes[offset + 2] << 16) ^ (bytes[offset + 3] << 24);
+        crc =
+            CRC32_TABLE[1792 + (first & 0xff)] ^
+            CRC32_TABLE[1536 + ((first >>> 8) & 0xff)] ^
+            CRC32_TABLE[1280 + ((first >>> 16) & 0xff)] ^
+            CRC32_TABLE[1024 + (first >>> 24)] ^
+            CRC32_TABLE[768 + bytes[offset + 4]] ^
+            CRC32_TABLE[512 + bytes[offset + 5]] ^
+            CRC32_TABLE[256 + bytes[offset + 6]] ^
+            CRC32_TABLE[bytes[offset + 7]];
+    }
+    for (; offset < bytes.byteLength; offset += 1) {
+        crc = (crc >>> 8) ^ CRC32_TABLE[(crc ^ bytes[offset]) & 0xff];
     }
     return (crc ^ 0xffffffff) >>> 0;
 }
 function buildEnvelope(magic: Uint8Array, kindTag: number, rawLength: number, payload: Uint8Array): Uint8Array {
     const out = new Uint8Array(ENVELOPE_HEADER_SIZE + payload.byteLength);
-    out.set(magic, 0);
-    out[8] = ENVELOPE_VERSION;
-    out[9] = kindTag;
-    const view = new DataView(out.buffer, out.byteOffset, ENVELOPE_HEADER_SIZE);
-    view.setUint32(10, rawLength, true);
-    view.setUint32(14, crc32(payload), true);
-    out.set(payload, ENVELOPE_HEADER_SIZE);
+    writeEnvelope(out, 0, magic, kindTag, rawLength, payload);
     return out;
+}
+function writeEnvelope(
+    out: Uint8Array,
+    offset: number,
+    magic: Uint8Array,
+    kindTag: number,
+    rawLength: number,
+    payload: Uint8Array
+): void {
+    // A borrowed payload can overlap the destination header.
+    const checksum = crc32(payload);
+    out.set(payload, offset + ENVELOPE_HEADER_SIZE);
+    out.set(magic, offset);
+    out[offset + 8] = ENVELOPE_VERSION;
+    out[offset + 9] = kindTag;
+    const view = new DataView(out.buffer, out.byteOffset + offset, ENVELOPE_HEADER_SIZE);
+    view.setUint32(10, rawLength, true);
+    view.setUint32(14, checksum, true);
+}
+function compressionIsProfitable(rawLength: number, compressedLength: number): boolean {
+    return (
+        (compressedLength + ENVELOPE_HEADER_SIZE) * 100 <=
+        rawLength * (100 - STORE_VALUE_MIN_COMPRESSION_SAVING_PERCENT)
+    );
+}
+function snappyPreflightIsProfitable(value: Uint8Array): boolean {
+    if (value.byteLength < STORE_VALUE_COMPRESSION_PREFLIGHT_MIN_BYTES) {
+        return true;
+    }
+    let compressedLength = 0;
+    for (let index = 0; index < STORE_VALUE_COMPRESSION_PREFLIGHT_WINDOW_COUNT; index += 1) {
+        const offset = Math.floor(
+            ((value.byteLength - STORE_VALUE_COMPRESSION_PREFLIGHT_WINDOW_BYTES) * index) /
+                (STORE_VALUE_COMPRESSION_PREFLIGHT_WINDOW_COUNT - 1)
+        );
+        compressedLength += encodeSnappy(
+            value.subarray(offset, offset + STORE_VALUE_COMPRESSION_PREFLIGHT_WINDOW_BYTES)
+        ).byteLength;
+    }
+    return compressionIsProfitable(
+        STORE_VALUE_COMPRESSION_PREFLIGHT_WINDOW_BYTES * STORE_VALUE_COMPRESSION_PREFLIGHT_WINDOW_COUNT,
+        compressedLength
+    );
+}
+function buildStoreRecord(input: Uint8Array, compressed: Uint8Array, compression: CompressionKind): Uint8Array {
+    if (!compressionIsProfitable(input.byteLength, compressed.byteLength)) {
+        return buildEnvelope(STORE_RECORD_MAGIC, COMPRESSION_TAG_NONE, input.byteLength, input);
+    }
+    return buildEnvelope(STORE_RECORD_MAGIC, compressionTag(compression), input.byteLength, compressed);
+}
+function validateStoreValueLength(value: Uint8Array): void {
+    if (value.byteLength > MAX_DECOMPRESSED_STORE_VALUE_BYTES) {
+        throw namedError(
+            'ValueTooLargeError',
+            `value has ${value.byteLength} bytes, exceeding the ${MAX_DECOMPRESSED_STORE_VALUE_BYTES} byte limit`
+        );
+    }
+}
+// Raw payloads borrow value until the prepared record is written.
+export function prepareFastStoreValueRecord(
+    value: Uint8Array,
+    compression: 'snappy' | false
+): PreparedStoreValueRecord {
+    if (compression === false) {
+        return { payload: value, rawLength: value.byteLength, byteLength: value.byteLength, kindTag: null };
+    }
+    validateStoreValueLength(value);
+    let payload = value;
+    let kindTag = COMPRESSION_TAG_NONE;
+    if (value.byteLength >= STORE_VALUE_COMPRESSION_THRESHOLD && snappyPreflightIsProfitable(value)) {
+        const compressed = encodeSnappy(value);
+        if (compressionIsProfitable(value.byteLength, compressed.byteLength)) {
+            payload = compressed;
+            kindTag = COMPRESSION_TAG_SNAPPY;
+        }
+    }
+    return { payload, rawLength: value.byteLength, byteLength: ENVELOPE_HEADER_SIZE + payload.byteLength, kindTag };
+}
+export function writePreparedStoreValueRecord(
+    record: PreparedStoreValueRecord,
+    target: Uint8Array,
+    offset: number
+): number {
+    if (!Number.isSafeInteger(offset) || offset < 0 || record.byteLength > target.byteLength - offset) {
+        throw namedError('InternalError', 'prepared store value exceeds its destination');
+    }
+    if (record.kindTag === null) {
+        target.set(record.payload, offset);
+    } else {
+        writeEnvelope(target, offset, STORE_RECORD_MAGIC, record.kindTag, record.rawLength, record.payload);
+    }
+    return offset + record.byteLength;
 }
 // Copy before the stream can suspend so caller mutations cannot change its input.
 function copyBytes(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
@@ -140,7 +267,7 @@ function readEnvelopeHeader(magic: Uint8Array, bytes: Uint8Array, strict = true)
         payloadChecksum: view.getUint32(14, true)
     };
 }
-async function compressBytes(data: Uint8Array<ArrayBuffer>, kind: CompressionKind): Promise<Uint8Array> {
+async function compressBytes(data: Uint8Array<ArrayBuffer>, kind: SnapshotCompressionKind): Promise<Uint8Array> {
     ensureCompressionRuntime();
     let stream: ReadableStream<Uint8Array>;
     try {
@@ -160,6 +287,9 @@ async function decompressBytes(
     label: string,
     maxOutputBytes?: number
 ): Promise<Uint8Array> {
+    if (kind === 'snappy') {
+        return decodeSnappy(data, maxOutputBytes ?? MAX_DECOMPRESSED_STORE_VALUE_BYTES, maxOutputBytes);
+    }
     ensureCompressionRuntime();
     let stream: ReadableStream<Uint8Array>;
     try {
@@ -215,6 +345,8 @@ export function compressionFromStoreFlags(flags: number): CompressionOption {
             return 'gzip';
         case 2:
             return 'deflate';
+        case 3:
+            return 'snappy';
         default:
             throw namedError('CorruptionError', `invalid store compression flags: ${encoded}`);
     }
@@ -223,21 +355,18 @@ export async function encodeStoreValueRecord(value: Uint8Array, compression: Com
     if (compression === false) {
         return value;
     }
-    if (value.byteLength > MAX_DECOMPRESSED_STORE_VALUE_BYTES) {
-        throw namedError(
-            'ValueTooLargeError',
-            `value has ${value.byteLength} bytes, exceeding the ${MAX_DECOMPRESSED_STORE_VALUE_BYTES} byte limit`
-        );
+    if (compression === 'snappy') {
+        const record = prepareFastStoreValueRecord(value, compression);
+        const output = new Uint8Array(record.byteLength);
+        writePreparedStoreValueRecord(record, output, 0);
+        return output;
     }
+    validateStoreValueLength(value);
     if (value.byteLength < STORE_VALUE_COMPRESSION_THRESHOLD) {
         return buildEnvelope(STORE_RECORD_MAGIC, COMPRESSION_TAG_NONE, value.byteLength, value);
     }
     const input = copyBytes(value);
-    const compressed = await compressBytes(input, compression);
-    if (compressed.byteLength >= input.byteLength) {
-        return buildEnvelope(STORE_RECORD_MAGIC, COMPRESSION_TAG_NONE, input.byteLength, input);
-    }
-    return buildEnvelope(STORE_RECORD_MAGIC, compressionTag(compression), input.byteLength, compressed);
+    return buildStoreRecord(input, await compressBytes(input, compression), compression);
 }
 export async function decodeStoreValueRecord(
     value: Uint8Array,
@@ -300,10 +429,13 @@ export async function decodeStoreValueRecord(
 }
 export async function wrapSnapshotWithCompression(
     snapshot: Uint8Array,
-    compression: CompressionOption
+    compression: SnapshotCompressionKind | false
 ): Promise<Uint8Array> {
     if (compression === false) {
         return snapshot;
+    }
+    if (!['gzip', 'deflate'].includes(compression)) {
+        throw namedError('InternalError', `unsupported snapshot compression kind: ${String(compression)}`);
     }
     const input = copyBytes(snapshot);
     const compressed = await compressBytes(input, compression);
@@ -320,6 +452,9 @@ export async function unwrapSnapshotCompression(snapshot: Uint8Array): Promise<U
     const compression = compressionKindFromTag(header.kindTag);
     if (compression === false) {
         throw namedError('CorruptionError', 'snapshot compression envelope cannot store kind "none"');
+    }
+    if (compression === 'snappy') {
+        throw namedError('CorruptionError', `invalid snapshot compression tag: ${header.kindTag}`);
     }
     const payload = snapshot.subarray(ENVELOPE_HEADER_SIZE);
     if (crc32(payload) !== header.payloadChecksum) {

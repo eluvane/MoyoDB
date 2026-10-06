@@ -2,8 +2,8 @@ use super::*;
 use crate::checksum::work;
 use crate::layout::ValueKind;
 use crate::page::{
-    encode_internal_page, encode_leaf_page, encode_overflow_page, max_overflow_chunk_len,
-    InternalCell, LeafCell,
+    decode_page, encode_internal_page, encode_leaf_page, encode_overflow_page,
+    max_overflow_chunk_len, InternalCell, LeafCell,
 };
 use crate::storage::memory::{MemoryBackend, MemoryBundle};
 use crate::{Engine, OpenConfig, TxMode};
@@ -166,7 +166,7 @@ fn engine_commit_hashes_each_generated_page_payload_once() -> Result<()> {
         engine.create_store(setup, "kv")?;
         engine.commit_tx(setup)?;
         let tx = engine.begin_tx(TxMode::Readwrite)?;
-        let value = vec![0x31; 64 * 1024];
+        let value = vec![0x31; 16 * 1024];
         for key in 0u32..count {
             engine.put(tx, "kv", &key.to_be_bytes(), &value)?;
         }
@@ -176,6 +176,17 @@ fn engine_commit_hashes_each_generated_page_payload_once() -> Result<()> {
         let transactions = scan_wal(&bundle.wal)?;
         let committed = transactions.last().expect("a durable commit");
         assert_eq!(committed.txid, txid);
+        let decoded_pages = committed
+            .page_images
+            .iter()
+            .map(|page| decode_page(&page.bytes))
+            .collect::<Result<Vec<_>>>()?;
+        let overflow_values = decoded_pages
+            .iter()
+            .flat_map(|page| &page.leaf_cells)
+            .filter(|cell| cell.value_kind == ValueKind::Overflow)
+            .count();
+        assert_eq!(overflow_values, count as usize);
         let pages = committed.page_images.len();
         // Page creation hashes each output page once. WAL encoding hashes record
         // prefixes and the commit record; cached input pages are not rehashed.

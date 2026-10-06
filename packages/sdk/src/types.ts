@@ -62,12 +62,13 @@ export interface ChangeFeedSettings {
 export interface PutOptions {
     ttl?: number;
 }
-export type CompressionKind = 'gzip' | 'deflate';
+export type CompressionKind = 'gzip' | 'deflate' | 'snappy';
+export type SnapshotCompressionKind = 'gzip' | 'deflate';
 export interface CreateStoreOptions {
     compression?: CompressionKind | false;
 }
 export interface ExportSnapshotOptions {
-    compression?: CompressionKind | false;
+    compression?: SnapshotCompressionKind | false;
 }
 export interface ChangeRecord {
     txId: TxId;
@@ -124,6 +125,25 @@ export interface ScanItem {
     key: Uint8Array;
     value: Uint8Array;
 }
+/** Opaque cursor owned by the database handle or transaction that opened it. */
+export type ScanCursor = number;
+export interface ScanPageOptions {
+    cursor?: ScanCursor;
+    maxRows?: number;
+    /** Includes the 4-byte count and 8 bytes of metadata per row. A larger single row is an error. */
+    maxBytes?: number;
+}
+export interface ScanPage {
+    rows: ScanItem[];
+    cursor?: ScanCursor;
+    done: boolean;
+    bytes: number;
+}
+export interface IndexScanOptions {
+    maxRows?: number;
+    /** Bounds each decoded index page, including count, row metadata, keys, and values. */
+    maxBytes?: number;
+}
 export interface Transaction {
     readonly mode: TxMode;
     listIndexes?(): Promise<IndexDef[]>;
@@ -136,8 +156,18 @@ export interface Transaction {
     deleteMany(store: string, keys: Array<Uint8Array>): Promise<void>;
     applyBatch(store: string, ops: Array<BatchOp>): Promise<void>;
     scan(store: string, range?: Range): Promise<ScanItem[]>;
+    /** Retains the transaction snapshot until exhaustion or closeScanCursor. */
+    scanPage(store: string, range?: Range, options?: ScanPageOptions): Promise<ScanPage>;
+    /** Closes its cursor when iteration ends, throws, or is cancelled. */
+    scanIter(store: string, range?: Range, options?: Omit<ScanPageOptions, 'cursor'>): AsyncIterable<ScanItem>;
+    closeScanCursor(cursor: ScanCursor): Promise<void>;
     getByIndex(store: string, indexName: string, key: Uint8Array): Promise<Uint8Array | null>;
-    scanByIndex(store: string, indexName: string, range?: Range): AsyncIterable<[key: Uint8Array, value: Uint8Array]>;
+    scanByIndex(
+        store: string,
+        indexName: string,
+        range?: Range,
+        options?: IndexScanOptions
+    ): AsyncIterable<[key: Uint8Array, value: Uint8Array]>;
     createStore(name: string, options?: CreateStoreOptions): Promise<void>;
     dropStore(name: string): Promise<void>;
     clearStore(name: string): Promise<void>;
@@ -165,6 +195,11 @@ export interface DB {
     put(store: string, key: Uint8Array, value: Uint8Array, options?: PutOptions): Promise<void>;
     delete(store: string, key: Uint8Array): Promise<boolean>;
     scan(store: string, range?: Range): Promise<ScanItem[]>;
+    /** Retains a read snapshot until exhaustion or closeScanCursor. */
+    scanPage(store: string, range?: Range, options?: ScanPageOptions): Promise<ScanPage>;
+    /** Closes its cursor when iteration ends, throws, or is cancelled. */
+    scanIter(store: string, range?: Range, options?: Omit<ScanPageOptions, 'cursor'>): AsyncIterable<ScanItem>;
+    closeScanCursor(cursor: ScanCursor): Promise<void>;
     exportSnapshot(options?: ExportSnapshotOptions): Promise<Uint8Array>;
     importSnapshot(data: Uint8Array): Promise<void>;
     reset(): Promise<void>;

@@ -1,4 +1,11 @@
-import type { AutocommitCommand, IndexScanPage, WorkerApi, WorkerOpenRequest } from './worker-api';
+import type {
+    AutocommitCommand,
+    IndexScanPage,
+    WorkerApi,
+    WorkerOpenRequest,
+    WorkerScanPage,
+    WorkerScanPageRequest
+} from './worker-api';
 import type {
     BatchOp,
     ChangeFeed,
@@ -65,6 +72,8 @@ function clearPendingTimeout(pending: PendingRequest): void {
 export interface WorkerProtocolClientOptions {
     requestTimeoutMs?: number;
     readyTimeoutMs?: number;
+    /** Keeps scan packets packed when relaying through SharedWorker. */
+    forwardScanPackets?: boolean;
 }
 
 export interface WorkerTransport {
@@ -106,11 +115,13 @@ export class WorkerProtocolClient implements WorkerApi {
     private flushScheduled = false;
     private awaitingReady = 0;
     private readyTimeout: ReturnType<typeof setTimeout> | null = null;
+    private forwardScanPackets: boolean;
 
     constructor(
         private readonly worker: WorkerTransport,
         options: WorkerProtocolClientOptions = {}
     ) {
+        this.forwardScanPackets = options.forwardScanPackets === true;
         this.requestTimeoutMs = clampTimerDelayMs(options.requestTimeoutMs ?? 0);
         this.ready = new Promise<void>((resolve, reject) => {
             this.readyResolve = resolve;
@@ -233,6 +244,14 @@ export class WorkerProtocolClient implements WorkerApi {
         return this.request('scan', [txId, store, range]);
     }
 
+    scanPage(request: WorkerScanPageRequest): Promise<WorkerScanPage> {
+        return this.request('scanPage', [request]);
+    }
+
+    closeCursor(cursorId: number): Promise<void> {
+        return this.request('closeCursor', [cursorId]);
+    }
+
     getByIndex(txId: number, store: string, indexName: string, key: Uint8Array): Promise<Uint8Array | null> {
         return this.request('getByIndex', [txId, store, indexName, key]);
     }
@@ -247,9 +266,10 @@ export class WorkerProtocolClient implements WorkerApi {
         indexName: string,
         range: Range,
         cursor: Uint8Array | null,
-        limit: number
+        limit: number,
+        maxBytes?: number
     ): Promise<IndexScanPage> {
-        return this.request('scanByIndexPage', [txId, store, indexName, range, cursor, limit]);
+        return this.request('scanByIndexPage', [txId, store, indexName, range, cursor, limit, maxBytes]);
     }
 
     getIndexes(txId?: number): Promise<IndexDef[]> {
@@ -501,7 +521,15 @@ export class WorkerProtocolClient implements WorkerApi {
         clearPendingTimeout(pending);
         try {
             if (data.ok) {
-                pending.resolve(decodeWorkerResponsePayload(pending.command, data.result));
+                pending.resolve(
+                    this.forwardScanPackets &&
+                        (pending.command === 'scanPage' ||
+                            pending.command === 'scan' ||
+                            pending.command === 'scanByIndex' ||
+                            pending.command === 'scanByIndexPage')
+                        ? data.result
+                        : decodeWorkerResponsePayload(pending.command, data.result)
+                );
             } else {
                 pending.reject(deserializeWorkerError(data.error));
             }

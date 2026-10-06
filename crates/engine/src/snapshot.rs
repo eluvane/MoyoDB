@@ -1,6 +1,6 @@
 use crate::btree::load_all_entries;
 use crate::bytes::{
-    read_u16_le, read_u32_le, read_u64_le, validate_key, validate_value, write_u32_le, write_u64_le,
+    read_u16_le, read_u32_le, read_u64_le, validate_key, write_u32_le, write_u64_le,
 };
 use crate::change_feed::{is_internal_store_name, validate_user_store_name};
 use crate::checksum::checksum_with_zeroed_region;
@@ -8,7 +8,9 @@ use crate::error::{EngineError, Result};
 use crate::pager::Pager;
 use crate::storage::backend::FileBackend;
 use crate::txn::Snapshot;
-use crate::value::StoredValue;
+use crate::value::{
+    validate_store_flags, validate_store_value, StoredValue, STORE_FLAG_VALUE_REVISION,
+};
 use std::collections::BTreeSet;
 use std::convert::TryFrom;
 
@@ -68,7 +70,8 @@ pub fn collect_snapshot_contents<B: FileBackend>(
         }
         stores.push(SnapshotStore {
             name: name.clone(),
-            flags: meta.flags,
+            // Snapshot entries omit revisions. Import assigns new native versions.
+            flags: meta.flags & !STORE_FLAG_VALUE_REVISION,
             entries,
         });
     }
@@ -157,6 +160,7 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotContents> {
         offset += 2;
         offset += 2;
         let flags = read_u64_le(bytes, offset).map_err(corruption_from_engine_error)?;
+        validate_store_flags(flags).map_err(corruption_from_engine_error)?;
         offset += 8;
         let entry_count = usize_from_u64(
             read_u64_le(bytes, offset).map_err(corruption_from_engine_error)?,
@@ -208,7 +212,7 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotContents> {
             validate_key(key).map_err(corruption_from_engine_error)?;
 
             let value = take_slice(bytes, &mut offset, value_len, "snapshot value")?;
-            validate_value(value).map_err(corruption_from_engine_error)?;
+            validate_store_value(value, flags).map_err(corruption_from_engine_error)?;
             let value = value.to_vec();
 
             if !seen_keys.insert(key) {
@@ -246,6 +250,7 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotContents> {
 
 fn encode_store(dst: &mut Vec<u8>, store: &SnapshotStore) -> Result<()> {
     validate_user_store_name(&store.name)?;
+    validate_store_flags(store.flags)?;
     let name_bytes = store.name.as_bytes();
     let name_len = u16::try_from(name_bytes.len()).map_err(|_| {
         EngineError::Serialization(format!(
@@ -267,7 +272,7 @@ fn encode_store(dst: &mut Vec<u8>, store: &SnapshotStore) -> Result<()> {
     let mut seen_keys = BTreeSet::new();
     for entry in &store.entries {
         validate_key(&entry.key)?;
-        validate_value(&entry.value)?;
+        validate_store_value(&entry.value, store.flags)?;
         if !seen_keys.insert(entry.key.as_slice()) {
             return Err(EngineError::Serialization(format!(
                 "duplicate key while encoding snapshot store {}",

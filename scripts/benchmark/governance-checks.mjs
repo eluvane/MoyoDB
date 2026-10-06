@@ -59,6 +59,26 @@ function report(rows) {
             valueSize: 8,
             batchSize: 1,
             transactionBoundaries: 'one',
+            policy: {
+                dataset: { profile: 'lcg-repeat-256', version: 1, seed: 0 },
+                compression: false,
+                compressionTuning: {
+                    algorithm: 'snappy-raw-block',
+                    algorithmVersion: 2,
+                    thresholdBytes: 1024,
+                    minimumSavingPercent: 10,
+                    envelopeBytes: 18,
+                    sampling: {
+                        minimumInputBytes: 65_536,
+                        windowBytes: 1024,
+                        windowCount: 3,
+                        positioning: 'start-middle-end',
+                        profitability: 'aggregate-size-plus-one-envelope'
+                    }
+                },
+                changeFeed: { enabled: true, retainTxids: 100_000 },
+                timing: 'run-callback-only-v1'
+            },
             warmupCount: 0,
             sampleCount: 1,
             stats:

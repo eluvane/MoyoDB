@@ -23,6 +23,7 @@ try {
         'codec',
         'indexing',
         'compression',
+        'snappy',
         'internal',
         'errors',
         'codec-index-work-cases',

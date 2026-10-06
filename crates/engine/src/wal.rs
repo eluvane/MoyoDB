@@ -1,6 +1,8 @@
 mod read_buffer;
 
 #[cfg(test)]
+mod encoding_tests;
+#[cfg(test)]
 mod generated_tests;
 
 use crate::bytes::read_u32_le;
@@ -18,6 +20,8 @@ use read_buffer::WalReadBuffer;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use zerocopy::IntoBytes;
+
+const WAL_ENCODING_BATCH_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PageImageRecord {
@@ -120,7 +124,7 @@ fn append_transaction_inner<const GENERATED: bool, B: FileBackend>(
         )));
     }
 
-    let mut capacity = wal_record_total_len(WAL_COMMIT_BODY_SIZE);
+    // Invalid image lengths must fail before the first WAL write.
     for (_, bytes) in page_images {
         if bytes.len() != PAGE_SIZE {
             return Err(EngineError::Serialization(format!(
@@ -128,18 +132,40 @@ fn append_transaction_inner<const GENERATED: bool, B: FileBackend>(
                 bytes.len()
             )));
         }
-        capacity += wal_record_total_len(WAL_PAGE_IMAGE_BODY_HEADER_SIZE + bytes.len());
     }
 
-    // A single batch avoids separate payload and record copies.
+    let page_record_len = wal_record_total_len(WAL_PAGE_IMAGE_BODY_HEADER_SIZE + PAGE_SIZE);
+    let commit_record_len = wal_record_total_len(WAL_COMMIT_BODY_SIZE);
+    let capacity = page_images
+        .len()
+        .saturating_mul(page_record_len)
+        .saturating_add(commit_record_len)
+        .min(WAL_ENCODING_BATCH_BYTES);
     let mut batch = Vec::with_capacity(capacity);
     for (page_id, bytes) in page_images {
+        if batch.len() + page_record_len > WAL_ENCODING_BATCH_BYTES {
+            append_encoded_batch(wal, offset, &mut batch)?;
+        }
         encode_page_image_record_into::<GENERATED>(&mut batch, txid, *page_id, bytes)?;
     }
+    if batch.len() + commit_record_len > WAL_ENCODING_BATCH_BYTES {
+        append_encoded_batch(wal, offset, &mut batch)?;
+    }
     encode_commit_record_into(&mut batch, commit);
+    append_encoded_batch(wal, offset, &mut batch)
+}
 
-    wal.write_at(*offset, &batch)?;
+fn append_encoded_batch<B: FileBackend>(
+    wal: &mut B,
+    offset: &mut u64,
+    batch: &mut Vec<u8>,
+) -> Result<()> {
+    #[cfg(test)]
+    encoding_tests::observe_batch(batch.len(), batch.capacity());
+
+    wal.write_at(*offset, batch)?;
     *offset += batch.len() as u64;
+    batch.clear();
     Ok(())
 }
 

@@ -38,3 +38,4 @@ for (const name of ['node-worker.mjs', 'node-storage.mjs', 'node-storage.d.mts']
 }
 // npm packs only package files, so include the root license in the SDK package.
 await copyFile(new URL('../../../LICENSE', import.meta.url), new URL('../LICENSE', import.meta.url));
+await copyFile(new URL('../../../README.md', import.meta.url), new URL('../README.md', import.meta.url));

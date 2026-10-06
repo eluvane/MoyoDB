@@ -233,7 +233,16 @@ function createWorker(
         });
         const proxy = new SharedWorkerProtocolClient(sharedWorker);
         const persistenceBridge = { close() {} };
-        return { worker: { terminate: () => sharedWorker.port.close() }, proxy, persistenceBridge };
+        return {
+            worker: {
+                terminate: async () => {
+                    await proxy.disconnect();
+                    return 0;
+                }
+            },
+            proxy,
+            persistenceBridge
+        };
     }
     const worker = new Worker(new URL('./browser-worker.ts', import.meta.url), { type: 'module' });
     const proxy = new WorkerProtocolClient(worker);

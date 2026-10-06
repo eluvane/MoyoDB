@@ -200,7 +200,7 @@ pub(crate) mod work {
         HASHED_BYTES.with(Cell::get)
     }
 
-    pub(super) fn record(len: usize) {
+    pub(crate) fn record(len: usize) {
         HASHED_BYTES.with(|bytes| bytes.set(bytes.get() + len));
     }
 }

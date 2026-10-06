@@ -18,6 +18,7 @@ import {
     scanWindow,
     STORE_NAME,
     valueBytes,
+    workloadPolicy,
     verificationKind,
     writeVerificationIndices
 } from './workloads';
@@ -373,7 +374,10 @@ function buildEntryBatches(workload: WorkloadSpec, count: number, batchSize: num
         const end = Math.min(start + batchSize, count);
         const entries: IdbEntry[] = [];
         for (let i = start; i < end; i += 1) {
-            entries.push([keyBytes(i, workload.keySize), valueBytes(i, workload.valueSize)]);
+            entries.push([
+                keyBytes(i, workload.keySize),
+                valueBytes(i, workload.valueSize, workloadPolicy(workload).dataset.profile)
+            ]);
         }
         batches.push(entries);
     }

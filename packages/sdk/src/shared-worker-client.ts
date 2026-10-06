@@ -82,6 +82,9 @@ export class SharedWorkerProtocolClient extends WorkerProtocolClient {
     private heartbeat: ReturnType<typeof setInterval> | null;
     private lastPong = Date.now();
     private disposed = false;
+    private detachId: number | null = null;
+    private detachPromise: Promise<void> | null = null;
+    private resolveDetach: (() => void) | null = null;
 
     constructor(private readonly sharedWorker: SharedWorker) {
         super(sharedWorker.port, { readyTimeoutMs: 10_000 });
@@ -119,6 +122,12 @@ export class SharedWorkerProtocolClient extends WorkerProtocolClient {
         super.dispose(reason);
     }
 
+    async disconnect(): Promise<void> {
+        this.dispose();
+        await this.detachPromise;
+        this.sharedWorker.port.close();
+    }
+
     protected override fail(reason: Error): void {
         this.cleanup(reason);
         super.fail(reason);
@@ -147,6 +156,10 @@ export class SharedWorkerProtocolClient extends WorkerProtocolClient {
     private handleControl = (event: MessageEvent<unknown>): void => {
         const data = event.data;
         if (!isRecord(data)) return;
+        if (this.disposed) {
+            if (data.type === SHARED_WORKER_CONTROL_RESULT && data.id === this.detachId) this.resolveDetach?.();
+            return;
+        }
         if (data.type === SHARED_WORKER_OWNER_REQUEST && typeof data.id === 'number') {
             try {
                 const { workerPort, hostPort } = hostStorageWorker();
@@ -198,10 +211,20 @@ export class SharedWorkerProtocolClient extends WorkerProtocolClient {
         this.disposed = true;
         if (this.heartbeat !== null) clearInterval(this.heartbeat);
         this.heartbeat = null;
+        this.detachId = this.controlId++;
+        // Closing the port before this acknowledgement can discard the queued detach message.
+        const detached = new Promise<void>((resolve) => {
+            this.resolveDetach = resolve;
+        });
+        this.detachPromise = withTimeout(detached, 1000, undefined).then(() => {
+            this.resolveDetach = null;
+            this.sharedWorker.port.removeEventListener('message', this.handleControl);
+        });
         try {
-            this.sendControl('detach', 0);
-        } catch {}
-        this.sharedWorker.port.removeEventListener('message', this.handleControl);
+            this.sendControl('detach', this.detachId);
+        } catch {
+            this.resolveDetach?.();
+        }
         this.sharedWorker.removeEventListener('error', this.handleSharedError);
         globalThis.removeEventListener?.('pagehide', this.handlePageHide);
         for (const pending of this.controls.values()) pending.reject(reason);

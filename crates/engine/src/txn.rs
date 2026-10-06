@@ -104,6 +104,13 @@ impl<'a> From<&'a BatchOp> for BatchOpRef<'a> {
     }
 }
 
+/// An ordered index write. Puts store an empty value without TTL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexOpRef<'a> {
+    Put { store: &'a str, key: &'a [u8] },
+    Delete { store: &'a str, key: &'a [u8] },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum BatchOpOutcome {
@@ -178,6 +185,8 @@ pub struct ReadwriteTx {
     pub stores: BTreeMap<String, StagedStore>,
     pub staged_schema_version: Option<u64>,
     pub staged_change_feed_policy: Option<ChangeFeedPolicy>,
+    #[serde(default)]
+    pub revision_epoch: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,6 +223,7 @@ impl TransactionState {
                 stores: BTreeMap::new(),
                 staged_schema_version: None,
                 staged_change_feed_policy: None,
+                revision_epoch: None,
             }),
         }
     }

@@ -17,6 +17,34 @@ export function createSuite({ runtime, indexing, codec }) {
     };
     const hex = (v) => Array.from(v, (b) => b.toString(16).padStart(2, '0')).join('');
     const named = (name) => Object.assign(new Error(name), { name });
+    function installIndexedBatch(engine) {
+        engine.put_many_indexed_packed = (id, store, packet, operations, options = {}) => {
+            const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength);
+            const count = view.getUint32(0, true);
+            let offset = 4 + count * 4;
+            const items = Array.from({ length: count }, (_, index) => {
+                const length = view.getUint32(4 + index * 4, true);
+                const item = packet.subarray(offset, offset + length);
+                offset += length;
+                return item;
+            });
+            const partial = [];
+            try {
+                for (let index = 0; index < count / 2; index++) {
+                    const existed = engine.put(id, store, items[index * 2], items[index * 2 + 1], options);
+                    for (const op of operations[index]) {
+                        if (op.kind === 'delete') engine.delete(id, op.store, op.key);
+                        else engine.put(id, op.store, op.key, empty);
+                    }
+                    partial.push(existed);
+                }
+            } catch (error) {
+                error.partial = partial;
+                throw error;
+            }
+            return Uint8Array.from(partial, Number);
+        };
+    }
     async function rejects(fn, name, fragment) {
         try {
             await fn();
@@ -176,6 +204,7 @@ export function createSuite({ runtime, indexing, codec }) {
                 return keys.map((key) => ({ key: key.slice(), value: empty }));
             }
         };
+        installIndexedBatch(worker.engine);
         return {
             worker,
             configs,
@@ -379,6 +408,7 @@ export function createSuite({ runtime, indexing, codec }) {
                 return result;
             }
         };
+        installIndexedBatch(worker.engine);
         if (nativeVisibility) {
             worker.engine.has_many = (id, store, keys) => {
                 counts.hasManyCalls++;
@@ -724,7 +754,7 @@ export function createSuite({ runtime, indexing, codec }) {
                 const put = await counted(() => f.worker.put(tx, 'docs', u64Key(1), document(indexes)));
                 eq(put.jsonParses, 2);
                 eq(put.utf8Decodes, 2);
-                eq(f.writes.filter((w) => w[1] !== 'docs').length, 0, 'unchanged index key must not be rewritten');
+                eq(f.writes.filter((w) => w[1] !== 'docs').length, indexes, 'each index revision must be refreshed');
                 const del = await counted(() => f.worker.delete(tx, 'docs', u64Key(1)));
                 eq(del.jsonParses, 1);
                 eq(del.utf8Decodes, 1);
@@ -1467,8 +1497,8 @@ export function createSuite({ runtime, indexing, codec }) {
                     eq(got.length, limit);
                     eq(f.counts.rawRows, limit);
                     eq(f.counts.gets, limit);
-                    eq(f.counts.getCalls, limit === 1 ? 1 : 0);
-                    eq(f.counts.getManyCalls, limit === 1 ? 0 : 1);
+                    eq(f.counts.getCalls, limit);
+                    eq(f.counts.getManyCalls, 0);
                     const expected = Array.from({ length: limit }, (_, i) => hex(u64Key(reverse ? 1999 - i : i)));
                     eq(
                         got.map((r) => hex(r.key)),
@@ -1514,7 +1544,7 @@ export function createSuite({ runtime, indexing, codec }) {
                     eq(f.counts.getManyCalls, 0);
                 } else {
                     eq(f.counts.deletes, 0);
-                    ok(f.counts.getManyCalls > 0, 'readonly rows did not use bulk lookups');
+                    eq(f.counts.getManyCalls, 0, 'unknown value sizes must not trigger bulk materialization');
                 }
                 f.close();
             });
@@ -1560,7 +1590,7 @@ export function createSuite({ runtime, indexing, codec }) {
         await rejects(() => f.worker.scanByIndex(tx, 'docs', 'i0', { limit: 1 }), 'CorruptionError');
         f.close();
     });
-    test('readonly index batches stop before an unreachable corrupt value in a stale chunk', async () => {
+    test('readonly index pages stop before an unreachable corrupt value in a stale chunk', async () => {
         const rows = indexRows(20, (i) => i >= 6);
         rows[8].value = new Uint8Array([255]);
         const f = fixture({ defs: definitions(1), rows });
@@ -1574,7 +1604,7 @@ export function createSuite({ runtime, indexing, codec }) {
         eq(f.counts.deletes, 0);
         f.close();
     });
-    test('failed readonly bulk lookup preserves the earlier document error', async () => {
+    test('readonly pages do not prefetch later bodies before an earlier document error', async () => {
         const rows = indexRows(10);
         rows[0].value = new Uint8Array([255]);
         const f = fixture({ defs: definitions(1), rows });
@@ -1584,7 +1614,7 @@ export function createSuite({ runtime, indexing, codec }) {
             throw named('CorruptionError');
         };
         await rejects(() => f.worker.scanByIndex(tx, 'docs', 'i0', { limit: 10 }), 'SerializationError');
-        eq(f.counts.getManyCalls, 1);
+        eq(f.counts.getManyCalls, 0);
         eq(f.counts.getCalls, 1);
         eq(f.counts.deletes, 0);
         f.close();
@@ -1605,7 +1635,7 @@ export function createSuite({ runtime, indexing, codec }) {
         eq(f.counts.getManyCalls, 0);
         f.close();
     });
-    test('readonly bulk failure falls back in row order and preserves its engine error', async () => {
+    test('readonly pages preserve primary errors in index row order', async () => {
         const f = fixture({ defs: definitions(1), rows: indexRows(10) });
         const tx = await f.worker.begin('readonly');
         const get = f.worker.engine.get;
@@ -1619,7 +1649,7 @@ export function createSuite({ runtime, indexing, codec }) {
         };
         await rejects(() => f.worker.scanByIndex(tx, 'docs', 'i0', { limit: 10 }), 'CorruptionError');
         eq(f.counts.getCalls, 4);
-        eq(f.counts.getManyCalls, 1);
+        eq(f.counts.getManyCalls, 0);
         f.close();
     });
     test('write transaction scans preserve stale cleanup before a document error', async () => {
@@ -1634,11 +1664,13 @@ export function createSuite({ runtime, indexing, codec }) {
         eq(f.physical.has(hex(rows[0].physical)), false);
         f.close();
     });
-    test('readonly bulk outcome size mismatch is an explicit internal error', async () => {
+    test('readonly index pages do not depend on unbounded bulk primary lookups', async () => {
         const f = fixture({ defs: definitions(1), rows: indexRows(10) });
         const tx = await f.worker.begin('readonly');
         f.worker.engine.get_many = () => [];
-        await rejects(() => f.worker.scanByIndex(tx, 'docs', 'i0', { limit: 10 }), 'InternalError', 'outcome count');
+        eq((await f.worker.scanByIndex(tx, 'docs', 'i0', { limit: 10 })).length, 10);
+        eq(f.counts.getManyCalls, 0);
+        eq(f.counts.getCalls, 10);
         f.close();
     });
     test(

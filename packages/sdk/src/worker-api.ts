@@ -32,6 +32,20 @@ export interface IndexScanPage {
     /** Physical index key to resume after, or `null` when exhaustion is detected. */
     cursor: Uint8Array | null;
 }
+export interface WorkerScanPageRequest {
+    cursorId?: number;
+    txId?: number;
+    store: string;
+    range?: Range;
+    maxRows: number;
+    maxBytes: number;
+}
+export interface WorkerScanPage {
+    rows: ScanItem[];
+    cursorId?: number;
+    done: boolean;
+    bytes: number;
+}
 /**
  * Commands supported in one autocommit request. The worker replies after
  * commit (readwrite) or rollback (readonly).
@@ -77,6 +91,8 @@ export interface WorkerApi {
     deleteMany: (txId: number, store: string, keys: Array<Uint8Array>) => Promise<void>;
     applyBatch: (txId: number, store: string, ops: Array<BatchOp>) => Promise<void>;
     scan: (txId: number, store: string, range: Range) => Promise<ScanItem[]>;
+    scanPage: (request: WorkerScanPageRequest) => Promise<WorkerScanPage>;
+    closeCursor: (cursorId: number) => Promise<void>;
     getByIndex: (txId: number, store: string, indexName: string, key: Uint8Array) => Promise<Uint8Array | null>;
     scanByIndex: (txId: number, store: string, indexName: string, range: Range) => Promise<ScanItem[]>;
     scanByIndexPage: (
@@ -85,7 +101,8 @@ export interface WorkerApi {
         indexName: string,
         range: Range,
         cursor: Uint8Array | null,
-        limit: number
+        limit: number,
+        maxBytes?: number
     ) => Promise<IndexScanPage>;
     getIndexes: (txId?: number) => Promise<IndexDef[]>;
     reconcileIndexes: (txId: number, indexes: IndexDef[]) => Promise<void>;

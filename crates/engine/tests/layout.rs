@@ -211,7 +211,7 @@ fn decode_rejects_overlapping_leaf_cells() {
 
 #[test]
 fn exported_layout_constants_are_stable() {
-    assert_eq!(FORMAT_VERSION, 1);
+    assert_eq!(FORMAT_VERSION, 2);
     assert_eq!(SUPERBLOCK_MAGIC, *b"STKDB001");
     assert_eq!(SUPERBLOCK_SLOT_SIZE, 4096);
 }

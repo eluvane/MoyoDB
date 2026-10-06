@@ -9,25 +9,41 @@ mod commit_work_tests;
 #[cfg(test)]
 mod paired_crc_tests;
 
+#[cfg(test)]
+mod payload_tests;
+
+#[cfg(test)]
+mod checkpoint_retirement_tests;
+
+#[cfg(test)]
+mod revision_tests;
+
 use crate::btree::{
-    apply_value_mutations, build_catalog_tree, build_tree_from_sorted, build_tree_from_values,
-    collect_keys_below, free_tree, lookup_stored_value, lookup_value_expiry,
-    materialize_pending_value, pending_value_prefix, BuiltTree, KvPair, PageAllocator, PageImages,
-    PendingValue, PointReadBatch, RangeSpec, SortedTreeBuilder, TreeIter,
+    apply_value_mutations, build_catalog_tree, build_tree_from_values, collect_keys_below,
+    drop_tree_payload_references, free_tree, lookup_stored_value, lookup_stored_value_info,
+    lookup_stored_value_into, lookup_stored_value_size, lookup_stored_value_state,
+    lookup_value_expiry, materialize_pending_stored_value, materialize_pending_value,
+    pending_stored_value_info, pending_value_prefix, write_pending_stored_value, BuiltTree, KvPair,
+    PageAllocator, PageImages, PendingValue, PointReadBatch, RangeSpec, SortedTreeBuilder,
+    TreeIter,
 };
-use crate::bytes::{validate_key, validate_store_name, validate_value};
+use crate::bytes::{read_u32_le, validate_key, validate_store_name as validate_store_name_length};
 use crate::catalog::{CatalogMap, CatalogState, ChangeFeedPolicy};
 use crate::change_feed::{
-    decode_change_record_payload_ref, encode_after_txid_key, encode_change_log_key,
+    decode_change_record_prefix_ref, encode_after_txid_key, encode_change_log_key,
     encode_change_record_prefix, is_internal_store_name, normalize_store_filter,
     validate_user_store_name, visible_store_count, visible_store_names, ChangeFeed,
-    ChangeFeedOptions, ChangeKind, CHANGELOG_STORE_FLAGS, SYSTEM_CHANGELOG_STORE_NAME,
+    ChangeFeedOptions, ChangeKind, ChangeRecord, CHANGELOG_STORE_FLAGS,
+    MAX_CHANGE_RECORD_PREFIX_SIZE, SYSTEM_CHANGELOG_STORE_NAME,
 };
 use crate::checksum;
 use crate::error::{EngineError, Result};
 use crate::layout::{StoreMetadata, SuperblockState};
+use crate::output::{PackedScanPage, PackedValues, ScanPacket};
 use crate::pager::Pager;
-use crate::prepared_value::PreparedValue;
+use crate::payload::write_payload_unflushed;
+use crate::payload_registry::{PayloadRegistry, PAYLOAD_REGISTRY_STORE_NAME};
+use crate::prepared_value::{PreparedValue, ValueSource};
 use crate::recovery::{
     ensure_openable_or_initialize, load_catalog_snapshot, recover_if_needed, write_superblock,
 };
@@ -38,13 +54,15 @@ use crate::snapshot::{
 use crate::storage::backend::{FileBackend, FileSet};
 use crate::time::now_unix_ms;
 use crate::txn::{
-    BatchOp, BatchOpOutcome, BatchOpRef, MutationValue, ReadwriteTx, Snapshot, StagedStore,
-    TransactionState, TxInner,
+    BatchOp, BatchOpOutcome, BatchOpRef, IndexOpRef, MutationValue, ReadwriteTx, Snapshot,
+    StagedStore, TransactionState, TxInner,
 };
 use crate::value::{
     store_compression_from_flags, store_flags_for_user_store, store_uses_system_raw_values,
-    store_uses_value_envelope, stored_value_expired, StoreCompression, StoredValue,
-    STORE_FLAG_COMPRESSION_MASK, STORE_FLAG_VALUE_ENVELOPE_V1, VALUE_ENVELOPE_HEADER_SIZE,
+    store_uses_value_envelope, store_value_prefix_len, validate_store_value,
+    validate_store_value_max_size, validate_store_value_prefix, StoreCompression, StoredValue,
+    ValueRevision, ValueState, COMPRESSION_VALUE_HEADER_SIZE, STORE_FLAG_COMPRESSION_MASK,
+    STORE_FLAG_SYSTEM_RAW_VALUES, STORE_FLAG_VALUE_ENVELOPE_V1, STORE_FLAG_VALUE_REVISION,
 };
 use crate::wal::{append_generated_transaction, CommitRecord};
 use catalog_delta::{CatalogDelta, CatalogUpdate};
@@ -60,6 +78,108 @@ pub type ScanRange = RangeSpec;
 
 // Limit pruning work per commit. Later commits remove the remaining records.
 const CHANGE_LOG_PRUNE_BATCH: usize = 1024;
+const EXTERNAL_PAYLOAD_THRESHOLD: usize = 32 * 1024;
+
+fn validate_store_name(name: &str) -> Result<()> {
+    validate_store_name_length(name)?;
+    if name == PAYLOAD_REGISTRY_STORE_NAME {
+        return Err(EngineError::ReservedStoreName(name.into()));
+    }
+    Ok(())
+}
+
+fn validate_index_entry_binding(
+    index_store: &str,
+    index_key: &[u8],
+    primary_key: &[u8],
+) -> Result<()> {
+    if !index_store.starts_with("__browserdb:index:") {
+        return Err(EngineError::Serialization(
+            "checked index store has invalid namespace".into(),
+        ));
+    }
+    let mut part = 0usize;
+    let mut matched = 0usize;
+    let mut offset = 0usize;
+    while offset < index_key.len() {
+        let mut byte = index_key[offset];
+        offset += 1;
+        if byte == 0 {
+            let escaped = *index_key
+                .get(offset)
+                .ok_or_else(|| EngineError::Serialization("truncated index key escape".into()))?;
+            offset += 1;
+            match escaped {
+                0 => {
+                    part += 1;
+                    if part > 2 || (part == 2 && offset != index_key.len()) {
+                        return Err(EngineError::Serialization(
+                            "index key must contain exactly two parts".into(),
+                        ));
+                    }
+                    continue;
+                }
+                255 => byte = 0,
+                _ => {
+                    return Err(EngineError::Serialization(
+                        "invalid index key escape".into(),
+                    ))
+                }
+            }
+        }
+        if part == 1 {
+            if primary_key.get(matched) != Some(&byte) {
+                return Err(EngineError::Serialization(
+                    "index key does not bind the primary key".into(),
+                ));
+            }
+            matched += 1;
+        }
+    }
+    if part != 2 || matched != primary_key.len() {
+        return Err(EngineError::Serialization(
+            "index key does not bind the primary key".into(),
+        ));
+    }
+    Ok(())
+}
+
+struct PayloadPreparation {
+    registry: PayloadRegistry,
+    oldest_snapshot_txid: u64,
+    pending_writes: bool,
+}
+
+impl PayloadPreparation {
+    fn externalize<B: FileBackend>(
+        &mut self,
+        pager: &mut Pager<B>,
+        alloc: &mut PageAllocator,
+        value: &mut PreparedValue<'_>,
+    ) -> Result<()> {
+        let body = value.parts().payload();
+        if body.len() < EXTERNAL_PAYLOAD_THRESHOLD {
+            return Ok(());
+        }
+        let reservation =
+            self.registry
+                .reserve(pager, body.len() as u32, self.oldest_snapshot_txid, alloc)?;
+        let reference =
+            write_payload_unflushed(pager.backend_mut(), reservation.first_page_id, body)?;
+        self.pending_writes = true;
+        self.registry.register_body(reservation, reference)?;
+        value.set_external_reference(reference);
+        Ok(())
+    }
+
+    fn flush_pending<B: FileBackend>(&mut self, pager: &mut Pager<B>) -> Result<()> {
+        if self.pending_writes {
+            pager.backend_mut().flush()?;
+            self.pending_writes = false;
+        }
+        Ok(())
+    }
+}
 
 struct CommitPlan {
     new_txid: u64,
@@ -227,17 +347,31 @@ impl<T> BatchExecutionReport<T> {
 #[derive(Debug, Default)]
 struct FreePagePool {
     ready: Vec<u64>,
-    retired: VecDeque<(u64, Vec<u64>)>,
+    retired: VecDeque<RetiredPageBatch>,
+}
+
+#[derive(Debug)]
+struct RetiredPageBatch {
+    txid: u64,
+    pages: Vec<u64>,
+    dirty_images: Vec<(u64, u64)>,
 }
 
 impl FreePagePool {
-    fn promote(&mut self, oldest_snapshot_txid: u64) {
-        while let Some((retired_at, _)) = self.retired.front() {
-            if *retired_at > oldest_snapshot_txid {
+    fn promote(
+        &mut self,
+        oldest_snapshot_txid: u64,
+        mut discard_dirty_image: impl FnMut(u64, u64),
+    ) {
+        while let Some(batch) = self.retired.front() {
+            if batch.txid > oldest_snapshot_txid {
                 break;
             }
-            if let Some((_, pages)) = self.retired.pop_front() {
-                self.ready.extend(pages);
+            if let Some(batch) = self.retired.pop_front() {
+                for (page_id, generation) in batch.dirty_images {
+                    discard_dirty_image(page_id, generation);
+                }
+                self.ready.extend(batch.pages);
             }
         }
     }
@@ -250,9 +384,13 @@ impl FreePagePool {
         self.ready.extend(pages);
     }
 
-    fn retire(&mut self, txid: u64, pages: Vec<u64>) {
+    fn retire(&mut self, txid: u64, pages: Vec<u64>, dirty_images: Vec<(u64, u64)>) {
         if !pages.is_empty() {
-            self.retired.push_back((txid, pages));
+            self.retired.push_back(RetiredPageBatch {
+                txid,
+                pages,
+                dirty_images,
+            });
         }
     }
 
@@ -262,7 +400,7 @@ impl FreePagePool {
     }
 
     fn retired_len(&self) -> usize {
-        self.retired.iter().map(|(_, pages)| pages.len()).sum()
+        self.retired.iter().map(|batch| batch.pages.len()).sum()
     }
 }
 
@@ -288,6 +426,7 @@ pub struct Engine<B: FileBackend> {
     change_feed_policy: ChangeFeedPolicy,
     next_tx_id: u64,
     next_commit_txid: u64,
+    next_value_revision_ordinal: u64,
     txns: HashMap<u64, TransactionState>,
     next_failpoint: Option<Failpoint>,
     cache_pages: usize,
@@ -365,6 +504,7 @@ impl<B: FileBackend> Engine<B> {
             change_feed_policy: ChangeFeedPolicy::default(),
             next_tx_id: 1,
             next_commit_txid: 1,
+            next_value_revision_ordinal: 0,
             txns: HashMap::new(),
             next_failpoint: None,
             cache_pages,
@@ -394,6 +534,7 @@ impl<B: FileBackend> Engine<B> {
         self.wal_durable_txid = superblock.last_committed_txid;
         self.checkpoint_txid = superblock.last_committed_txid;
         self.next_commit_txid = superblock.last_committed_txid.saturating_add(1);
+        self.next_value_revision_ordinal = 0;
         self.schema_version = catalog.schema_version;
         self.catalog = Arc::new(catalog.stores);
         self.change_feed_floor_txid = change_feed_floor_txid;
@@ -523,6 +664,7 @@ impl<B: FileBackend> Engine<B> {
     }
 
     fn checkpoint_inner(&mut self, known_wal_len: Option<u64>) -> Result<()> {
+        self.promote_free_pages();
         if !self.pager.has_dirty() && self.checkpoint_txid == self.superblock.last_committed_txid {
             return Ok(());
         }
@@ -626,6 +768,7 @@ impl<B: FileBackend> Engine<B> {
             stores,
             staged_schema_version,
             staged_change_feed_policy,
+            revision_epoch: _,
         } = write_tx;
         if snapshot.last_committed_txid != self.superblock.last_committed_txid {
             return Err(EngineError::TransactionConflict {
@@ -915,6 +1058,222 @@ impl<B: FileBackend> Engine<B> {
         result
     }
 
+    /// Reads live value sizes from headers. Does not validate bodies or stage TTL deletes.
+    pub fn get_many_value_sizes<K: AsRef<[u8]>>(
+        &mut self,
+        tx_id: u64,
+        store: &str,
+        keys: &[K],
+    ) -> Result<Vec<Option<usize>>> {
+        validate_store_name(store)?;
+        for key in keys {
+            validate_key(key.as_ref())?;
+        }
+        let now_ms = now_unix_ms()?;
+        let tx = self.take_tx(tx_id)?;
+        let mut order: Vec<usize> = (0..keys.len()).collect();
+        order.sort_by(|left, right| keys[*left].as_ref().cmp(keys[*right].as_ref()));
+        let mut batch = PointReadBatch::default();
+        let result = (|| match &tx.inner {
+            TxInner::Readonly(readonly) => {
+                let meta = readonly
+                    .snapshot
+                    .catalog
+                    .get(store)
+                    .ok_or_else(|| EngineError::StoreNotFound(store.into()))?;
+                read_many_in_order(keys, &order, |key| {
+                    lookup_stored_value_size(
+                        &mut self.pager,
+                        meta.store_root_page_id,
+                        key,
+                        meta.flags,
+                        now_ms,
+                        Some(&mut batch),
+                    )
+                })
+            }
+            TxInner::Readwrite(rw) => {
+                ensure_readwrite_store_visible(rw, store)?;
+                read_many_in_order(keys, &order, |key| {
+                    stored_value_size_with_staged(
+                        &mut self.pager,
+                        rw,
+                        store,
+                        key,
+                        now_ms,
+                        &mut batch,
+                    )
+                })
+            }
+        })();
+        self.put_tx(tx);
+        result
+    }
+
+    /// Retains physical expired rows in metadata. Does not read bodies or stage TTL deletes.
+    pub fn get_many_value_states<K: AsRef<[u8]>>(
+        &mut self,
+        tx_id: u64,
+        store: &str,
+        keys: &[K],
+    ) -> Result<Vec<Option<ValueState>>> {
+        validate_store_name(store)?;
+        for key in keys {
+            validate_key(key.as_ref())?;
+        }
+        let now_ms = now_unix_ms()?;
+        let tx = self.take_tx(tx_id)?;
+        let mut order: Vec<usize> = (0..keys.len()).collect();
+        order.sort_by(|left, right| keys[*left].as_ref().cmp(keys[*right].as_ref()));
+        let mut batch = PointReadBatch::default();
+        let result = (|| match &tx.inner {
+            TxInner::Readonly(readonly) => {
+                let meta = readonly
+                    .snapshot
+                    .catalog
+                    .get(store)
+                    .ok_or_else(|| EngineError::StoreNotFound(store.into()))?;
+                read_many_in_order(keys, &order, |key| {
+                    lookup_stored_value_state(
+                        &mut self.pager,
+                        meta.store_root_page_id,
+                        key,
+                        meta.flags,
+                        now_ms,
+                        Some(&mut batch),
+                    )
+                })
+            }
+            TxInner::Readwrite(rw) => {
+                ensure_readwrite_store_visible(rw, store)?;
+                read_many_in_order(keys, &order, |key| {
+                    stored_value_state_with_staged(
+                        &mut self.pager,
+                        rw,
+                        store,
+                        key,
+                        now_ms,
+                        &mut batch,
+                    )
+                })
+            }
+        })();
+        self.put_tx(tx);
+        result
+    }
+
+    pub fn get_many_packed<K: AsRef<[u8]>>(
+        &mut self,
+        tx_id: u64,
+        store: &str,
+        keys: &[K],
+    ) -> Result<Vec<u8>> {
+        validate_store_name(store)?;
+        for key in keys {
+            validate_key(key.as_ref())?;
+        }
+        let now_ms = now_unix_ms()?;
+        let mut tx = self.take_tx(tx_id)?;
+        let mut order: Vec<usize> = (0..keys.len()).collect();
+        order.sort_by(|left, right| keys[*left].as_ref().cmp(keys[*right].as_ref()));
+        let mut batch = PointReadBatch::default();
+        let result = (|| {
+            // Metadata fixes every output slot before sorted reads fill values in input order.
+            let metadata = match &tx.inner {
+                TxInner::Readonly(readonly) => {
+                    let meta = readonly
+                        .snapshot
+                        .catalog
+                        .get(store)
+                        .ok_or_else(|| EngineError::StoreNotFound(store.into()))?;
+                    read_many_in_order(keys, &order, |key| {
+                        lookup_stored_value_info(
+                            &mut self.pager,
+                            meta.store_root_page_id,
+                            key,
+                            meta.flags,
+                            Some(&mut batch),
+                        )
+                    })?
+                }
+                TxInner::Readwrite(rw) => {
+                    ensure_readwrite_store_visible(rw, store)?;
+                    read_many_in_order(keys, &order, |key| {
+                        stored_value_info_with_staged(&mut self.pager, rw, store, key, &mut batch)
+                    })?
+                }
+            };
+            let lengths: Vec<Option<usize>> = metadata
+                .iter()
+                .map(|info| {
+                    info.and_then(|(length, expiry)| {
+                        (!matches!(expiry, Some(timestamp) if now_ms >= timestamp))
+                            .then_some(length)
+                    })
+                })
+                .collect();
+            let mut packet = PackedValues::new(&lengths)?;
+            let mut start = 0;
+            while start < order.len() {
+                let index = order[start];
+                let key = keys[index].as_ref();
+                let mut end = start + 1;
+                while end < order.len() && keys[order[end]].as_ref() == key {
+                    end += 1;
+                }
+                let mut writer = packet.writer(index, lengths[index].unwrap_or(0));
+                let mut write = |chunk: &[u8]| {
+                    if lengths[index].is_some() {
+                        writer.write(chunk)
+                    } else {
+                        Ok(())
+                    }
+                };
+                let expiry = match &mut tx.inner {
+                    TxInner::Readonly(readonly) => {
+                        let meta = readonly
+                            .snapshot
+                            .catalog
+                            .get(store)
+                            .ok_or_else(|| EngineError::StoreNotFound(store.into()))?;
+                        lookup_stored_value_into(
+                            &mut self.pager,
+                            meta.store_root_page_id,
+                            key,
+                            meta.flags,
+                            Some(&mut batch),
+                            &mut write,
+                        )?
+                    }
+                    TxInner::Readwrite(rw) => stored_value_into_with_staged(
+                        &mut self.pager,
+                        rw,
+                        store,
+                        key,
+                        now_ms,
+                        &mut batch,
+                        &mut write,
+                    )?,
+                };
+                if expiry != metadata[index].map(|(_, expiry)| expiry) {
+                    return Err(EngineError::Corruption(
+                        "value metadata changed during packed read".into(),
+                    ));
+                }
+                writer.finish()?;
+                if let Some(length) = lengths[index] {
+                    for duplicate in &order[start + 1..end] {
+                        packet.duplicate(index, *duplicate, length);
+                    }
+                }
+                start = end;
+            }
+            Ok(packet.bytes)
+        })();
+        self.put_tx(tx);
+        result
+    }
+
     pub fn put(&mut self, tx_id: u64, store: &str, key: &[u8], value: &[u8]) -> Result<()> {
         self.put_with_ttl(tx_id, store, key, value, None)
     }
@@ -931,6 +1290,70 @@ impl<B: FileBackend> Engine<B> {
             .map(|_| ())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    /// Checks the stored revision. Expired rows remain eligible until cleanup.
+    /// Read the expected revision from the primary row in this transaction.
+    /// Derive the logical index projection from that row. This checks the
+    /// primary-key binding and revision, not the document fields.
+    pub fn put_index_entry_checked(
+        &mut self,
+        tx_id: u64,
+        primary_store: &str,
+        index_store: &str,
+        primary_key: &[u8],
+        index_key: &[u8],
+        expected_epoch: u64,
+        expected_ordinal: u64,
+    ) -> Result<()> {
+        validate_store_name(primary_store)?;
+        validate_store_name(index_store)?;
+        validate_key(primary_key)?;
+        validate_key(index_key)?;
+        validate_index_entry_binding(index_store, index_key, primary_key)?;
+        let expected = ValueRevision {
+            epoch: expected_epoch,
+            ordinal: expected_ordinal,
+        };
+        let now_ms = now_unix_ms()?;
+        let mut tx = self.take_tx(tx_id)?;
+        let result = tx.readwrite_mut().and_then(|rw| {
+            let state = stored_value_state_with_staged(
+                &mut self.pager,
+                rw,
+                primary_store,
+                primary_key,
+                now_ms,
+                &mut PointReadBatch::default(),
+            )?;
+            if expected.epoch == 0
+                || expected.ordinal == 0
+                || state.and_then(|state| state.revision) != Some(expected)
+            {
+                return Err(EngineError::ValueRevisionConflict);
+            }
+            if expected.epoch > rw.snapshot.last_committed_txid
+                && Some(expected.epoch) != rw.revision_epoch
+            {
+                return Err(EngineError::Corruption(
+                    "primary revision is newer than its transaction".into(),
+                ));
+            }
+            validate_readwrite_store_value(rw, index_store, &[])?;
+            put_with_staged_at(
+                &mut self.pager,
+                &mut self.next_value_revision_ordinal,
+                rw,
+                index_store,
+                index_key,
+                StoredValue::plain(Vec::new()).with_revision(expected),
+                now_ms,
+            )
+            .map(|_| ())
+        });
+        self.put_tx(tx);
+        result
+    }
+
     /// Like [`Engine::put_with_ttl`], but reports whether a live value existed
     /// for `key` before this write. The answer comes from key metadata, so the
     /// previous value is never materialized.
@@ -944,13 +1367,16 @@ impl<B: FileBackend> Engine<B> {
     ) -> Result<bool> {
         validate_store_name(store)?;
         validate_key(key)?;
-        validate_value(value)?;
+        validate_store_value_max_size(value)?;
         let operation_now_ms = now_unix_ms()?;
         let expires_at_ms = absolute_expiry_from_ttl_at(ttl_ms, operation_now_ms)?;
         let mut tx = self.take_tx(tx_id)?;
         let result = tx.readwrite_mut().and_then(|rw| {
+            validate_readwrite_store_value(rw, store, value)?;
+            self.ensure_revision_epoch(rw)?;
             put_with_staged_at(
                 &mut self.pager,
+                &mut self.next_value_revision_ordinal,
                 rw,
                 store,
                 key,
@@ -998,11 +1424,14 @@ impl<B: FileBackend> Engine<B> {
         for (key, value) in entries {
             let (key, value) = (key.as_ref(), value.as_ref());
             let result = validate_key(key)
-                .and_then(|_| validate_value(value))
+                .and_then(|_| validate_store_value_max_size(value))
                 .and_then(|_| tx.readwrite_mut())
                 .and_then(|rw| {
+                    validate_readwrite_store_value(rw, store, value)?;
+                    self.ensure_revision_epoch(rw)?;
                     put_with_staged_at(
                         &mut self.pager,
+                        &mut self.next_value_revision_ordinal,
                         rw,
                         store,
                         key,
@@ -1027,6 +1456,129 @@ impl<B: FileBackend> Engine<B> {
         entries: &[(K, V)],
     ) -> Result<Vec<bool>> {
         self.put_many_report(tx_id, store, entries).into_result()
+    }
+
+    /// Completes each primary put and its index writes before starting the next row.
+    /// On failure, earlier writes in the failed row remain staged, but that row
+    /// has no completed outcome.
+    pub fn put_many_indexed_report<K: AsRef<[u8]>, V: AsRef<[u8]>>(
+        &mut self,
+        tx_id: u64,
+        store: &str,
+        entries: &[(K, V)],
+        index_ops: &[Vec<IndexOpRef<'_>>],
+        ttl_ms: Option<u64>,
+    ) -> BatchExecutionReport<bool> {
+        if entries.len() != index_ops.len() {
+            return BatchExecutionReport::failure(
+                Vec::new(),
+                EngineError::Serialization("indexed put row count mismatch".into()),
+            );
+        }
+        let mut tx: Option<TransactionState> = None;
+        let mut completed = Vec::with_capacity(entries.len());
+        for ((key, value), row_ops) in entries.iter().zip(index_ops) {
+            let (key, value) = (key.as_ref(), value.as_ref());
+            let result = (|| {
+                validate_store_name(store)?;
+                validate_key(key)?;
+                validate_store_value_max_size(value)?;
+                let now_ms = now_unix_ms()?;
+                let expires_at_ms = absolute_expiry_from_ttl_at(ttl_ms, now_ms)?;
+                if tx.is_none() {
+                    tx = Some(self.take_tx(tx_id)?);
+                }
+                let rw = tx
+                    .as_mut()
+                    .ok_or_else(|| EngineError::Internal("indexed put transaction missing".into()))?
+                    .readwrite_mut()?;
+                validate_readwrite_store_value(rw, store, value)?;
+                self.ensure_revision_epoch(rw)?;
+                let baseline_exists = put_with_staged_at(
+                    &mut self.pager,
+                    &mut self.next_value_revision_ordinal,
+                    rw,
+                    store,
+                    key,
+                    StoredValue::with_expiry(value.to_vec(), expires_at_ms),
+                    now_ms,
+                )?;
+                let revision = match staged_lookup(rw, store, key)? {
+                    StagedLookup::Staged(Some(value)) => value.revision,
+                    _ => None,
+                };
+                for op in row_ops {
+                    let (index_store, index_key) = match op {
+                        IndexOpRef::Put { store, key } | IndexOpRef::Delete { store, key } => {
+                            (*store, *key)
+                        }
+                    };
+                    validate_store_name(index_store)?;
+                    validate_key(index_key)?;
+                    let now_ms = now_unix_ms()?;
+                    match op {
+                        IndexOpRef::Put { .. } => {
+                            validate_readwrite_store_value(rw, index_store, &[])?;
+                            let mut index_value = StoredValue::plain(Vec::new());
+                            // Only bound SDK index entries may share a primary revision.
+                            if index_store.starts_with("__browserdb:index:") {
+                                validate_index_entry_binding(index_store, index_key, key)?;
+                                index_value =
+                                    index_value.with_revision(revision.ok_or_else(|| {
+                                        EngineError::Internal(
+                                            "indexed primary revision missing".into(),
+                                        )
+                                    })?);
+                            }
+                            put_with_staged_at(
+                                &mut self.pager,
+                                &mut self.next_value_revision_ordinal,
+                                rw,
+                                index_store,
+                                index_key,
+                                index_value,
+                                now_ms,
+                            )?;
+                        }
+                        IndexOpRef::Delete { .. } => {
+                            delete_with_staged_at(
+                                &mut self.pager,
+                                rw,
+                                index_store,
+                                index_key,
+                                now_ms,
+                            )?;
+                        }
+                    }
+                }
+                Ok(baseline_exists)
+            })();
+            match result {
+                Ok(baseline_exists) => completed.push(baseline_exists),
+                Err(error) => {
+                    return match tx {
+                        Some(tx) => self.batch_failure(tx, completed, error),
+                        None => BatchExecutionReport::failure(completed, error),
+                    };
+                }
+            }
+        }
+        if let Some(tx) = tx {
+            self.put_tx(tx);
+        }
+        BatchExecutionReport::success(completed)
+    }
+
+    pub fn put_many_indexed<K: AsRef<[u8]>, V: AsRef<[u8]>>(
+        &mut self,
+        tx_id: u64,
+        store: &str,
+        entries: &[(K, V)],
+        index_ops: &[Vec<IndexOpRef<'_>>],
+        ttl_ms: Option<u64>,
+    ) -> Result<Vec<bool>> {
+        self.put_many_indexed_report(tx_id, store, entries, index_ops, ttl_ms)
+            .into_result()
     }
 
     pub fn put_many_with_ttl<K: AsRef<[u8]>, V: AsRef<[u8]>>(
@@ -1129,11 +1681,14 @@ impl<B: FileBackend> Engine<B> {
         for op in ops {
             let result = match *op {
                 BatchOpRef::Put { key, value } => validate_key(key)
-                    .and_then(|_| validate_value(value))
+                    .and_then(|_| validate_store_value_max_size(value))
                     .and_then(|_| tx.readwrite_mut())
                     .and_then(|rw| {
+                        validate_readwrite_store_value(rw, store, value)?;
+                        self.ensure_revision_epoch(rw)?;
                         put_with_staged_at(
                             &mut self.pager,
+                            &mut self.next_value_revision_ordinal,
                             rw,
                             store,
                             key,
@@ -1186,6 +1741,112 @@ impl<B: FileBackend> Engine<B> {
             },
             TxInner::Readwrite(rw) => scan_with_staged(&mut self.pager, rw, store, range, now_ms),
         };
+        self.put_tx(tx);
+        result
+    }
+
+    pub fn scan_packed_page(
+        &mut self,
+        tx_id: u64,
+        store: &str,
+        range: &ScanRange,
+        max_rows: usize,
+        max_bytes: usize,
+        keys_only: bool,
+    ) -> Result<PackedScanPage> {
+        validate_store_name(store)?;
+        range.validate()?;
+        if max_rows == 0 {
+            return Err(EngineError::InvalidRange(
+                "scan row budget must be positive".into(),
+            ));
+        }
+        let mut bounded = range.clone();
+        bounded.limit = Some(range.limit.unwrap_or(usize::MAX).min(max_rows));
+        let now_ms = now_unix_ms()?;
+        let mut packet = ScanPacket::new(max_bytes)?;
+        let mut tx = self.take_tx(tx_id)?;
+        let result = (|| {
+            let mut append = |pager: &mut Pager<B>, key: Vec<u8>, value: VisibleValue<'_>| {
+                let length = if keys_only {
+                    0
+                } else {
+                    match &value {
+                        VisibleValue::Staged(stored, _) => stored.value.len(),
+                        VisibleValue::Committed(pending, flags) => {
+                            pending_stored_value_info(pager, pending, *flags)?.0
+                        }
+                    }
+                };
+                let decoded_length = if keys_only {
+                    0
+                } else {
+                    match &value {
+                        VisibleValue::Staged(stored, flags) => {
+                            decoded_scan_value_length(&stored.value, *flags, length)?
+                        }
+                        VisibleValue::Committed(pending, flags) => {
+                            let offset = store_value_prefix_len(*flags);
+                            if store_compression_from_flags(*flags)? == StoreCompression::None {
+                                length
+                            } else {
+                                let prefix = pending_value_prefix(
+                                    pager,
+                                    pending,
+                                    offset + COMPRESSION_VALUE_HEADER_SIZE,
+                                )?;
+                                decoded_scan_value_length(&prefix[offset..], *flags, length)?
+                            }
+                        }
+                    }
+                };
+                if !packet.begin_row(&key, length, decoded_length)? {
+                    return Ok(false);
+                }
+                if !keys_only {
+                    match value {
+                        VisibleValue::Staged(stored, _) => {
+                            packet.bytes.extend_from_slice(&stored.value)
+                        }
+                        VisibleValue::Committed(pending, flags) => {
+                            write_pending_stored_value(pager, pending, flags, |chunk| {
+                                packet.bytes.extend_from_slice(chunk);
+                                Ok(())
+                            })?;
+                        }
+                    }
+                }
+                packet.finish_row(&key);
+                Ok(true)
+            };
+            let exhausted = match &mut tx.inner {
+                TxInner::Readonly(readonly) => {
+                    let meta = readonly
+                        .snapshot
+                        .catalog
+                        .get(store)
+                        .ok_or_else(|| EngineError::StoreNotFound(store.into()))?;
+                    visit_committed_visible(
+                        &mut self.pager,
+                        meta.store_root_page_id,
+                        meta.flags,
+                        &bounded,
+                        now_ms,
+                        &mut append,
+                    )?
+                }
+                TxInner::Readwrite(rw) => visit_with_staged(
+                    &mut self.pager,
+                    rw,
+                    store,
+                    &bounded,
+                    now_ms,
+                    false,
+                    &mut append,
+                )?,
+            };
+            packet.finish(exhausted)
+        })();
         self.put_tx(tx);
         result
     }
@@ -1262,14 +1923,76 @@ impl<B: FileBackend> Engine<B> {
         let mut iter = TreeIter::new(&mut self.pager, change_log_meta.store_root_page_id, &range)?;
         while let Some(pair) = iter.next(&mut self.pager)? {
             let record_txid = decode_change_log_record_txid(&pair.key)?;
-            let payload = materialize_pending_value(&mut self.pager, pair.value)?;
-            let record = decode_change_record_payload_ref(&payload)?;
-            if let Some(filter) = store_filter.as_ref() {
-                if !filter.contains(record.store) {
-                    continue;
+            let total_len = match &pair.value {
+                PendingValue::Inline(value) => value.len(),
+                PendingValue::Overflow { total_len, .. } => *total_len,
+                PendingValue::External { payload, prefix } => {
+                    prefix.len() + payload.body_len as usize
                 }
+            };
+            let mut prefix = Vec::with_capacity(total_len.min(MAX_CHANGE_RECORD_PREFIX_SIZE));
+            let mut selected = None;
+            let mut value: Option<Vec<u8>> = None;
+            let mut metadata_error = None;
+            // Complete body validation before skipping records or reporting metadata errors.
+            write_pending_stored_value(
+                &mut self.pager,
+                pair.value,
+                CHANGELOG_STORE_FLAGS,
+                |chunk| {
+                    if let Some(selected) = selected {
+                        if selected {
+                            if let Some(value) = value.as_mut() {
+                                value.extend_from_slice(chunk);
+                            }
+                        }
+                        return Ok(());
+                    }
+                    if metadata_error.is_some() {
+                        return Ok(());
+                    }
+                    let take = (MAX_CHANGE_RECORD_PREFIX_SIZE - prefix.len()).min(chunk.len());
+                    prefix.extend_from_slice(&chunk[..take]);
+                    match decode_change_record_prefix_ref(&prefix, total_len) {
+                        Ok(Some(record)) => {
+                            let include = store_filter
+                                .as_ref()
+                                .is_none_or(|filter| filter.contains(record.store));
+                            selected = Some(include);
+                            if include && record.kind == ChangeKind::Put {
+                                let mut body = Vec::new();
+                                body.try_reserve_exact(record.value_len).map_err(|error| {
+                                    EngineError::Storage(format!(
+                                        "change value allocation failed: {error}"
+                                    ))
+                                })?;
+                                body.extend_from_slice(record.value_prefix);
+                                body.extend_from_slice(&chunk[take..]);
+                                value = Some(body);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => metadata_error = Some(error),
+                    }
+                    Ok(())
+                },
+            )?;
+            if let Some(error) = metadata_error {
+                return Err(error);
             }
-            changes.push(record.into_owned(record_txid));
+            let record = decode_change_record_prefix_ref(&prefix, total_len)?.ok_or_else(|| {
+                EngineError::Corruption("change log payload prefix is truncated".into())
+            })?;
+            if selected == Some(false) {
+                continue;
+            }
+            changes.push(ChangeRecord {
+                tx_id: record_txid,
+                store: record.store.to_owned(),
+                key: record.key.to_vec(),
+                kind: record.kind,
+                value,
+            });
             if changes.len() >= limit {
                 break;
             }
@@ -1389,6 +2112,11 @@ impl<B: FileBackend> Engine<B> {
             .checked_add(1)
             .ok_or_else(|| EngineError::Internal("commit txid overflow".into()))?;
         let mut alloc = PageAllocator::new(target.superblock.next_page_id);
+        let mut payloads = PayloadPreparation {
+            registry: PayloadRegistry::new(0),
+            oldest_snapshot_txid: 0,
+            pending_writes: false,
+        };
         let mut stores = CatalogMap::new();
         let mut page_batch = Vec::with_capacity(crate::pager::PAGE_WRITE_BATCH_PAGES);
         let mut page_buffer = Vec::new();
@@ -1397,6 +2125,7 @@ impl<B: FileBackend> Engine<B> {
         // The target feed floor excludes the source history.
         for (name, meta) in self.catalog.iter() {
             if skipped_stores.contains(name.as_str())
+                || name.as_str() == PAYLOAD_REGISTRY_STORE_NAME
                 || (name.as_str() == SYSTEM_CHANGELOG_STORE_NAME
                     && store_uses_system_raw_values(meta.flags))
             {
@@ -1412,8 +2141,11 @@ impl<B: FileBackend> Engine<B> {
                 if pending_value_expired(&mut self.pager, meta.flags, &pair.value, now_ms)? {
                     continue;
                 }
-                let value = materialize_pending_value(&mut self.pager, pair.value)?;
-                builder.push(&pair.key, &value, &mut alloc)?;
+                let raw = materialize_pending_value(&mut self.pager, pair.value)?;
+                let stored = StoredValue::decode_owned_for_store(meta.flags, raw)?;
+                let mut value = PreparedValue::stored(&stored, meta.flags)?;
+                payloads.externalize(&mut target.pager, &mut alloc, &mut value)?;
+                builder.push_value(&pair.key, &value, &mut alloc)?;
                 queue_compaction_images(
                     &mut target.pager,
                     &mut page_batch,
@@ -1438,6 +2170,29 @@ impl<B: FileBackend> Engine<B> {
             );
         }
 
+        payloads.registry.apply_reference_changes(
+            alloc.added_payload_refs(),
+            alloc.dropped_payload_refs(),
+            new_txid,
+            &mut target.pager,
+        )?;
+        if let Some(built) = payloads.registry.finish(&mut target.pager, &mut alloc)? {
+            queue_compaction_images(
+                &mut target.pager,
+                &mut page_batch,
+                &mut page_buffer,
+                built.page_images,
+            )?;
+            stores.insert(
+                PAYLOAD_REGISTRY_STORE_NAME.into(),
+                StoreMetadata {
+                    store_root_page_id: built.root_page_id,
+                    created_txid: new_txid,
+                    flags: STORE_FLAG_SYSTEM_RAW_VALUES,
+                },
+            );
+        }
+
         let catalog_state = CatalogState {
             schema_version: self.schema_version,
             change_feed_floor_txid: self.superblock.last_committed_txid,
@@ -1454,6 +2209,7 @@ impl<B: FileBackend> Engine<B> {
         target
             .pager
             .write_page_images(&mut page_batch, &mut page_buffer)?;
+        // Flush tree pages and pending payload bodies before manifest publication.
         target.pager.flush()?;
 
         let generation = target
@@ -1516,14 +2272,13 @@ impl<B: FileBackend> Engine<B> {
             .min(self.superblock.last_committed_txid)
     }
 
-    fn committed_view(&self) -> CommittedView<'_> {
-        CommittedView {
-            catalog: &self.catalog,
-            catalog_root_page_id: self.superblock.catalog_root_page_id,
-            schema_version: self.schema_version,
-            change_feed_floor_txid: self.change_feed_floor_txid,
-            change_feed_policy: self.change_feed_policy,
-        }
+    fn promote_free_pages(&mut self) {
+        let oldest_snapshot_txid = self.oldest_snapshot_txid();
+        let pager = &mut self.pager;
+        self.free_pages
+            .promote(oldest_snapshot_txid, |page_id, generation| {
+                pager.discard_dirty_page_if_generation(page_id, generation);
+            });
     }
 
     fn commit_staged(
@@ -1537,7 +2292,7 @@ impl<B: FileBackend> Engine<B> {
             normalize_expired_stage_mutations(stage, commit_now_ms);
         }
         let new_txid = self.reserve_commit_txid()?;
-        self.free_pages.promote(self.oldest_snapshot_txid());
+        self.promote_free_pages();
         let reusable = self.free_pages.take_ready();
         let mut alloc =
             PageAllocator::with_reusable(self.superblock.next_page_id, reusable.clone());
@@ -1548,6 +2303,7 @@ impl<B: FileBackend> Engine<B> {
             schema_version: self.schema_version,
             change_feed_floor_txid: self.change_feed_floor_txid,
             change_feed_policy: self.change_feed_policy,
+            oldest_snapshot_txid: self.oldest_snapshot_txid(),
         };
         let plan = plan_commit(
             &mut self.pager,
@@ -1573,12 +2329,22 @@ impl<B: FileBackend> Engine<B> {
         let new_txid = self
             .reserve_commit_txid_at_least(snapshot.source_last_committed_txid.saturating_add(1))?;
         let apply_now_ms = now_unix_ms()?;
-        self.free_pages.promote(self.oldest_snapshot_txid());
+        self.promote_free_pages();
         let reusable = self.free_pages.take_ready();
         let mut alloc =
             PageAllocator::with_reusable(self.superblock.next_page_id, reusable.clone());
+        let catalog = self.catalog.clone();
+        let view = CommittedView {
+            catalog: &catalog,
+            catalog_root_page_id: self.superblock.catalog_root_page_id,
+            schema_version: self.schema_version,
+            change_feed_floor_txid: self.change_feed_floor_txid,
+            change_feed_policy: self.change_feed_policy,
+            oldest_snapshot_txid: self.oldest_snapshot_txid(),
+        };
         let plan = plan_snapshot_apply(
-            &self.committed_view(),
+            &mut self.pager,
+            &view,
             snapshot,
             new_txid,
             apply_now_ms,
@@ -1602,10 +2368,28 @@ impl<B: FileBackend> Engine<B> {
     ) -> Result<u64> {
         let new_txid = plan.new_txid;
         let (next_page_id, unused, freed) = alloc.into_parts();
+        // Match the retired image, even if this commit stages the same page id.
+        let dirty_images = freed
+            .iter()
+            .filter_map(|page_id| {
+                self.pager
+                    .dirty_page_generation(*page_id)
+                    .map(|generation| (*page_id, generation))
+            })
+            .collect();
         match self.finish_commit(plan, next_page_id) {
-            Ok(txid) => {
+            Ok((txid, wal_offset)) => {
+                // Roots are published. Checkpoint must see their retirements.
                 self.free_pages.restore(unused);
-                self.free_pages.retire(new_txid, freed);
+                self.free_pages.retire(new_txid, freed, dirty_images);
+                self.promote_free_pages();
+                if let Err(err) = self.maybe_checkpoint(wal_offset) {
+                    self.poison(
+                        format!("checkpoint after commit failed: {err}"),
+                        Some(new_txid),
+                    );
+                    return Err(err);
+                }
                 Ok(txid)
             }
             Err(err) => {
@@ -1621,6 +2405,17 @@ impl<B: FileBackend> Engine<B> {
         self.reserve_commit_txid_at_least(self.next_commit_txid)
     }
 
+    fn ensure_revision_epoch(&self, rw: &mut ReadwriteTx) -> Result<()> {
+        if rw.revision_epoch.is_none() {
+            // Peeking keeps rollback out of feed retention. Global ordinals separate writers.
+            self.next_commit_txid
+                .checked_add(1)
+                .ok_or_else(|| EngineError::Internal("commit txid overflow".into()))?;
+            rw.revision_epoch = Some(self.next_commit_txid);
+        }
+        Ok(())
+    }
+
     fn reserve_commit_txid_at_least(&mut self, minimum: u64) -> Result<u64> {
         let new_txid = self.next_commit_txid.max(minimum);
         self.next_commit_txid = new_txid
@@ -1629,7 +2424,7 @@ impl<B: FileBackend> Engine<B> {
         Ok(new_txid)
     }
 
-    fn finish_commit(&mut self, plan: CommitPlan, next_page_id: u64) -> Result<u64> {
+    fn finish_commit(&mut self, plan: CommitPlan, next_page_id: u64) -> Result<(u64, u64)> {
         let CommitPlan {
             new_txid,
             catalog_update,
@@ -1687,14 +2482,7 @@ impl<B: FileBackend> Engine<B> {
         catalog_update.publish(&mut self.catalog);
         self.change_feed_floor_txid = final_change_feed_floor_txid;
         self.change_feed_policy = final_change_feed_policy;
-        if let Err(err) = self.maybe_checkpoint(wal_offset) {
-            self.poison(
-                format!("checkpoint after commit failed: {err}"),
-                Some(new_txid),
-            );
-            return Err(err);
-        }
-        Ok(new_txid)
+        Ok((new_txid, wal_offset))
     }
 
     fn maybe_checkpoint(&mut self, wal_len: u64) -> Result<()> {
@@ -1765,6 +2553,7 @@ struct CommittedView<'a> {
     schema_version: u64,
     change_feed_floor_txid: u64,
     change_feed_policy: ChangeFeedPolicy,
+    oldest_snapshot_txid: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1783,6 +2572,17 @@ fn plan_commit<B: FileBackend>(
     let final_policy = staged_policy.unwrap_or(view.change_feed_policy);
     let mut page_images = Vec::new();
     let mut change_payloads = Vec::new();
+    let registry_meta = view.catalog.get(PAYLOAD_REGISTRY_STORE_NAME);
+    if registry_meta.is_some_and(|meta| !store_uses_system_raw_values(meta.flags)) {
+        return Err(EngineError::ReservedStoreName(
+            PAYLOAD_REGISTRY_STORE_NAME.into(),
+        ));
+    }
+    let mut payloads = PayloadPreparation {
+        registry: PayloadRegistry::new(registry_meta.map_or(0, |meta| meta.store_root_page_id)),
+        oldest_snapshot_txid: view.oldest_snapshot_txid,
+        pending_writes: false,
+    };
 
     for (name, stage) in staged {
         if !stage.has_changes() {
@@ -1805,6 +2605,7 @@ fn plan_commit<B: FileBackend>(
             &mut change_payloads[change_start..],
             now_ms,
             alloc,
+            &mut payloads,
         )?
         else {
             continue;
@@ -1912,6 +2713,26 @@ fn plan_commit<B: FileBackend>(
         free_tree(pager, meta.store_root_page_id, alloc)?;
     }
 
+    payloads.flush_pending(pager)?;
+    payloads.registry.apply_reference_changes(
+        alloc.added_payload_refs(),
+        alloc.dropped_payload_refs(),
+        new_txid,
+        pager,
+    )?;
+    if let Some(built) = payloads.registry.finish(pager, alloc)? {
+        page_images.extend(built.page_images);
+        catalog_delta.set(
+            view.catalog,
+            PAYLOAD_REGISTRY_STORE_NAME,
+            Some(StoreMetadata {
+                store_root_page_id: built.root_page_id,
+                created_txid: registry_meta.map_or(new_txid, |meta| meta.created_txid),
+                flags: STORE_FLAG_SYSTEM_RAW_VALUES,
+            }),
+        );
+    }
+
     let catalog_changed = !catalog_delta.is_empty()
         || final_schema_version != view.schema_version
         || floor != view.change_feed_floor_txid
@@ -1947,6 +2768,7 @@ fn build_store_commit<'a, B: FileBackend>(
     changes: &mut [PreparedChange<'a>],
     now_ms: u64,
     alloc: &mut PageAllocator,
+    payloads: &mut PayloadPreparation,
 ) -> Result<Option<BuiltTree>> {
     let base = stage.base_meta.as_ref();
     if stage.created || stage.cleared || base.is_none() {
@@ -1955,18 +2777,18 @@ fn build_store_commit<'a, B: FileBackend>(
                 free_tree(pager, base.store_root_page_id, alloc)?;
             }
         }
-        let encoded = prepare_stage_puts(stage, changes)?;
+        let encoded = prepare_stage_puts(stage, changes, pager, alloc, payloads)?;
         return build_tree_from_values(encoded.iter().map(|(key, value)| (*key, value)), alloc)
             .map(Some);
     }
     let base = base.ok_or_else(|| EngineError::Internal("missing base metadata".into()))?;
     if stage.force_full_rewrite {
-        return rewrite_store_fully(pager, base, stage, changes, now_ms, alloc).map(Some);
+        return rewrite_store_fully(pager, base, stage, changes, now_ms, alloc, payloads).map(Some);
     }
     if stage.mutations.is_empty() {
         return Ok(None);
     }
-    let encoded = prepare_stage_mutations(stage, changes)?;
+    let encoded = prepare_stage_mutations(stage, changes, pager, alloc, payloads)?;
     let mutations: Vec<_> = encoded
         .iter()
         .map(|(key, value)| (*key, value.as_ref()))
@@ -1983,6 +2805,7 @@ fn rewrite_store_fully<'a, B: FileBackend>(
     changes: &mut [PreparedChange<'a>],
     now_ms: u64,
     alloc: &mut PageAllocator,
+    payloads: &mut PayloadPreparation,
 ) -> Result<BuiltTree> {
     let mut builder = SortedTreeBuilder::new();
     let mut staged = stage.mutations.iter().peekable();
@@ -2006,18 +2829,23 @@ fn rewrite_store_fully<'a, B: FileBackend>(
                 base_next = iter.next(pager)?;
             }
             if let MutationValue::Put(stored) = mutation {
-                let value = prepare_staged_value(stored, stage.flags, change_puts.next())?;
+                let value = prepare_staged_value(
+                    stored,
+                    stage.flags,
+                    change_puts.next(),
+                    pager,
+                    alloc,
+                    payloads,
+                )?;
                 builder.push_value(key, &value, alloc)?;
             }
         } else if let Some(pair) = base_next.take() {
             let raw = materialize_pending_value(pager, pair.value)?;
             let stored = StoredValue::decode_owned_for_store(base.flags, raw)?;
             if !stored.is_expired_at(now_ms) {
-                builder.push_value(
-                    &pair.key,
-                    &PreparedValue::stored(&stored, stage.flags)?,
-                    alloc,
-                )?;
+                let mut value = PreparedValue::stored(&stored, stage.flags)?;
+                payloads.externalize(pager, alloc, &mut value)?;
+                builder.push_value(&pair.key, &value, alloc)?;
             }
             base_next = iter.next(pager)?;
         }
@@ -2045,28 +2873,53 @@ fn queue_compaction_images<B: FileBackend>(
     Ok(())
 }
 
-fn plan_snapshot_apply(
+fn plan_snapshot_apply<B: FileBackend>(
+    pager: &mut Pager<B>,
     view: &CommittedView<'_>,
     snapshot: SnapshotContents,
     new_txid: u64,
     now_ms: u64,
     alloc: &mut PageAllocator,
 ) -> Result<CommitPlan> {
-    // Reset and import leave the previous trees allocated. Compaction reclaims
-    // their pages without a full tree walk during replacement.
+    // Tree pages stay allocated until compaction. External references retire
+    // with this commit and remain protected by the oldest active snapshot.
     let mut final_catalog = CatalogMap::new();
     let mut page_images = Vec::new();
+    let registry_meta = view.catalog.get(PAYLOAD_REGISTRY_STORE_NAME);
+    let mut payloads = PayloadPreparation {
+        registry: PayloadRegistry::new(registry_meta.map_or(0, |meta| meta.store_root_page_id)),
+        oldest_snapshot_txid: view.oldest_snapshot_txid,
+        pending_writes: false,
+    };
+    if let Some(meta) = registry_meta {
+        final_catalog.insert(PAYLOAD_REGISTRY_STORE_NAME.into(), meta.clone());
+    }
 
+    for (name, meta) in view.catalog.iter() {
+        if name != PAYLOAD_REGISTRY_STORE_NAME {
+            drop_tree_payload_references(pager, meta.store_root_page_id, alloc)?;
+        }
+    }
+
+    let mut revision_ordinal = 0u64;
     for store in snapshot.stores {
         validate_user_store_name(&store.name)?;
         let flags = normalize_snapshot_store_flags(store.flags, &store.entries)?;
-        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(store.entries.len());
+        let mut entries: Vec<(Vec<u8>, StoredValue)> = Vec::with_capacity(store.entries.len());
         for entry in store.entries {
-            let stored = StoredValue::with_expiry(entry.value, entry.expires_at_ms);
+            revision_ordinal = revision_ordinal.checked_add(1).ok_or_else(|| {
+                EngineError::Internal("snapshot revision ordinal overflow".into())
+            })?;
+            let stored = StoredValue::with_expiry(entry.value, entry.expires_at_ms).with_revision(
+                ValueRevision {
+                    epoch: new_txid,
+                    ordinal: revision_ordinal,
+                },
+            );
             if stored.is_expired_at(now_ms) {
                 continue;
             }
-            entries.push((entry.key, stored.encode_for_store(flags)?));
+            entries.push((entry.key, stored));
         }
         entries.sort_by(|left, right| left.0.cmp(&right.0));
         if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
@@ -2075,12 +2928,14 @@ fn plan_snapshot_apply(
                 store.name
             )));
         }
-        let built = build_tree_from_sorted(
-            entries
-                .iter()
-                .map(|(key, value)| (key.as_slice(), value.as_slice())),
-            alloc,
-        )?;
+        let mut prepared = Vec::with_capacity(entries.len());
+        for (key, stored) in &entries {
+            let mut value = PreparedValue::stored(stored, flags)?;
+            payloads.externalize(pager, alloc, &mut value)?;
+            prepared.push((key.as_slice(), value));
+        }
+        let built =
+            build_tree_from_values(prepared.iter().map(|(key, value)| (*key, value)), alloc)?;
         page_images.extend(built.page_images);
         final_catalog.insert(
             store.name,
@@ -2088,6 +2943,25 @@ fn plan_snapshot_apply(
                 store_root_page_id: built.root_page_id,
                 created_txid: new_txid,
                 flags,
+            },
+        );
+    }
+
+    payloads.flush_pending(pager)?;
+    payloads.registry.apply_reference_changes(
+        alloc.added_payload_refs(),
+        alloc.dropped_payload_refs(),
+        new_txid,
+        pager,
+    )?;
+    if let Some(built) = payloads.registry.finish(pager, alloc)? {
+        page_images.extend(built.page_images);
+        final_catalog.insert(
+            PAYLOAD_REGISTRY_STORE_NAME.into(),
+            StoreMetadata {
+                store_root_page_id: built.root_page_id,
+                created_txid: registry_meta.map_or(new_txid, |meta| meta.created_txid),
+                flags: STORE_FLAG_SYSTEM_RAW_VALUES,
             },
         );
     }
@@ -2115,21 +2989,36 @@ fn plan_snapshot_apply(
     })
 }
 
-fn prepare_staged_value<'a>(
+fn prepare_staged_value<'a, B: FileBackend>(
     stored: &'a StoredValue,
     flags: u64,
     change: Option<&mut PreparedChange<'a>>,
+    pager: &mut Pager<B>,
+    alloc: &mut PageAllocator,
+    payloads: &mut PayloadPreparation,
 ) -> Result<PreparedValue<'a>> {
     let mut value = PreparedValue::stored(stored, flags)?;
+    payloads.externalize(pager, alloc, &mut value)?;
     if let Some(change) = change {
+        if let Some(reference) = value.external_reference() {
+            if !std::ptr::eq(value.parts().payload(), change.value.parts().payload()) {
+                return Err(EngineError::Internal(
+                    "primary and change log payloads do not match".into(),
+                ));
+            }
+            change.value.set_external_reference(reference);
+        }
         value.share_payload_checksums(&mut change.value);
     }
     Ok(value)
 }
 
-fn prepare_stage_puts<'a>(
+fn prepare_stage_puts<'a, B: FileBackend>(
     stage: &'a StagedStore,
     changes: &mut [PreparedChange<'a>],
+    pager: &mut Pager<B>,
+    alloc: &mut PageAllocator,
+    payloads: &mut PayloadPreparation,
 ) -> Result<Vec<(&'a [u8], PreparedValue<'a>)>> {
     let mut change_puts = changes
         .iter_mut()
@@ -2139,8 +3028,15 @@ fn prepare_stage_puts<'a>(
         .iter()
         .filter_map(|(key, mutation)| match mutation {
             MutationValue::Put(stored) => Some(
-                prepare_staged_value(stored, stage.flags, change_puts.next())
-                    .map(|encoded| (key.as_slice(), encoded)),
+                prepare_staged_value(
+                    stored,
+                    stage.flags,
+                    change_puts.next(),
+                    pager,
+                    alloc,
+                    payloads,
+                )
+                .map(|encoded| (key.as_slice(), encoded)),
             ),
             MutationValue::Delete => None,
         })
@@ -2149,9 +3045,12 @@ fn prepare_stage_puts<'a>(
 
 type PreparedMutation<'a> = (&'a [u8], Option<PreparedValue<'a>>);
 
-fn prepare_stage_mutations<'a>(
+fn prepare_stage_mutations<'a, B: FileBackend>(
     stage: &'a StagedStore,
     changes: &mut [PreparedChange<'a>],
+    pager: &mut Pager<B>,
+    alloc: &mut PageAllocator,
+    payloads: &mut PayloadPreparation,
 ) -> Result<Vec<PreparedMutation<'a>>> {
     let mut change_puts = changes
         .iter_mut()
@@ -2165,6 +3064,9 @@ fn prepare_stage_mutations<'a>(
                     stored,
                     stage.flags,
                     change_puts.next(),
+                    pager,
+                    alloc,
+                    payloads,
                 )?),
                 MutationValue::Delete => None,
             };
@@ -2293,6 +3195,22 @@ fn ensure_readwrite_store_visible(rw: &ReadwriteTx, store: &str) -> Result<()> {
     }
 }
 
+fn validate_readwrite_store_value(rw: &ReadwriteTx, store: &str, value: &[u8]) -> Result<()> {
+    let flags = if let Some(stage) = rw.stores.get(store) {
+        if stage.dropped {
+            return Err(EngineError::StoreNotFound(store.into()));
+        }
+        stage.flags
+    } else {
+        rw.snapshot
+            .catalog
+            .get(store)
+            .ok_or_else(|| EngineError::StoreNotFound(store.into()))?
+            .flags
+    };
+    validate_store_value(value, flags)
+}
+
 fn absolute_expiry_from_ttl_at(ttl_ms: Option<u64>, now_ms: u64) -> Result<Option<u64>> {
     ttl_ms
         .map(|ttl_ms| {
@@ -2311,7 +3229,7 @@ fn normalize_snapshot_store_flags(flags: u64, entries: &[SnapshotEntry]) -> Resu
     {
         normalized |= STORE_FLAG_VALUE_ENVELOPE_V1;
     }
-    Ok(normalized)
+    Ok(normalized | STORE_FLAG_VALUE_REVISION)
 }
 
 fn mark_key_expired(stage: &mut StagedStore, key: &[u8]) {
@@ -2457,6 +3375,137 @@ fn staged_lookup<'a>(rw: &'a ReadwriteTx, store: &str, key: &[u8]) -> Result<Sta
         .ok_or_else(|| EngineError::StoreNotFound(store.into()))
 }
 
+fn stored_value_state_with_staged<B: FileBackend>(
+    pager: &mut Pager<B>,
+    rw: &ReadwriteTx,
+    store: &str,
+    key: &[u8],
+    now_ms: u64,
+    batch: &mut PointReadBatch,
+) -> Result<Option<ValueState>> {
+    match staged_lookup(rw, store, key)? {
+        StagedLookup::Staged(Some(stored)) => {
+            let expired = stored.is_expired_at(now_ms);
+            let max_length = if expired {
+                0
+            } else {
+                let flags = rw
+                    .stores
+                    .get(store)
+                    .ok_or_else(|| {
+                        EngineError::Internal("staged value without staged store".into())
+                    })?
+                    .flags;
+                let encoded_length = stored.value.len();
+                encoded_length.max(decoded_scan_value_length(
+                    &stored.value,
+                    flags,
+                    encoded_length,
+                )?)
+            };
+            Ok(Some(ValueState {
+                exists: !expired,
+                expired,
+                expires_at_ms: stored.expires_at_ms,
+                revision: stored.revision.as_ref().map(|revision| ValueRevision {
+                    epoch: revision.epoch,
+                    ordinal: revision.ordinal,
+                }),
+                max_length,
+            }))
+        }
+        StagedLookup::Staged(None) | StagedLookup::Absent => Ok(None),
+        StagedLookup::Committed(meta) => lookup_stored_value_state(
+            pager,
+            meta.store_root_page_id,
+            key,
+            meta.flags,
+            now_ms,
+            Some(batch),
+        ),
+    }
+}
+
+fn stored_value_size_with_staged<B: FileBackend>(
+    pager: &mut Pager<B>,
+    rw: &ReadwriteTx,
+    store: &str,
+    key: &[u8],
+    now_ms: u64,
+    batch: &mut PointReadBatch,
+) -> Result<Option<usize>> {
+    match staged_lookup(rw, store, key)? {
+        StagedLookup::Staged(Some(stored)) => {
+            if stored.is_expired_at(now_ms) {
+                return Ok(None);
+            }
+            let flags = rw
+                .stores
+                .get(store)
+                .ok_or_else(|| EngineError::Internal("staged value without staged store".into()))?
+                .flags;
+            let encoded_length = stored.value.len();
+            let decoded_length = decoded_scan_value_length(&stored.value, flags, encoded_length)?;
+            Ok(Some(encoded_length.max(decoded_length)))
+        }
+        StagedLookup::Staged(None) | StagedLookup::Absent => Ok(None),
+        StagedLookup::Committed(meta) => lookup_stored_value_size(
+            pager,
+            meta.store_root_page_id,
+            key,
+            meta.flags,
+            now_ms,
+            Some(batch),
+        ),
+    }
+}
+
+fn stored_value_info_with_staged<B: FileBackend>(
+    pager: &mut Pager<B>,
+    rw: &ReadwriteTx,
+    store: &str,
+    key: &[u8],
+    batch: &mut PointReadBatch,
+) -> Result<Option<(usize, Option<u64>)>> {
+    match staged_lookup(rw, store, key)? {
+        StagedLookup::Staged(Some(stored)) => Ok(Some((stored.value.len(), stored.expires_at_ms))),
+        StagedLookup::Staged(None) | StagedLookup::Absent => Ok(None),
+        StagedLookup::Committed(meta) => {
+            lookup_stored_value_info(pager, meta.store_root_page_id, key, meta.flags, Some(batch))
+        }
+    }
+}
+
+fn stored_value_into_with_staged<B: FileBackend>(
+    pager: &mut Pager<B>,
+    rw: &mut ReadwriteTx,
+    store: &str,
+    key: &[u8],
+    now_ms: u64,
+    batch: &mut PointReadBatch,
+    mut write: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<Option<Option<u64>>> {
+    let expiry = match staged_lookup(rw, store, key)? {
+        StagedLookup::Staged(Some(stored)) => {
+            write(&stored.value)?;
+            Some(stored.expires_at_ms)
+        }
+        StagedLookup::Staged(None) | StagedLookup::Absent => None,
+        StagedLookup::Committed(meta) => lookup_stored_value_into(
+            pager,
+            meta.store_root_page_id,
+            key,
+            meta.flags,
+            Some(batch),
+            write,
+        )?,
+    };
+    if matches!(expiry, Some(Some(timestamp)) if now_ms >= timestamp) {
+        expire_staged_key(rw, store, key)?;
+    }
+    Ok(expiry)
+}
+
 fn expire_staged_key(rw: &mut ReadwriteTx, store: &str, key: &[u8]) -> Result<()> {
     let stage = ensure_stage_for_write(rw, store)?;
     match stage.mutations.get(key) {
@@ -2597,13 +3646,27 @@ fn exists_with_staged_deferred_base<B: FileBackend>(
 
 fn put_with_staged_at<B: FileBackend>(
     pager: &mut Pager<B>,
+    next_value_revision_ordinal: &mut u64,
     rw: &mut ReadwriteTx,
     store: &str,
     key: &[u8],
-    value: StoredValue,
+    mut value: StoredValue,
     now_ms: u64,
 ) -> Result<bool> {
     let existed = exists_with_staged(pager, rw, store, key, now_ms)?;
+    let flags = ensure_stage_for_write(rw, store)?.flags;
+    if !store_uses_system_raw_values(flags) && value.revision.is_none() {
+        let epoch = rw
+            .revision_epoch
+            .ok_or_else(|| EngineError::Internal("write revision epoch missing".into()))?;
+        *next_value_revision_ordinal = next_value_revision_ordinal
+            .checked_add(1)
+            .ok_or_else(|| EngineError::Internal("write revision ordinal overflow".into()))?;
+        value.revision = Some(ValueRevision {
+            epoch,
+            ordinal: *next_value_revision_ordinal,
+        });
+    }
     let stage = ensure_stage_for_write(rw, store)?;
     if stage.dropped {
         return Err(EngineError::StoreNotFound(store.into()));
@@ -2611,11 +3674,14 @@ fn put_with_staged_at<B: FileBackend>(
     if value.expires_at_ms.is_some() {
         stage.has_expiring_mutations = Some(true);
     }
-    if value.expires_at_ms.is_some() && !store_uses_value_envelope(stage.flags) {
-        stage.flags |= STORE_FLAG_VALUE_ENVELOPE_V1;
+    if !store_uses_system_raw_values(stage.flags) && stage.flags & STORE_FLAG_VALUE_REVISION == 0 {
+        stage.flags |= STORE_FLAG_VALUE_REVISION;
         if !stage.created && !stage.cleared {
             stage.force_full_rewrite = true;
         }
+    }
+    if value.expires_at_ms.is_some() && !store_uses_system_raw_values(stage.flags) {
+        stage.flags |= STORE_FLAG_VALUE_ENVELOPE_V1;
     }
     stage
         .mutations
@@ -2644,8 +3710,6 @@ fn delete_with_staged_at<B: FileBackend>(
     Ok(existed)
 }
 
-/// Streams a committed tree in range order, skipping expired values, and
-/// stops as soon as `limit` rows are collected, in either direction.
 fn scan_committed_visible<B: FileBackend>(
     pager: &mut Pager<B>,
     root_page_id: u64,
@@ -2653,31 +3717,28 @@ fn scan_committed_visible<B: FileBackend>(
     range: &RangeSpec,
     now_ms: u64,
 ) -> Result<Vec<KvPair>> {
-    let limit = range.limit.unwrap_or(usize::MAX);
     let mut rows = Vec::new();
-    if limit == 0 {
-        return Ok(rows);
-    }
-    let mut iter = TreeIter::new(pager, root_page_id, range)?;
-    while let Some(pair) = iter.next(pager)? {
-        if pending_value_expired(pager, store_flags, &pair.value, now_ms)? {
-            continue;
-        }
-        let raw = materialize_pending_value(pager, pair.value)?;
-        let stored = StoredValue::decode_owned_for_store(store_flags, raw)?;
-        rows.push(KvPair {
-            key: pair.key,
-            value: stored.value,
-        });
-        if rows.len() >= limit {
-            break;
-        }
-    }
+    visit_committed_visible(
+        pager,
+        root_page_id,
+        store_flags,
+        range,
+        now_ms,
+        &mut |pager, key, value| {
+            let VisibleValue::Committed(pending, flags) = value else {
+                return Err(EngineError::Internal("staged row in committed scan".into()));
+            };
+            let stored = materialize_pending_stored_value(pager, pending, flags)?;
+            rows.push(KvPair {
+                key,
+                value: stored.value,
+            });
+            Ok(true)
+        },
+    )?;
     Ok(rows)
 }
 
-/// Merges committed and staged rows lazily in range order. Stops at `limit`
-/// live rows in either direction without materializing the complete range.
 fn scan_with_staged<B: FileBackend>(
     pager: &mut Pager<B>,
     rw: &mut ReadwriteTx,
@@ -2685,11 +3746,94 @@ fn scan_with_staged<B: FileBackend>(
     range: &RangeSpec,
     now_ms: u64,
 ) -> Result<Vec<KvPair>> {
+    let mut rows = Vec::new();
+    visit_with_staged(
+        pager,
+        rw,
+        store,
+        range,
+        now_ms,
+        true,
+        &mut |pager, key, value| {
+            let value = match value {
+                VisibleValue::Staged(stored, _) => stored.value.clone(),
+                VisibleValue::Committed(pending, flags) => {
+                    materialize_pending_stored_value(pager, pending, flags)?.value
+                }
+            };
+            rows.push(KvPair { key, value });
+            Ok(true)
+        },
+    )?;
+    Ok(rows)
+}
+
+enum VisibleValue<'a> {
+    Staged(&'a StoredValue, u64),
+    Committed(PendingValue, u64),
+}
+
+fn decoded_scan_value_length(prefix: &[u8], flags: u64, encoded_length: usize) -> Result<usize> {
+    // The SDK compression header carries the decoded length without reading the body.
+    if store_compression_from_flags(flags)? == StoreCompression::None {
+        return Ok(encoded_length);
+    }
+    validate_store_value_prefix(prefix, encoded_length, flags).map_err(|error| match error {
+        EngineError::Corruption(_) => error,
+        error => EngineError::Corruption(error.to_string()),
+    })?;
+    Ok(read_u32_le(prefix, 10)? as usize)
+}
+
+fn visit_committed_visible<B: FileBackend>(
+    pager: &mut Pager<B>,
+    root_page_id: u64,
+    store_flags: u64,
+    range: &RangeSpec,
+    now_ms: u64,
+    visit: &mut impl FnMut(&mut Pager<B>, Vec<u8>, VisibleValue<'_>) -> Result<bool>,
+) -> Result<bool> {
+    let limit = range.limit.unwrap_or(usize::MAX);
+    if limit == 0 {
+        return Ok(true);
+    }
+    let mut rows = 0;
+    let mut iter = TreeIter::new(pager, root_page_id, range)?;
+    while let Some(pair) = iter.next(pager)? {
+        if pending_value_expired(pager, store_flags, &pair.value, now_ms)? {
+            continue;
+        }
+        if !visit(
+            pager,
+            pair.key,
+            VisibleValue::Committed(pair.value, store_flags),
+        )? {
+            return Ok(false);
+        }
+        rows += 1;
+        if rows >= limit {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn visit_with_staged<B: FileBackend>(
+    pager: &mut Pager<B>,
+    rw: &mut ReadwriteTx,
+    store: &str,
+    range: &RangeSpec,
+    now_ms: u64,
+    normalize_all: bool,
+    visit: &mut impl FnMut(&mut Pager<B>, Vec<u8>, VisibleValue<'_>) -> Result<bool>,
+) -> Result<bool> {
     if let Some(stage) = rw.stores.get_mut(store) {
         if stage.dropped {
             return Err(EngineError::StoreNotFound(store.into()));
         }
-        normalize_expired_stage_mutations(stage, now_ms);
+        if normalize_all {
+            normalize_expired_stage_mutations(stage, now_ms);
+        }
     }
 
     let (base_meta, stage) = match rw.stores.get(store) {
@@ -2714,8 +3858,10 @@ fn scan_with_staged<B: FileBackend>(
     };
 
     let limit = range.limit.unwrap_or(usize::MAX);
-    let mut rows = Vec::new();
+    let mut rows = 0;
+    let mut exhausted = limit == 0;
     let mut expired_base_keys = Vec::new();
+    let mut expired_staged_keys = Vec::new();
     if limit > 0 {
         let lower = to_bound(range.lower_bound());
         let upper = to_bound(range.upper_bound());
@@ -2742,9 +3888,12 @@ fn scan_with_staged<B: FileBackend>(
         };
         let mut staged_next = staged.next();
 
-        while rows.len() < limit {
+        while rows < limit {
             let order = match (base_next.as_ref(), staged_next) {
-                (None, None) => break,
+                (None, None) => {
+                    exhausted = true;
+                    break;
+                }
                 (Some(_), None) => Ordering::Less,
                 (None, Some(_)) => Ordering::Greater,
                 (Some(pair), Some((key, _))) => {
@@ -2762,13 +3911,16 @@ fn scan_with_staged<B: FileBackend>(
                 };
                 if let MutationValue::Put(stored) = mutation {
                     if !stored.is_expired_at(now_ms) {
-                        rows.push(KvPair {
-                            key: key.clone(),
-                            value: stored.value.clone(),
-                        });
+                        let flags = stage.map_or(0, |stage| stage.flags);
+                        if !visit(pager, key.clone(), VisibleValue::Staged(stored, flags))? {
+                            break;
+                        }
+                        rows += 1;
+                    } else {
+                        expired_staged_keys.push(key.clone());
                     }
                 }
-                if rows.len() >= limit {
+                if rows >= limit {
                     break;
                 }
                 if order == Ordering::Equal {
@@ -2789,14 +3941,16 @@ fn scan_with_staged<B: FileBackend>(
             if pending_value_expired(pager, meta.flags, &pair.value, now_ms)? {
                 expired_base_keys.push(pair.key);
             } else {
-                let raw = materialize_pending_value(pager, pair.value)?;
-                let stored = StoredValue::decode_owned_for_store(meta.flags, raw)?;
-                rows.push(KvPair {
-                    key: pair.key,
-                    value: stored.value,
-                });
+                if !visit(
+                    pager,
+                    pair.key,
+                    VisibleValue::Committed(pair.value, meta.flags),
+                )? {
+                    break;
+                }
+                rows += 1;
             }
-            if rows.len() >= limit {
+            if rows >= limit {
                 break;
             }
             base_next = match base.as_mut() {
@@ -2812,7 +3966,10 @@ fn scan_with_staged<B: FileBackend>(
             mark_key_expired(stage, key);
         }
     }
-    Ok(rows)
+    for key in expired_staged_keys {
+        expire_staged_key(rw, store, &key)?;
+    }
+    Ok(exhausted)
 }
 
 /// Checks only the envelope header. Expired overflow values need no further
@@ -2826,8 +3983,8 @@ fn pending_value_expired<B: FileBackend>(
     if !store_uses_value_envelope(store_flags) || store_uses_system_raw_values(store_flags) {
         return Ok(false);
     }
-    let prefix = pending_value_prefix(pager, value, VALUE_ENVELOPE_HEADER_SIZE)?;
-    stored_value_expired(store_flags, &prefix, now_ms)
+    let (_, expiry) = pending_stored_value_info(pager, value, store_flags)?;
+    Ok(matches!(expiry, Some(timestamp) if now_ms >= timestamp))
 }
 
 fn to_bound(bound: Option<(&[u8], bool)>) -> Bound<&[u8]> {

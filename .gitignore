@@ -122,3 +122,4 @@ persistent-user-data-*/
 !LICENSE*
 # Build-time copy of the root LICENSE for the npm package (scripts/prepare-dist.mjs)
 packages/sdk/LICENSE
+packages/sdk/README.md
