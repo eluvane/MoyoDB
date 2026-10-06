@@ -23,14 +23,15 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master; toolchain 1.98.1
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v7
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -44,7 +45,7 @@ jobs:
       - name: Run benchmarks and collect baseline
         run: npm run bench:collect -- --out-dir .benchmark/current
       - name: Publish baseline artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: benchmark-baseline
           path: .benchmark/current
@@ -53,7 +54,7 @@ jobs:
         run: cat .benchmark/current/summary.md >> "$GITHUB_STEP_SUMMARY"
       - name: Find previous successful benchmark run
         id: previous-run
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:
           script: |
             const runs = await github.rest.actions.listWorkflowRuns({
@@ -69,7 +70,7 @@ jobs:
       - name: Download previous baseline artifact
         if: steps.previous-run.outputs.run-id != ''
         continue-on-error: true
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: benchmark-baseline
           path: .benchmark/previous
@@ -83,7 +84,7 @@ jobs:
             --current .benchmark/current/baseline.json \
             --out-dir .benchmark/comparison
       - name: Publish comparison artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: benchmark-comparison
           path: .benchmark/comparison

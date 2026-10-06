@@ -227,3 +227,81 @@ fn snapshot_roundtrip_preserves_live_ttl_metadata_and_skips_expired_rows() {
     assert_eq!(target.get(ro, "ttl", b"expired").unwrap(), None);
     target.rollback_tx(ro).unwrap();
 }
+
+#[test]
+fn native_snapshot_preserves_full_u64_metadata() {
+    let (_bundle, mut target) = common::open_memory_engine("snapshot-full-u64");
+    let source_last_committed_txid = (1u64 << 53) + 1;
+    let snapshot = encode_snapshot(&SnapshotContents {
+        source_last_committed_txid,
+        schema_version: u64::MAX,
+        stores: Vec::new(),
+    })
+    .unwrap();
+    assert_eq!(
+        target.import_snapshot(&snapshot).unwrap(),
+        source_last_committed_txid + 1
+    );
+    assert_eq!(target.schema_version(), u64::MAX);
+    let tx = target.begin_tx(TxMode::Readwrite).unwrap();
+    assert_eq!(
+        target.commit_tx(tx).unwrap(),
+        source_last_committed_txid + 2
+    );
+}
+
+#[test]
+fn staged_snapshot_import_keeps_source_state_and_commit_floor() {
+    use moyodb_engine::catalog::ChangeFeedPolicy;
+    use moyodb_engine::change_feed::ChangeFeedOptions;
+
+    let (source_bundle, mut source) = common::open_memory_engine("snapshot-stage-source");
+    seed_target_with_old_state(&mut source);
+    let tx = source.begin_tx(TxMode::Readwrite).unwrap();
+    let policy = ChangeFeedPolicy {
+        enabled: true,
+        retain_txids: Some(5),
+    };
+    source.set_change_feed_policy(tx, policy).unwrap();
+    source.commit_tx(tx).unwrap();
+    let before = source.export_snapshot().unwrap();
+    let old_txid = source.stats().unwrap().last_committed_txid;
+    let snapshot = encode_snapshot(&SnapshotContents {
+        source_last_committed_txid: 0,
+        schema_version: 4,
+        stores: vec![SnapshotStore {
+            name: "docs".into(),
+            flags: 0,
+            entries: vec![SnapshotEntry {
+                key: b"new".to_vec(),
+                value: b"value".to_vec(),
+                expires_at_ms: None,
+            }],
+        }],
+    })
+    .unwrap();
+    let (target_bundle, mut target) = common::open_memory_engine("snapshot-stage-target");
+    let imported = source.import_snapshot_into(&mut target, &snapshot).unwrap();
+    assert!(imported > old_txid);
+    assert_eq!(target.change_feed_policy(), policy);
+    assert_eq!(source.export_snapshot().unwrap(), before);
+    source.abandon().unwrap();
+    target.abandon().unwrap();
+    let mut old = common::reopen_memory_engine("snapshot-stage-source", &source_bundle);
+    assert_eq!(old.export_snapshot().unwrap(), before);
+    let mut new = common::reopen_memory_engine("snapshot-stage-target", &target_bundle);
+    assert_eq!(new.schema_version(), 4);
+    assert_eq!(new.change_feed_policy(), policy);
+    let tx = new.begin_tx(TxMode::Readonly).unwrap();
+    assert_eq!(
+        new.get(tx, "docs", b"new").unwrap(),
+        Some(b"value".to_vec())
+    );
+    new.rollback_tx(tx).unwrap();
+    assert_eq!(
+        new.changes_since(imported, ChangeFeedOptions::default())
+            .unwrap()
+            .latest_tx_id,
+        imported
+    );
+}

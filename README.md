@@ -68,6 +68,8 @@ const db = await openDB('app', { workerMode: 'shared' });
 
 Pages from the same origin share a storage owner through SharedWorker. Each client owns its transactions. Closing one handle preserves the other clients. When the page hosting the storage worker closes, another page reopens storage; database handles remain usable and active transactions receive invalidation.
 
+Shared mode requires trusted same-origin scripts and clients. The selected hosting page supplies the storage worker endpoint. A client that supplies a different endpoint can observe other clients' operations, including uncommitted values and imported snapshots, and forge results. Session-local transaction and cursor IDs separate handle ownership and cleanup. They do not authenticate the storage endpoint or protect clients from a malicious host. Same-origin scripts already share access to the origin's OPFS and committed database state. Use separate origins for applications that do not trust each other.
+
 Read and write transactions can overlap. Readers retain their snapshots. Commits publish sequentially; a writer whose snapshot is stale closes with `TransactionConflictError` before writing its changes. Start a new transaction to retry. Schema upgrades have one migration owner.
 
 ```ts

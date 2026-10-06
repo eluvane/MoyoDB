@@ -14,7 +14,11 @@ const LOCK_DIRECTORY: &str = ".moyodb.lock";
 static NEXT_LEASE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
-/// The storage path and its parent directories must remain unchanged while open.
+/// Callers must trust the storage path and all parent directories.
+/// Entries must remain unchanged from the start of opening until close.
+/// New Unix files use mode 0600 and directories use mode 0700, subject to umask.
+/// Existing permissions are preserved. Callers must secure existing storage.
+/// Other platforms inherit access controls from the parent directories.
 pub struct NativeFileBackend {
     path: PathBuf,
     file: Mutex<Option<File>>,
@@ -52,10 +56,15 @@ impl NativeFileBackend {
             EngineError::Storage("native file path has no parent directory".into())
         })?;
         ensure_directory(parent, false)?;
-        validate_file(&path, create_if_missing)?;
+        let expected = inspect_file(&path, create_if_missing)?;
 
-        let mut options = OpenOptions::new();
-        options.read(true).write(true);
+        let mut options = native_file_options();
+        options.write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
         let (file, created) = match options.open(&path) {
             Ok(file) => (file, false),
             Err(err) if create_if_missing && err.kind() == io::ErrorKind::NotFound => {
@@ -63,7 +72,6 @@ impl NativeFileBackend {
                 match options.open(&path) {
                     Ok(file) => (file, true),
                     Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                        validate_file(&path, false)?;
                         options.create_new(false);
                         (
                             options
@@ -77,13 +85,12 @@ impl NativeFileBackend {
             }
             Err(err) => return Err(io_error("open", &path, err)),
         };
-        if !file
-            .metadata()
-            .map_err(|err| io_error("inspect", &path, err))?
-            .is_file()
+        let identity = file_identity(&file, &path)?;
+        if expected.is_some_and(|expected| expected != identity)
+            || inspect_file(&path, false)? != Some(identity)
         {
             return Err(EngineError::Storage(format!(
-                "native file is not a regular file: {}",
+                "native file changed while opening: {}",
                 path.display()
             )));
         }
@@ -512,8 +519,11 @@ fn read_lease(directory: &Path) -> Result<LeaseRecord> {
         return Err(invalid());
     }
     let path = directory.join(filename);
-    validate_file(&path, false).map_err(|_| invalid())?;
-    let file = File::open(&path).map_err(|_| invalid())?;
+    let expected = inspect_file(&path, false).map_err(|_| invalid())?;
+    let file = native_file_options().open(&path).map_err(|_| invalid())?;
+    if expected != Some(file_identity(&file, &path).map_err(|_| invalid())?) {
+        return Err(invalid());
+    }
     let mut bytes = Vec::new();
     file.take(1025)
         .read_to_end(&mut bytes)
@@ -787,7 +797,20 @@ fn ensure_directory(path: &Path, create_if_missing: bool) -> Result<()> {
                 )))
             }
             Err(err) if create_if_missing && err.kind() == io::ErrorKind::NotFound => {
-                match fs::create_dir(&current) {
+                let builder = {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::DirBuilderExt;
+                        let mut builder = fs::DirBuilder::new();
+                        builder.mode(0o700);
+                        builder
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        fs::DirBuilder::new()
+                    }
+                };
+                match builder.create(&current) {
                     Ok(()) => {}
                     Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(err) => return Err(io_error("create directory", &current, err)),
@@ -811,15 +834,154 @@ fn ensure_directory(path: &Path, create_if_missing: bool) -> Result<()> {
 }
 
 fn validate_file(path: &Path, create_if_missing: bool) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(()),
-        Ok(_) => Err(EngineError::Storage(format!(
-            "native storage path is not a regular file: {}",
-            path.display()
-        ))),
-        Err(err) if create_if_missing && err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(io_error("inspect file", path, err)),
+    inspect_file(path, create_if_missing).map(|_| ())
+}
+
+fn inspect_file(path: &Path, create_if_missing: bool) -> Result<Option<(u64, u128)>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
+        Ok(_) => {
+            return Err(EngineError::Storage(format!(
+                "native storage path is not a regular file: {}",
+                path.display()
+            )))
+        }
+        Err(err) if create_if_missing && err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(io_error("inspect file", path, err)),
+    };
+    let file = native_file_options()
+        .open(path)
+        .map_err(|err| io_error("inspect file", path, err))?;
+    let identity = file_identity(&file, path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if (metadata.dev(), u128::from(metadata.ino())) != identity {
+            return Err(EngineError::Storage(format!(
+                "native file changed while inspecting: {}",
+                path.display()
+            )));
+        }
     }
+    #[cfg(not(unix))]
+    let _ = metadata;
+    Ok(Some(identity))
+}
+
+fn native_file_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options
+}
+
+fn file_identity(file: &File, path: &Path) -> Result<(u64, u128)> {
+    let metadata = file
+        .metadata()
+        .map_err(|err| io_error("inspect opened file", path, err))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(EngineError::Storage(format!(
+            "native file is not a regular file: {}",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(EngineError::Storage(format!(
+                "native file must have one link: {}",
+                path.display()
+            )));
+        }
+        Ok((metadata.dev(), u128::from(metadata.ino())))
+    }
+    #[cfg(windows)]
+    {
+        use std::ffi::c_void;
+        use std::os::windows::io::AsRawHandle;
+
+        #[repr(C)]
+        #[derive(Default)]
+        struct FileInformation {
+            attributes: u32,
+            creation_time: [u32; 2],
+            access_time: [u32; 2],
+            write_time: [u32; 2],
+            volume_serial: u32,
+            size_high: u32,
+            size_low: u32,
+            links: u32,
+            index_high: u32,
+            index_low: u32,
+        }
+        #[repr(C)]
+        #[derive(Default)]
+        struct FileIdInformation {
+            volume_serial: u64,
+            file_id: [u8; 16],
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetFileInformationByHandle(
+                handle: *mut c_void,
+                information: *mut FileInformation,
+            ) -> i32;
+            fn GetFileInformationByHandleEx(
+                handle: *mut c_void,
+                class: i32,
+                information: *mut c_void,
+                size: u32,
+            ) -> i32;
+        }
+        let mut information = FileInformation::default();
+        // SAFETY: The file owns a live handle. The output has the Win32 C layout.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+            return Err(io_error(
+                "inspect opened file",
+                path,
+                io::Error::last_os_error(),
+            ));
+        }
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if information.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 || information.links != 1 {
+            return Err(EngineError::Storage(format!(
+                "native file must be a regular file with one link: {}",
+                path.display()
+            )));
+        }
+        let mut identity = FileIdInformation::default();
+        const FILE_ID_INFO: i32 = 18;
+        // SAFETY: The file owns a live handle. The output size and C layout match FILE_ID_INFO.
+        let inspected = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FILE_ID_INFO,
+                std::ptr::from_mut(&mut identity).cast(),
+                std::mem::size_of::<FileIdInformation>() as u32,
+            )
+        };
+        if inspected == 0 {
+            return Err(io_error(
+                "inspect file identity",
+                path,
+                io::Error::last_os_error(),
+            ));
+        }
+        Ok((
+            identity.volume_serial,
+            u128::from_le_bytes(identity.file_id),
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
+    Err(EngineError::Storage(
+        "native file identity check is unavailable".into(),
+    ))
 }
 
 #[cfg(unix)]

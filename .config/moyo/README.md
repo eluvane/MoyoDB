@@ -103,6 +103,8 @@ The primary workflow is `.github/workflows/ci.yml` and uses these blocking jobs:
 
 Code scanning is split into `.github/workflows/codeql.yml` so the CodeQL setup can use `.config/moyo/ci/codeql-config.yml` and the tighter `security-events: write` permission only where needed. Benchmark execution and artifact comparison live in `.github/workflows/benchmarks.yml`; slow paranoid scans live in `.github/workflows/paranoid-quality.yml`.
 
+External GitHub actions require full 40-hex commit SHAs. Keep the version comment on the same line so Dependabot can update it with the SHA; local `./` actions remain valid. Pin `dtolnay/rust-toolchain` to a commit in its `master` history and pass `toolchain` explicitly; generated version-branch commits can be garbage-collected.
+
 ## Blocking and non-blocking policy
 
 Required CI jobs are blocking by default. There are no `continue-on-error: true` quality jobs. Long-running benchmark and paranoid scans are scheduled or manually dispatched, but they are still real gates when invoked.

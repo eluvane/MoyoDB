@@ -2023,8 +2023,58 @@ impl<B: FileBackend> Engine<B> {
                 "cannot import snapshot while transactions are open".into(),
             ));
         }
-        let snapshot = decode_snapshot(bytes)?;
+        self.import_decoded_snapshot(decode_snapshot(bytes)?)
+    }
+
+    pub(crate) fn import_decoded_snapshot(&mut self, snapshot: SnapshotContents) -> Result<u64> {
+        self.ensure_healthy()?;
+        if !self.txns.is_empty() {
+            return Err(EngineError::DatabaseBusy(
+                "cannot import snapshot while transactions are open".into(),
+            ));
+        }
         self.apply_snapshot_contents(snapshot)
+    }
+
+    /// Imports into a new, empty target. Keeps this engine's commit floor and feed policy.
+    /// Activate the target only after the import and all derived store writes succeed.
+    pub fn import_snapshot_into(&mut self, target: &mut Engine<B>, bytes: &[u8]) -> Result<u64> {
+        self.import_snapshot_contents_into(target, decode_snapshot(bytes)?)
+    }
+
+    pub(crate) fn import_snapshot_contents_into(
+        &mut self,
+        target: &mut Engine<B>,
+        snapshot: SnapshotContents,
+    ) -> Result<u64> {
+        self.ensure_healthy()?;
+        target.ensure_healthy()?;
+        if !self.txns.is_empty() || !target.txns.is_empty() {
+            return Err(EngineError::DatabaseBusy(
+                "cannot import snapshot while transactions are open".into(),
+            ));
+        }
+        if target.superblock.last_committed_txid != 0
+            || !target.catalog.is_empty()
+            || target.pager.has_dirty()
+        {
+            return Err(EngineError::Internal(
+                "snapshot target must be a new, empty database".into(),
+            ));
+        }
+        target.next_commit_txid = self.next_commit_txid;
+        target.change_feed_policy = self.change_feed_policy;
+        target.apply_snapshot_contents(snapshot)
+    }
+
+    #[cfg(any(target_arch = "wasm32", test))]
+    pub(crate) fn next_commit_txid(&self) -> u64 {
+        self.next_commit_txid
+    }
+
+    #[cfg(any(target_arch = "wasm32", test))]
+    pub(crate) fn next_transaction_handle(&self) -> u64 {
+        self.next_tx_id
     }
 
     pub fn reset(&mut self) -> Result<u64> {
