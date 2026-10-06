@@ -11,7 +11,7 @@
     "build": "npm run build:wasm:release && vite build && npm run build:node && npm run build:types && npm run prepare:dist",
     "dev": "npm run build:wasm:release && vite --host 127.0.0.1 --port 4173",
     "dev:test": "npm run build:wasm:release && vite --host 127.0.0.1 --port 4173",
-    "test:minimum-work": "node scripts/test-minimum-work.mjs && node scripts/test-read-work.mjs && node scripts/test-transport-work.mjs && node scripts/test-startup-work.mjs && node scripts/test-sdk-lifecycle.mjs && node scripts/test-codec-index-work.mjs && node scripts/test-write-pipeline.mjs && node scripts/test-benchmark-datasets.mjs && node scripts/test-worker-portability.mjs && node scripts/test-record-work.mjs && node --test --test-isolation=none tests/snappy.test.mjs tests/shared-cursors.test.mjs tests/sql-parser.test.mjs tests/sql-limit.test.mjs tests/worker-timer-delay.test.mjs",
+    "test:minimum-work": "node scripts/test-minimum-work.mjs && node scripts/test-read-work.mjs && node scripts/test-transport-work.mjs && node scripts/test-startup-work.mjs && node scripts/test-sdk-lifecycle.mjs && node scripts/test-codec-index-work.mjs && node scripts/test-write-pipeline.mjs && node scripts/test-benchmark-datasets.mjs && node scripts/test-worker-portability.mjs && node scripts/test-record-work.mjs && node --test --test-isolation=none tests/snappy.test.mjs tests/shared-cursors.test.mjs tests/sql-parser.test.mjs tests/sql-limit.test.mjs tests/worker-timer-delay.test.mjs tests/snapshot-worker.test.mjs",
     "bench:minimum-work": "node scripts/bench-minimum-work.mjs",
     "test:e2e": "npm run test:minimum-work && npm run build && npm run test:node && playwright test",
     "build:types": "tsc -p tsconfig.build.json",
@@ -59,7 +59,8 @@
   "files": [
     "dist",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "CONTRIBUTING.md"
   ],
   "exports": {
     ".": {

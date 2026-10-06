@@ -21,16 +21,12 @@ function checkUsesPinned(file, text) {
         const raw = match[1];
         const quoted = (raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"));
         const value = quoted ? raw.slice(1, -1) : raw;
-        if (value.startsWith('docker://')) {
-            continue;
-        }
-        if (!value.includes('@')) {
-            fail(file, `action reference must be pinned with @version: ${value}`);
+        if (value.startsWith('./') || value.startsWith('docker://')) {
             continue;
         }
         const ref = value.slice(value.lastIndexOf('@') + 1);
-        if (['main', 'master', 'latest', 'HEAD', 'stable'].includes(ref)) {
-            fail(file, `action reference must not use a moving ref: ${value}`);
+        if (!value.includes('@') || !/^[a-f0-9]{40}$/iu.test(ref)) {
+            fail(file, `external action reference must be pinned to a full 40-hex commit SHA: ${value}`);
         }
     }
 }

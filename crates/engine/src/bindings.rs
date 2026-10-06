@@ -1,4 +1,62 @@
 #[cfg(any(target_arch = "wasm32", test))]
+// The SDK uses number IDs and schema versions. Native engines retain full u64 values.
+const JS_MAX_SAFE_INTEGER: u64 = (1u64 << 53) - 1;
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn validate_js_u64(value: u64, field: &str) -> crate::error::Result<()> {
+    if value > JS_MAX_SAFE_INTEGER {
+        return Err(crate::error::EngineError::Serialization(format!(
+            "{field} exceeds the JavaScript safe integer range"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn decode_snapshot_for_binding(
+    bytes: &[u8],
+) -> crate::error::Result<crate::snapshot::SnapshotContents> {
+    let snapshot = crate::snapshot::decode_snapshot(bytes)?;
+    validate_js_u64(snapshot.schema_version, "snapshot schema version")?;
+    let imported_txid = snapshot
+        .source_last_committed_txid
+        .checked_add(1)
+        .ok_or_else(|| {
+            crate::error::EngineError::Serialization("snapshot commit txid overflow".into())
+        })?;
+    validate_js_u64(imported_txid, "snapshot commit txid")?;
+    Ok(snapshot)
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn import_snapshot_for_binding<B: crate::storage::backend::FileBackend>(
+    engine: &mut crate::engine::Engine<B>,
+    bytes: &[u8],
+) -> crate::error::Result<u64> {
+    let snapshot = decode_snapshot_for_binding(bytes)?;
+    validate_js_u64(engine.next_commit_txid(), "next commit txid")?;
+    engine.import_decoded_snapshot(snapshot)
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn commit_tx_for_binding<B: crate::storage::backend::FileBackend>(
+    engine: &mut crate::engine::Engine<B>,
+    tx_id: u64,
+) -> crate::error::Result<u64> {
+    validate_js_u64(engine.next_commit_txid(), "next commit txid")?;
+    engine.commit_tx(tx_id)
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn begin_tx_for_binding<B: crate::storage::backend::FileBackend>(
+    engine: &mut crate::engine::Engine<B>,
+    mode: crate::engine::TxMode,
+) -> crate::error::Result<u64> {
+    validate_js_u64(engine.next_transaction_handle(), "transaction handle")?;
+    engine.begin_tx(mode)
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
 fn open_engine_for_binding<B: crate::storage::backend::FileBackend + Clone>(
     name: &str,
     files: crate::storage::backend::FileSet<B>,
@@ -11,7 +69,11 @@ fn open_engine_for_binding<B: crate::storage::backend::FileBackend + Clone>(
         files.main.clone(),
         files.wal.clone(),
     ];
-    let opened = crate::engine::Engine::open(name, files, config);
+    let opened = crate::engine::Engine::open(name, files, config).and_then(|mut engine| {
+        validate_js_u64(engine.schema_version(), "persisted schema version")?;
+        validate_js_u64(engine.stats()?.last_committed_txid, "persisted commit txid")?;
+        Ok(engine)
+    });
     if opened.is_err() {
         for file in &mut cleanup {
             // Release every file and preserve the initialization error.
@@ -76,6 +138,111 @@ mod open_binding_tests {
         for file in [&bundle.manifest, &bundle.main, &bundle.wal] {
             assert!(matches!(file.len(), Err(EngineError::Storage(_))));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn binding_open_rejects_unsafe_persisted_snapshot_numbers() -> Result<()> {
+        use crate::snapshot::{encode_snapshot, SnapshotContents};
+
+        for (source_last_committed_txid, schema_version) in [(1u64 << 53, 0), (0, (1u64 << 53) + 1)]
+        {
+            let bundle = MemoryBundle::new();
+            let mut native = crate::engine::Engine::open(
+                "unsafe-snapshot",
+                bundle.files(),
+                OpenConfig::default(),
+            )?;
+            native.import_snapshot(&encode_snapshot(&SnapshotContents {
+                source_last_committed_txid,
+                schema_version,
+                stores: Vec::new(),
+            })?)?;
+            native.close()?;
+            let opened = open_engine_for_binding(
+                "unsafe-snapshot",
+                bundle.crash_recovered_files(),
+                OpenConfig::default(),
+            );
+            assert!(matches!(opened, Err(EngineError::Serialization(_))));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod snapshot_number_binding_tests {
+    use super::{
+        begin_tx_for_binding, commit_tx_for_binding, import_snapshot_for_binding,
+        JS_MAX_SAFE_INTEGER,
+    };
+    use crate::engine::{Engine, OpenConfig, TxMode};
+    use crate::error::{EngineError, Result};
+    use crate::snapshot::{encode_snapshot, SnapshotContents};
+    use crate::storage::memory::MemoryBundle;
+
+    #[test]
+    fn unsafe_snapshot_metadata_fails_before_publication() -> Result<()> {
+        let bundle = MemoryBundle::new();
+        let mut engine = Engine::open(
+            "binding-snapshot-reject",
+            bundle.files(),
+            OpenConfig::default(),
+        )?;
+        let tx = begin_tx_for_binding(&mut engine, TxMode::Readwrite)?;
+        engine.create_store(tx, "keep")?;
+        engine.put(tx, "keep", b"key", b"value")?;
+        commit_tx_for_binding(&mut engine, tx)?;
+        let before = engine.export_snapshot()?;
+        for (source_last_committed_txid, schema_version) in [
+            (JS_MAX_SAFE_INTEGER, 0),
+            (JS_MAX_SAFE_INTEGER + 1, 0),
+            (0, JS_MAX_SAFE_INTEGER + 1),
+            (u64::MAX, 0),
+        ] {
+            let bytes = encode_snapshot(&SnapshotContents {
+                source_last_committed_txid,
+                schema_version,
+                stores: Vec::new(),
+            })?;
+            assert!(matches!(
+                import_snapshot_for_binding(&mut engine, &bytes),
+                Err(EngineError::Serialization(_))
+            ));
+            assert_eq!(engine.export_snapshot()?, before);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn final_safe_commit_succeeds_and_next_commit_fails_before_publication() -> Result<()> {
+        let bundle = MemoryBundle::new();
+        let mut engine = Engine::open(
+            "binding-snapshot-boundary",
+            bundle.files(),
+            OpenConfig::default(),
+        )?;
+        let bytes = encode_snapshot(&SnapshotContents {
+            source_last_committed_txid: JS_MAX_SAFE_INTEGER - 2,
+            schema_version: JS_MAX_SAFE_INTEGER,
+            stores: Vec::new(),
+        })?;
+        assert_eq!(
+            import_snapshot_for_binding(&mut engine, &bytes)?,
+            JS_MAX_SAFE_INTEGER - 1
+        );
+        let tx = begin_tx_for_binding(&mut engine, TxMode::Readwrite)?;
+        assert_eq!(commit_tx_for_binding(&mut engine, tx)?, JS_MAX_SAFE_INTEGER);
+        let before = engine.export_snapshot()?;
+        let tx = begin_tx_for_binding(&mut engine, TxMode::Readwrite)?;
+        engine.create_store(tx, "overflow")?;
+        assert!(matches!(
+            commit_tx_for_binding(&mut engine, tx),
+            Err(EngineError::Serialization(_))
+        ));
+        engine.rollback_tx(tx)?;
+        assert_eq!(engine.export_snapshot()?, before);
+        assert_eq!(engine.schema_version(), JS_MAX_SAFE_INTEGER);
         Ok(())
     }
 }
@@ -854,7 +1021,17 @@ mod wasm {
             target: &mut WasmEngine,
         ) -> std::result::Result<u64, JsValue> {
             let target = target.inner_mut()?;
-            self.inner_mut()?.compact_into(target).map_err(js_error)
+            let engine = self.inner_mut()?;
+            super::validate_js_u64(
+                engine
+                    .stats()
+                    .map_err(js_error)?
+                    .last_committed_txid
+                    .saturating_add(1),
+                "compaction commit txid",
+            )
+            .map_err(js_error)?;
+            engine.compact_into(target).map_err(js_error)
         }
 
         /// Omits the named internal stores during a rebuild. Compaction
@@ -868,7 +1045,17 @@ mod wasm {
             let skip_stores: Vec<String> =
                 serde_wasm_bindgen::from_value(skip_stores).map_err(js_error_from_display)?;
             let target = target.inner_mut()?;
-            self.inner_mut()?
+            let engine = self.inner_mut()?;
+            super::validate_js_u64(
+                engine
+                    .stats()
+                    .map_err(js_error)?
+                    .last_committed_txid
+                    .saturating_add(1),
+                "compaction commit txid",
+            )
+            .map_err(js_error)?;
+            engine
                 .compact_into_skipping_stores(target, &skip_stores)
                 .map_err(js_error)
         }
@@ -877,12 +1064,13 @@ mod wasm {
         pub fn begin_tx(&mut self, mode: String) -> std::result::Result<u64, JsValue> {
             let engine = self.inner_mut()?;
             let tx_mode = mode.parse::<TxMode>().map_err(js_error)?;
-            engine.begin_tx(tx_mode).map_err(js_error)
+            super::begin_tx_for_binding(engine, tx_mode).map_err(js_error)
         }
 
         #[wasm_bindgen]
         pub fn commit_tx(&mut self, tx_id: u64) -> std::result::Result<u64, JsValue> {
-            let committed = self.inner_mut()?.commit_tx(tx_id).map_err(js_error)?;
+            let committed =
+                super::commit_tx_for_binding(self.inner_mut()?, tx_id).map_err(js_error)?;
             self.scan_cursors.retain(|_, cursor| cursor.tx_id != tx_id);
             Ok(committed)
         }
@@ -1423,12 +1611,30 @@ mod wasm {
 
         #[wasm_bindgen]
         pub fn import_snapshot(&mut self, data: &[u8]) -> std::result::Result<u64, JsValue> {
-            self.inner_mut()?.import_snapshot(data).map_err(js_error)
+            super::import_snapshot_for_binding(self.inner_mut()?, data).map_err(js_error)
+        }
+
+        #[wasm_bindgen]
+        pub fn import_snapshot_into(
+            &mut self,
+            target: &mut WasmEngine,
+            data: &[u8],
+        ) -> std::result::Result<u64, JsValue> {
+            let snapshot = super::decode_snapshot_for_binding(data).map_err(js_error)?;
+            let engine = self.inner_mut()?;
+            super::validate_js_u64(engine.next_commit_txid(), "next commit txid")
+                .map_err(js_error)?;
+            engine
+                .import_snapshot_contents_into(target.inner_mut()?, snapshot)
+                .map_err(js_error)
         }
 
         #[wasm_bindgen]
         pub fn reset(&mut self) -> std::result::Result<u64, JsValue> {
-            self.inner_mut()?.reset().map_err(js_error)
+            let engine = self.inner_mut()?;
+            super::validate_js_u64(engine.next_commit_txid(), "next commit txid")
+                .map_err(js_error)?;
+            engine.reset().map_err(js_error)
         }
 
         #[wasm_bindgen]
@@ -1443,6 +1649,7 @@ mod wasm {
             tx_id: u64,
             version: u64,
         ) -> std::result::Result<(), JsValue> {
+            super::validate_js_u64(version, "schema version").map_err(js_error)?;
             self.inner_mut()?
                 .set_schema_version(tx_id, version)
                 .map_err(js_error)

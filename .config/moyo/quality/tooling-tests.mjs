@@ -164,36 +164,48 @@ function workflow(action) {
     return `permissions: {}\njobs:\n  check:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: ${action}\n`;
 }
 
-test('workflow policy rejects moving action refs in unnamed steps', (t) => {
-    const directory = fixture(t, [workflowScript]);
-    write(directory, '.github/workflows/witness.yml', workflow('actions/setup-node@main'));
-    const result = run(directory, workflowScript);
-    assert.equal(result.status, 1, result.output);
-    assert.match(result.output, /must not use a moving ref/u);
-});
+const actionSha = '0123456789abcdef0123456789abcdef01234567';
+for (const action of [
+    'actions/setup-node',
+    'actions/setup-node@main',
+    'actions/setup-node@master',
+    'actions/setup-node@latest',
+    'actions/setup-node@HEAD',
+    'actions/setup-node@stable',
+    'actions/setup-node@release/next',
+    'actions/setup-node@v7',
+    'actions/setup-node@v7.0.0',
+    'actions/setup-node@0123456',
+    `actions/setup-node@${actionSha}0`,
+    `actions/setup-node@${actionSha.slice(0, -1)}g`,
+    '"actions/setup-node@v7"',
+    "'actions/setup-node@v7.0.0'"
+]) {
+    test(`workflow policy rejects external action without a full commit SHA: ${action}`, (t) => {
+        const directory = fixture(t, [workflowScript]);
+        write(directory, '.github/workflows/witness.yml', workflow(action));
+        const result = run(directory, workflowScript);
+        assert.equal(result.status, 1, result.output);
+        assert.match(result.output, /must be pinned to a full 40-hex commit SHA/u);
+    });
+}
 
-test('workflow policy rejects unpinned actions in unnamed steps', (t) => {
-    const directory = fixture(t, [workflowScript]);
-    write(directory, '.github/workflows/witness.yml', workflow('actions/setup-node'));
-    const result = run(directory, workflowScript);
-    assert.equal(result.status, 1, result.output);
-    assert.match(result.output, /must be pinned/u);
-});
-
-test('workflow policy accepts a version pin in an unnamed step', (t) => {
-    const directory = fixture(t, [workflowScript]);
-    write(directory, '.github/workflows/witness.yml', workflow('actions/setup-node@v7'));
-    const result = run(directory, workflowScript);
-    assert.equal(result.status, 0, result.output);
-});
-
-test('workflow policy rejects a quoted moving action ref', (t) => {
-    const directory = fixture(t, [workflowScript]);
-    write(directory, '.github/workflows/witness.yml', workflow('"actions/setup-node@main"'));
-    const result = run(directory, workflowScript);
-    assert.equal(result.status, 1, result.output);
-    assert.match(result.output, /must not use a moving ref/u);
-});
+for (const action of [
+    `actions/setup-node@${actionSha}`,
+    `github/codeql-action/init@${actionSha}`,
+    `"actions/setup-node@${actionSha}"`,
+    `'actions/setup-node@${actionSha.toUpperCase()}'`,
+    './.github/actions/local',
+    '"./.github/actions/local"',
+    "'./.github/actions/local'"
+]) {
+    test(`workflow policy accepts full commit SHA or local action: ${action}`, (t) => {
+        const directory = fixture(t, [workflowScript]);
+        write(directory, '.github/workflows/witness.yml', workflow(action));
+        const result = run(directory, workflowScript);
+        assert.equal(result.status, 0, result.output);
+    });
+}
 
 test('workflow policy checks npm install flags in unnamed run steps', (t) => {
     const directory = fixture(t, [workflowScript]);
@@ -259,11 +271,11 @@ test('workflow policy rejects a checkout whose credential pin is only counted on
             '  check:',
             '    runs-on: ubuntu-24.04',
             '    steps:',
-            '      - uses: actions/checkout@v7',
+            `      - uses: actions/checkout@${actionSha}`,
             '        with:',
             '          persist-credentials: false',
             '          persist-credentials: false',
-            '      - uses: actions/checkout@v7'
+            `      - uses: actions/checkout@${actionSha}`
         ].join('\n')
     );
     const result = run(directory, workflowScript);

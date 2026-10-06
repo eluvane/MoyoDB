@@ -212,6 +212,7 @@ type WasmEngine = {
     export_snapshot(): Uint8Array;
     list_store_configs(): unknown;
     import_snapshot(data: Uint8Array): WasmU64;
+    import_snapshot_into(target: WasmEngine, data: Uint8Array): WasmU64;
     reset(): WasmU64;
     list_stores(): unknown;
     set_schema_version(txId: WasmU64, version: WasmU64): void;
@@ -261,7 +262,11 @@ function toWasmU64(value: number | bigint): WasmU64 {
     return BigInt(value);
 }
 function fromWasmU64(value: number | bigint): number {
-    return typeof value === 'bigint' ? Number(value) : value;
+    const number = typeof value === 'bigint' ? Number(value) : value;
+    if (!Number.isSafeInteger(number) || number < 0) {
+        throw remoteError('SerializationError', 'WASM integer exceeds the JavaScript safe integer range');
+    }
+    return number;
 }
 function fromOptionalWasmU64(value: number | bigint | null | undefined): number | null {
     return value === null || value === undefined ? null : fromWasmU64(value);
@@ -308,7 +313,7 @@ type TrackedTxnChanges = Map<string, TrackedStoreChanges>;
 type StoreCompressionSnapshot =
     | { owned: false; values: ReadonlyMap<string, CompressionOption> }
     | { owned: true; values: Map<string, CompressionOption> };
-type MaintenanceOperation = 'compact' | 'rebuild';
+type MaintenanceOperation = 'compact' | 'rebuild' | 'import';
 const EMPTY_RANGE: Range = {};
 const EMPTY_VALUE = new Uint8Array(0);
 const MAX_ENGINE_KEY_BYTES = 1024;
@@ -1538,13 +1543,10 @@ export class DbWorker implements WorkerApi {
         return await wrapSnapshotWithCompression(wrapped, options.compression ?? false);
     }
     async importSnapshot(data: Uint8Array): Promise<void> {
-        this.rollbackAllTransactions();
+        this.ensureNotInMaintenance();
         const decompressed = await unwrapSnapshotCompression(data);
         const parsed = unwrapSnapshotWithIndexDefinitions(decompressed);
-        this.withEngine((engine) => engine.import_snapshot(parsed.snapshot));
-        this.committedIndexes = [];
-        this.committedStoreCompression = null;
-        await this.applyCommittedIndexSchema(parsed.indexes);
+        await this.runGenerationOperation('import', parsed);
     }
     async reset(): Promise<void> {
         const dbName = this.dbName;
@@ -1571,16 +1573,16 @@ export class DbWorker implements WorkerApi {
         }
     }
     async compact(): Promise<CompactionResult> {
-        return this.runCompactionOperation('compact');
+        return this.runGenerationOperation('compact');
     }
     async rebuild(): Promise<CompactionResult> {
-        return this.runCompactionOperation('rebuild');
+        return this.runGenerationOperation('rebuild');
     }
     stats(): Promise<DbStats> {
         const stats = this.withEngine((engine) => engine.stats()) as WasmDbStats;
         return Promise.resolve({
             ...stats,
-            db_id: fromWasmU64(stats.db_id),
+            db_id: typeof stats.db_id === 'bigint' ? Number(stats.db_id) : stats.db_id,
             catalog_root_page_id: fromWasmU64(stats.catalog_root_page_id),
             next_page_id: fromWasmU64(stats.next_page_id),
             last_committed_txid: fromWasmU64(stats.last_committed_txid),
@@ -1646,7 +1648,9 @@ export class DbWorker implements WorkerApi {
         this.txStoreCompression.set(txId, { owned: false, values: this.loadCommittedStoreCompression() });
         try {
             await this.reconcileIndexes(txId, toPublicIndexDefinitions(normalized));
-            this.withEngine((engine) => engine.commit_tx(toWasmU64(txId)), { allowDuringMaintenance: true });
+            fromWasmU64(
+                this.withEngine((engine) => engine.commit_tx(toWasmU64(txId)), { allowDuringMaintenance: true })
+            );
             this.committedIndexes = cloneNormalizedIndexDefinitions(normalized);
         } catch (error) {
             try {
@@ -1662,7 +1666,10 @@ export class DbWorker implements WorkerApi {
      * A failed swap may have reached storage; read the control file before cleanup.
      * After publication, abandon the old engine to avoid a checkpoint into inactive files.
      */
-    private async runCompactionOperation(operation: MaintenanceOperation): Promise<CompactionResult> {
+    private async runGenerationOperation(
+        operation: MaintenanceOperation,
+        imported?: { snapshot: Uint8Array; indexes: NormalizedIndexDef[] }
+    ): Promise<CompactionResult> {
         const dbName = this.requireDbName();
         if (this.maintenanceOperation) {
             throw remoteError(
@@ -1672,13 +1679,14 @@ export class DbWorker implements WorkerApi {
         }
         this.maintenanceOperation = operation;
         const start = performance.now();
-        const wasm = await this.loadWasm();
+        let wasm: WasmModule | null = null;
         let rebuiltEngine: WasmEngine | null = null;
         let generationName: string | null = null;
         let published = false;
         try {
+            wasm = await this.loadWasm();
             const sizeBefore = await wasm.dbDirectorySize(dbName);
-            const defs = cloneNormalizedIndexDefinitions(this.loadCommittedIndexSchema());
+            const defs = cloneNormalizedIndexDefinitions(imported?.indexes ?? this.loadCommittedIndexSchema());
             this.rollbackAllTransactions({ allowDuringMaintenance: true });
             const expectedGeneration = await wasm.readActiveGeneration(dbName);
             generationName = (await wasm.prepareRebuildTarget(dbName)).generationName;
@@ -1690,16 +1698,18 @@ export class DbWorker implements WorkerApi {
             const target = rebuiltEngine;
             this.withEngine(
                 (engine) =>
-                    operation === 'rebuild'
-                        ? engine.compact_into_skipping_stores(target, [
-                              ...defs.map((def) => def.internalStore),
-                              INDEX_METADATA_STORE
-                          ])
-                        : engine.compact_into(target),
+                    imported
+                        ? fromWasmU64(engine.import_snapshot_into(target, imported.snapshot))
+                        : operation === 'rebuild'
+                          ? engine.compact_into_skipping_stores(target, [
+                                ...defs.map((def) => def.internalStore),
+                                INDEX_METADATA_STORE
+                            ])
+                          : engine.compact_into(target),
                 { allowDuringMaintenance: true }
             );
-            if (operation === 'rebuild' && defs.length > 0) {
-                // Rebuild recreates indexes from live documents; compact preserves index entries.
+            if ((operation === 'rebuild' || imported) && defs.length > 0) {
+                // Regenerate managed indexes before activating the target generation.
                 const previousEngine = this.engine;
                 const previousMaintenance = this.maintenanceOperation;
                 this.engine = target;
@@ -1734,7 +1744,7 @@ export class DbWorker implements WorkerApi {
             try {
                 await wasm.cleanupInactiveEntries(dbName);
             } catch {}
-            const sizeAfter = await wasm.dbDirectorySize(dbName);
+            const sizeAfter = imported ? sizeBefore : await wasm.dbDirectorySize(dbName);
             return {
                 sizeBefore,
                 sizeAfter,
@@ -1748,7 +1758,7 @@ export class DbWorker implements WorkerApi {
                 try {
                     rebuiltEngine?.abandon();
                 } catch {}
-                if (generationName !== null) {
+                if (generationName !== null && wasm !== null) {
                     // Cleanup requires proof that the target generation is inactive.
                     const active = await readActiveGenerationOrNull(wasm, dbName);
                     if (active !== undefined && active !== generationName) {

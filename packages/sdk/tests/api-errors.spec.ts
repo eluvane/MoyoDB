@@ -153,6 +153,54 @@ test('openDB and deleteDB reject names the storage layer cannot represent', asyn
         'TypeError: deleteDB() database name must contain at most 127 UTF-8 bytes'
     ]);
 });
+test('database names preserve valid surrogate pairs without aliasing replacement characters', async ({ page }) => {
+    await prepareMoyoDbPage(page);
+    const result = await page.evaluate(async (base) => {
+        const names = [`${base}\uFFFD`, `${base}\uD800\uDC00`];
+        const handles = [];
+        const errors: string[] = [];
+        try {
+            for (const [index, name] of names.entries()) {
+                const db = await window.moyodb.openDB(name);
+                handles.push(db);
+                await db.createStore('kv');
+                await db.put('kv', Uint8Array.of(1), Uint8Array.of(index + 1));
+            }
+            for (const unit of ['\uD800', '\uDC00']) {
+                const name = `${base}${unit}`;
+                for (const operation of [
+                    () => window.moyodb.openDB(name),
+                    () => window.moyodb.deleteDB(name),
+                    () => window.moyodb.unsafeDebugCrashWorker(name)
+                ]) {
+                    try {
+                        await operation();
+                        errors.push('NO_ERROR');
+                    } catch (error) {
+                        errors.push(error instanceof Error ? error.name : String(error));
+                    }
+                }
+            }
+        } finally {
+            await Promise.all(handles.map((db) => db.close()));
+        }
+        const values = [];
+        try {
+            for (const name of names) {
+                const db = await window.moyodb.openDB(name, { createIfMissing: false });
+                try {
+                    values.push(Array.from((await db.get('kv', Uint8Array.of(1))) ?? []));
+                } finally {
+                    await db.close();
+                }
+            }
+        } finally {
+            await Promise.all(names.map((name) => window.moyodb.deleteDB(name)));
+        }
+        return { errors, values };
+    }, uniqueDbName('unicode-names'));
+    expect(result).toEqual({ errors: Array(6).fill('TypeError'), values: [[1], [2]] });
+});
 test('openDB rejects null option bags with InvalidOpenOptionsError', async ({ page }) => {
     const dbName = uniqueDbName('invalid-open-options-null');
     await prepareMoyoDbPage(page);

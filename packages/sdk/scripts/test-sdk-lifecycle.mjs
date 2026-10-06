@@ -325,6 +325,61 @@ try {
     const tests = [];
     const test = (name, run) => tests.push({ name, run });
     const open = (name, options = {}) => sdk.openDB(name, { requestPersistence: false, ...options });
+    test('database names reject every unpaired surrogate before creating worker state', async (env) => {
+        const aliases = ['db:\uD800', 'db:\uDC00', 'db:\uFFFD'];
+        assert.equal(new Set(aliases).size, 3);
+        for (const alias of aliases)
+            assert.deepEqual(new TextEncoder().encode(alias), new TextEncoder().encode(aliases[2]));
+        const malformed = Array.from({ length: 0x800 }, (_, index) => String.fromCharCode(0xd800 + index));
+        malformed.push('\uD800x', 'x\uDC00', '\uDC00\uD800', '\uD800\uD800\uDC00', '\uD800\uDC00\uDC00');
+        for (const name of malformed) {
+            await assert.rejects(open(name), {
+                name: 'TypeError',
+                message: 'openDB() database name must contain valid Unicode'
+            });
+            await assert.rejects(sdk.deleteDB(name), {
+                name: 'TypeError',
+                message: 'deleteDB() database name must contain valid Unicode'
+            });
+            assert.throws(() => sdk.unsafeDebugCrashWorker(name), {
+                name: 'TypeError',
+                message: 'unsafeDebugCrashWorker() database name must contain valid Unicode'
+            });
+        }
+        assert.equal(env.workers.size, 0);
+        assert.equal(env.calls.length, 0);
+    });
+    test('database names preserve valid Unicode and enforce the UTF-8 byte boundary', async (env) => {
+        const names = ['\uFFFD', '\uD800\uDC00', '\uDBFF\uDFFF', 'я', 'é', 'e\u0301', '😀'.repeat(31) + 'abc'];
+        const handles = [];
+        try {
+            for (const name of names) {
+                handles.push(await open(name));
+            }
+            assert.equal(sdk.unsafeDebugCrashWorker('valid-unopened-\uD800\uDC00-\uFFFD'), false);
+            assert.equal(new TextEncoder().encode(names.at(-1)).length, 127);
+            assert.equal(env.workers.size, names.length);
+            assert.deepEqual(
+                env.calls.filter((call) => call.command === 'open').map((call) => call.args[0].dbName),
+                names
+            );
+            const before = env.calls.length;
+            for (const name of ['x'.repeat(128), 'é'.repeat(64), '😀'.repeat(32)]) {
+                await assert.rejects(open(name), /at most 127 UTF-8 bytes/);
+                await assert.rejects(sdk.deleteDB(name), /at most 127 UTF-8 bytes/);
+                assert.throws(() => sdk.unsafeDebugCrashWorker(name), /at most 127 UTF-8 bytes/);
+            }
+            assert.equal(env.calls.length, before);
+        } finally {
+            await Promise.all(handles.map((handle) => handle.close()));
+        }
+        for (const name of names) await sdk.deleteDB(name);
+        assert.deepEqual(
+            env.calls.filter((call) => call.command === 'deleteDB').map((call) => call.args[0]),
+            names
+        );
+        assert.equal(env.workers.size, 0);
+    });
     test('primary scan pages keep one snapshot and obey row and byte budgets', async (env) => {
         const db = await open('cursor-snapshot');
         const first = await db.scanPage('kv', {}, { maxRows: 2, maxBytes: 128 });

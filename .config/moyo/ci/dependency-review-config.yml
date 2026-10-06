@@ -11,5 +11,8 @@ allow-licenses:
   - MPL-2.0
   - Unicode-3.0
   - Zlib
+# Existing CI cache tool. Dependency Review matches exceptions by package, not version.
+allow-dependencies-licenses:
+  - pkg:githubactions/Swatinem/rust-cache
 license-check: true
 vulnerability-check: true
