@@ -24,11 +24,16 @@ self.onmessage = async ({ data: name }) => {
         const engine = db.engine;
         const originalGet = engine.get;
         const originalParse = JSON.parse;
-        const originalDecode = db.decodeStoreValue;
-        const counts = { bodyReads: 0, jsonParses: 0, valueDecodes: 0, error: '' };
+        const originalRead = db.readStoreValue;
+        if (typeof originalRead !== 'function') throw new Error('Missing store value reader');
+        const counts = { bodyReads: 0, jsonParses: 0, valueReads: 0, error: '' };
         engine.get = function (...args) { if (args[1] === 'docs') counts.bodyReads++; return originalGet.apply(this, args); };
         JSON.parse = function (...args) { counts.jsonParses++; return originalParse.apply(this, args); };
-        db.decodeStoreValue = function (...args) { counts.valueDecodes++; return originalDecode.apply(this, args); };
+        db.readStoreValue = async function (...args) {
+            const value = await originalRead.apply(this, args);
+            if (value !== null) counts.valueReads++;
+            return value;
+        };
         try {
             await db.assertUniqueIndexAvailability(txId, def, codec.indexKey(logical), candidate);
         } catch (error) {
@@ -36,7 +41,7 @@ self.onmessage = async ({ data: name }) => {
         } finally {
             engine.get = originalGet;
             JSON.parse = originalParse;
-            db.decodeStoreValue = originalDecode;
+            db.readStoreValue = originalRead;
         }
         return counts;
     };
@@ -115,13 +120,13 @@ self.onmessage = async ({ data: name }) => {
     const trustedConflict = {
         bodyReads: 0,
         jsonParses: 0,
-        valueDecodes: 0,
+        valueReads: 0,
         error: 'UniqueIndexConstraintError'
     };
     for (const key of ['known', 'refreshed', 'rolledBack', 'reconciled', 'oldSnapshot', 'imported', 'rebuilt']) {
         expect(result[key], key).toEqual(trustedConflict);
     }
-    expect(result.rawFallback).toEqual({ ...trustedConflict, bodyReads: 1, jsonParses: 1, valueDecodes: 1 });
-    expect(result.forged).toEqual({ bodyReads: 1, jsonParses: 1, valueDecodes: 1, error: '' });
-    expect(result.expired).toEqual({ bodyReads: 0, jsonParses: 0, valueDecodes: 0, error: '' });
+    expect(result.rawFallback).toEqual({ ...trustedConflict, bodyReads: 1, jsonParses: 1, valueReads: 1 });
+    expect(result.forged).toEqual({ bodyReads: 1, jsonParses: 1, valueReads: 1, error: '' });
+    expect(result.expired).toEqual({ bodyReads: 0, jsonParses: 0, valueReads: 0, error: '' });
 });

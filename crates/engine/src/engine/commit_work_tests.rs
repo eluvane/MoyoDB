@@ -1,4 +1,5 @@
 use super::*;
+use crate::change_feed::ChangeFeedOptions;
 use crate::layout::{page_offset, PageKind, ValueKind, PAGE_SIZE};
 use crate::page::{decode_page, encode_leaf_page, MAX_TREE_LEVEL};
 use crate::storage::memory::{MemoryBackend, MemoryBundle};
@@ -124,6 +125,7 @@ fn staged_ttl_expiry_hides_live_base_and_survives_clock_reversal_and_commit() ->
     assert!(put_with_staged_at(
         &mut engine.pager,
         &mut engine.next_value_revision_ordinal,
+        None,
         rw,
         "kv",
         b"key",
@@ -136,7 +138,7 @@ fn staged_ttl_expiry_hides_live_base_and_survives_clock_reversal_and_commit() ->
         Some(MutationValue::Delete)
     ));
     assert_eq!(
-        get_with_staged(&mut engine.pager, rw, "kv", b"key", 0)?,
+        get_with_staged(&mut engine.pager, None, rw, "kv", b"key", 0)?,
         None
     );
     engine.put_tx(tx);
@@ -241,7 +243,7 @@ impl TtlCleanupFixture {
         let mut corrupt = late_image.clone();
         corrupt[PAGE_SIZE - 1] ^= 0x80;
         bundle.main.write_at(page_offset(late_leaf), &corrupt)?;
-        engine.pager.discard_cache();
+        engine.discard_pager_cache();
         Ok(Self {
             engine,
             bundle,
@@ -261,6 +263,7 @@ impl TtlCleanupFixture {
             put_with_staged_at(
                 &mut self.engine.pager,
                 &mut self.engine.next_value_revision_ordinal,
+                None,
                 rw,
                 "kv",
                 b"zz-staged",
@@ -276,7 +279,7 @@ impl TtlCleanupFixture {
         self.bundle
             .main
             .write_at(page_offset(self.late_leaf), &corrupt)?;
-        self.engine.pager.discard_cache();
+        self.engine.discard_pager_cache();
         Ok(())
     }
 
@@ -291,7 +294,7 @@ impl TtlCleanupFixture {
         self.bundle
             .main
             .write_at(page_offset(self.late_leaf), &self.late_image)?;
-        self.engine.pager.discard_cache();
+        self.engine.discard_pager_cache();
         Ok(())
     }
 }
@@ -316,7 +319,7 @@ fn has_many_failure_matches_full_scan_staged_and_base_ttl_cleanup() -> Result<()
         "failed full scans defer committed-key cleanup"
     );
     fixture.engine.rollback_tx(scan_tx)?;
-    fixture.engine.pager.discard_cache();
+    fixture.engine.discard_pager_cache();
 
     let batch_tx = fixture.engine.begin_tx(TxMode::Readwrite)?;
     fixture.stage_expired_put(batch_tx)?;
@@ -345,4 +348,62 @@ fn has_many_failure_matches_full_scan_staged_and_base_ttl_cleanup() -> Result<()
         Some(MutationValue::Delete)
     ));
     fixture.engine.rollback_tx(batch_tx)
+}
+
+#[test]
+fn excluded_change_log_payloads_are_still_validated() -> Result<()> {
+    let mut engine = Engine::open(
+        "excluded-corrupt-feed",
+        MemoryBundle::new().files(),
+        OpenConfig {
+            checkpoint_wal_bytes: u64::MAX,
+            checkpoint_dirty_pages: usize::MAX,
+            ..OpenConfig::default()
+        },
+    )?;
+    let tx = engine.begin_tx(TxMode::Readwrite)?;
+    engine.create_store(tx, "source")?;
+    engine.put(tx, "source", b"key", b"value")?;
+    engine.commit_tx(tx)?;
+    corrupt_change_log_magic(&mut engine)?;
+    let error = engine
+        .changes_since(
+            0,
+            ChangeFeedOptions {
+                stores: Some(vec!["other".to_string()]),
+                limit: None,
+            },
+        )
+        .expect_err("excluded payloads still require validation");
+    assert!(matches!(error, EngineError::Corruption(_)));
+    Ok(())
+}
+
+fn corrupt_change_log_magic<B: crate::storage::backend::FileBackend>(
+    engine: &mut Engine<B>,
+) -> Result<()> {
+    let next = engine.superblock.next_page_id;
+    for page_id in 1..next {
+        let mut bytes = match engine.pager.read_page(page_id) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        let Some(pos) = bytes.windows(4).position(|window| window == b"CHG1") else {
+            continue;
+        };
+        bytes[pos] ^= 0xff;
+        let checksum = crate::checksum::checksum_with_zeroed_region(
+            &bytes,
+            crate::layout::PAGE_HEADER_CHECKSUM_OFFSET,
+            4,
+        );
+        bytes[crate::layout::PAGE_HEADER_CHECKSUM_OFFSET
+            ..crate::layout::PAGE_HEADER_CHECKSUM_OFFSET + 4]
+            .copy_from_slice(&checksum.to_le_bytes());
+        engine.pager.stage_page_image(page_id, bytes)?;
+        return Ok(());
+    }
+    Err(EngineError::Internal(
+        "change log payload was not cached".into(),
+    ))
 }

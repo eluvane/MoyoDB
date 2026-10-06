@@ -2,7 +2,9 @@ use crate::error::{EngineError, Result};
 use crate::layout::{page_offset, PAGE_SIZE};
 use crate::page::{validate_tree_page, verify_page_image};
 use crate::storage::backend::FileBackend;
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};
+use std::hash::{BuildHasher, Hasher};
 
 // Limit the copy buffer while reducing native and OPFS backend calls.
 pub(crate) const PAGE_WRITE_BATCH_PAGES: usize = 64;
@@ -43,6 +45,63 @@ impl Default for PageReadWindow {
     }
 }
 
+// Multiply-xor mix for page ids. A keyed SipHash on every probe dominated hits.
+const PAGE_ID_HASH_MIX: u64 = 0x517cc1b727220a95;
+
+struct PageIdHasher {
+    state: u64,
+}
+
+impl Hasher for PageIdHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.state
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.state =
+                (self.state.rotate_left(5) ^ u64::from(byte)).wrapping_mul(PAGE_ID_HASH_MIX);
+        }
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.state = (self.state.rotate_left(5) ^ value).wrapping_mul(PAGE_ID_HASH_MIX);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PageIdBuildHasher {
+    seed: u64,
+}
+
+impl PageIdBuildHasher {
+    fn new() -> Self {
+        // One random seed per pager. Lookups then mix the page id without SipHash.
+        Self {
+            seed: RandomState::new().hash_one(0x4d6f_796f_5047_u64),
+        }
+    }
+}
+
+impl BuildHasher for PageIdBuildHasher {
+    type Hasher = PageIdHasher;
+
+    #[inline]
+    fn build_hasher(&self) -> PageIdHasher {
+        PageIdHasher { state: self.seed }
+    }
+}
+
+#[inline]
+fn bump_generation_counter(next_generation: &mut u64) -> u64 {
+    let generation = *next_generation;
+    *next_generation = generation.wrapping_add(1).max(1);
+    generation
+}
+
 #[derive(Debug)]
 struct CacheEntry {
     bytes: Vec<u8>,
@@ -50,19 +109,39 @@ struct CacheEntry {
     dirty: bool,
 }
 
-// Cached main-file pages are verified on load: checksum plus cell structure.
-// Image-write callers supply valid bytes, because cached images bypass both checks.
+// Returns whether a new clean-queue record was appended.
+#[inline]
+fn note_cached_use(
+    entry: &mut CacheEntry,
+    lru: &mut VecDeque<(u64, u64)>,
+    next_generation: &mut u64,
+    page_id: u64,
+) -> bool {
+    if entry.dirty || lru.back() == Some(&(page_id, entry.generation)) {
+        return false;
+    }
+    let generation = bump_generation_counter(next_generation);
+    entry.generation = generation;
+    lru.push_back((page_id, generation));
+    true
+}
+
+// Main-file reads are verified once. Image-write callers must supply valid bytes,
+// because cached images bypass checksum verification.
 #[derive(Debug)]
 pub struct Pager<B: FileBackend> {
     main: B,
     cache_pages: usize,
-    cache: HashMap<u64, CacheEntry>,
+    cache: HashMap<u64, CacheEntry, PageIdBuildHasher>,
     // Track only clean pages. Growing commits must not scan dirty pins.
     lru: VecDeque<(u64, u64)>,
     next_generation: u64,
     // Exclusive upper bound for page ids reachable from committed state.
     page_limit: u64,
     dirty_count: usize,
+    // Scratch reused across checkpoints. Membership stays on the cache entries.
+    dirty_ids: Vec<u64>,
+    write_batch: Vec<u8>,
     #[cfg(test)]
     lru_entries_examined: usize,
 }
@@ -83,11 +162,13 @@ impl<B: FileBackend> Pager<B> {
         Self {
             main,
             cache_pages: cache_pages.max(1),
-            cache: HashMap::new(),
+            cache: HashMap::with_hasher(PageIdBuildHasher::new()),
             lru: VecDeque::new(),
             next_generation: 1,
             page_limit: u64::MAX,
             dirty_count: 0,
+            dirty_ids: Vec::new(),
+            write_batch: Vec::new(),
             #[cfg(test)]
             lru_entries_examined: 0,
         }
@@ -123,6 +204,7 @@ impl<B: FileBackend> Pager<B> {
         self.with_page(page_id, |bytes| Ok(bytes.to_vec()))
     }
 
+    #[inline]
     pub(crate) fn with_page<R>(
         &mut self,
         page_id: u64,
@@ -131,20 +213,36 @@ impl<B: FileBackend> Pager<B> {
         if page_id == 0 {
             return Err(EngineError::Corruption("page id 0 is invalid".into()));
         }
-        if !self.cache.contains_key(&page_id) {
-            if page_id >= self.page_limit {
-                return Err(EngineError::Corruption(format!(
-                    "page id {page_id} is beyond the allocated range (next page id {})",
-                    self.page_limit
-                )));
+        if let Some(entry) = self.cache.get_mut(&page_id) {
+            // Hits stay on this probe. The callback cannot re-enter the pager.
+            let appended =
+                note_cached_use(entry, &mut self.lru, &mut self.next_generation, page_id);
+            let result = f(&entry.bytes);
+            if appended {
+                self.compact_lru_if_needed();
             }
-            let bytes = self.main.read_at(page_offset(page_id), PAGE_SIZE)?;
-            let header = verify_page_image(&bytes, page_id)?;
-            validate_tree_page(&bytes, &header)?;
-            self.insert_cache(page_id, bytes, false);
-        } else {
-            self.touch(page_id);
+            return result;
         }
+        self.read_uncached_page(page_id, f)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn read_uncached_page<R>(
+        &mut self,
+        page_id: u64,
+        f: impl FnOnce(&[u8]) -> Result<R>,
+    ) -> Result<R> {
+        if page_id >= self.page_limit {
+            return Err(EngineError::Corruption(format!(
+                "page id {page_id} is beyond the allocated range (next page id {})",
+                self.page_limit
+            )));
+        }
+        let bytes = self.main.read_at(page_offset(page_id), PAGE_SIZE)?;
+        let header = verify_page_image(&bytes, page_id)?;
+        validate_tree_page(&bytes, &header)?;
+        self.insert_cache(page_id, bytes, false);
         let entry = self
             .cache
             .get(&page_id)
@@ -153,6 +251,9 @@ impl<B: FileBackend> Pager<B> {
     }
 
     pub fn write_page_image(&mut self, page_id: u64, bytes: &[u8]) -> Result<()> {
+        if page_id == 0 {
+            return Err(EngineError::Corruption("page id 0 is invalid".into()));
+        }
         require_page_image_size(bytes.len())?;
         self.main.write_at(page_offset(page_id), bytes)?;
         self.store_cached_page(page_id, bytes.to_vec(), false);
@@ -217,6 +318,9 @@ impl<B: FileBackend> Pager<B> {
     ) -> Result<()> {
         if images.is_empty() {
             return Ok(());
+        }
+        if images.iter().any(|(page_id, _)| *page_id == 0) {
+            return Err(EngineError::Corruption("page id 0 is invalid".into()));
         }
         if images.len() > PAGE_WRITE_BATCH_PAGES
             || images
@@ -291,15 +395,24 @@ impl<B: FileBackend> Pager<B> {
         if self.dirty_count == 0 {
             return Ok(());
         }
-        let mut page_ids: Vec<u64> = self
-            .cache
-            .iter()
-            .filter(|(_, entry)| entry.dirty)
-            .map(|(page_id, _)| *page_id)
-            .collect();
+        let mut page_ids = std::mem::take(&mut self.dirty_ids);
+        let mut batch = std::mem::take(&mut self.write_batch);
+        let result = self.write_sorted_dirty(&mut page_ids, &mut batch);
+        self.dirty_ids = page_ids;
+        self.write_batch = batch;
+        result
+    }
+
+    fn write_sorted_dirty(&mut self, page_ids: &mut Vec<u64>, batch: &mut Vec<u8>) -> Result<()> {
+        page_ids.clear();
+        page_ids.reserve(self.dirty_count);
+        for (page_id, entry) in &self.cache {
+            if entry.dirty {
+                page_ids.push(*page_id);
+            }
+        }
         page_ids.sort_unstable();
         let Self { main, cache, .. } = self;
-        let mut batch = Vec::new();
         let mut start = 0;
         while start < page_ids.len() {
             let mut end = start + 1;
@@ -325,7 +438,7 @@ impl<B: FileBackend> Pager<B> {
                     batch.extend_from_slice(&entry.bytes);
                 }
                 // Batch only adjacent dirty pages; writing across gaps would replace other pages.
-                main.write_at(page_offset(page_id), &batch)?;
+                main.write_at(page_offset(page_id), batch)?;
             }
             start = end;
         }
@@ -339,8 +452,7 @@ impl<B: FileBackend> Pager<B> {
         for (page_id, entry) in &mut self.cache {
             if entry.dirty {
                 entry.dirty = false;
-                entry.generation = self.next_generation;
-                self.next_generation = self.next_generation.wrapping_add(1).max(1);
+                entry.generation = bump_generation_counter(&mut self.next_generation);
                 self.lru.push_back((*page_id, entry.generation));
             }
         }
@@ -415,22 +527,18 @@ impl<B: FileBackend> Pager<B> {
     }
 
     fn touch(&mut self, page_id: u64) {
-        let Some(entry) = self.cache.get_mut(&page_id) else {
+        let appended = if let Some(entry) = self.cache.get_mut(&page_id) {
+            note_cached_use(entry, &mut self.lru, &mut self.next_generation, page_id)
+        } else {
             return;
         };
-        if entry.dirty || self.lru.back() == Some(&(page_id, entry.generation)) {
-            return;
+        if appended {
+            self.compact_lru_if_needed();
         }
-        entry.generation = self.next_generation;
-        self.next_generation = self.next_generation.wrapping_add(1).max(1);
-        self.lru.push_back((page_id, entry.generation));
-        self.compact_lru_if_needed();
     }
 
     fn bump_generation(&mut self) -> u64 {
-        let generation = self.next_generation;
-        self.next_generation = self.next_generation.wrapping_add(1).max(1);
-        generation
+        bump_generation_counter(&mut self.next_generation)
     }
 
     fn evict_if_needed(&mut self, protected_page_id: u64) {

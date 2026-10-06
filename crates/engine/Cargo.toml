@@ -1,6 +1,6 @@
 [package]
 name = "moyodb-engine"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2021"
 license-file = "../../LICENSE"
 description = "Rust/WASM transactional storage engine for browser and native file runtimes."

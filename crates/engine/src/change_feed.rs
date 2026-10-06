@@ -6,7 +6,6 @@ use crate::catalog::CatalogMap;
 use crate::error::{EngineError, Result};
 use crate::value::STORE_FLAG_SYSTEM_RAW_VALUES;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 
 pub type TxId = u64;
 
@@ -136,17 +135,28 @@ pub fn visible_store_count(catalog: &CatalogMap) -> usize {
         .count()
 }
 
-pub fn normalize_store_filter(stores: Option<&[String]>) -> Result<Option<BTreeSet<String>>> {
+/// Borrowed allow-list. `changes_since` only tests membership, so the caller's
+/// names stay where they are instead of being copied into a set.
+#[derive(Debug, Clone, Copy)]
+pub struct StoreFilter<'a> {
+    names: &'a [String],
+}
+
+impl StoreFilter<'_> {
+    #[inline]
+    pub fn contains(&self, store: &str) -> bool {
+        self.names.iter().any(|name| name.as_str() == store)
+    }
+}
+
+pub fn normalize_store_filter<'a>(stores: Option<&'a [String]>) -> Result<Option<StoreFilter<'a>>> {
     let Some(stores) = stores else {
         return Ok(None);
     };
-
-    let mut normalized = BTreeSet::new();
     for store in stores {
         validate_user_store_name(store)?;
-        normalized.insert(store.clone());
     }
-    Ok(Some(normalized))
+    Ok(Some(StoreFilter { names: stores }))
 }
 
 pub fn encode_change_log_key(txid: TxId, sequence: u32) -> Vec<u8> {
@@ -343,4 +353,31 @@ pub(crate) fn decode_change_record_prefix_ref(
         value_prefix: &payload[key_end..],
         value_len,
     }))
+}
+
+#[cfg(test)]
+mod encode_tests {
+    use super::{
+        encode_change_record_payload, encode_change_record_prefix, ChangeKind,
+        CHANGE_RECORD_HEADER_SIZE,
+    };
+    use crate::error::Result;
+
+    #[test]
+    fn prefix_reserves_only_the_header_store_and_key() -> Result<()> {
+        let value = vec![0x5a; 64 * 1024];
+        let prefix = encode_change_record_prefix("docs", b"ab", ChangeKind::Put, Some(&value))?;
+        let payload = encode_change_record_payload("docs", b"ab", ChangeKind::Put, Some(&value))?;
+        assert_eq!(prefix.len(), CHANGE_RECORD_HEADER_SIZE + 4 + 2);
+        assert_eq!(
+            prefix.capacity(),
+            prefix.len(),
+            "prefix reserved unused value bytes"
+        );
+        assert_eq!(payload.len(), prefix.len() + value.len());
+        assert_eq!(payload.capacity(), payload.len());
+        assert_eq!(&payload[..prefix.len()], prefix.as_slice());
+        assert_eq!(&payload[prefix.len()..], value.as_slice());
+        Ok(())
+    }
 }

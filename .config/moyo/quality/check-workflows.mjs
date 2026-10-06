@@ -86,6 +86,25 @@ function checkInstallPolicy(file, lines) {
     }
 }
 
+function checkCargoCommandPolicy(file, lines) {
+    for (const line of lines) {
+        const installsWasmPack = /\bcargo\s+install\b/.test(line) && /(?:^|\s)wasm-pack(?:\s|$)/.test(line);
+        if (installsWasmPack) {
+            fail(file, `cargo install of wasm-pack is forbidden; use scripts/ci/install-wasm-pack.mjs: ${line.trim()}`);
+        }
+        const testsAllTargets =
+            /\bcargo\s+test\b/.test(line) &&
+            /(?:^|\s)--workspace(?:\s|$)/.test(line) &&
+            /(?:^|\s)--all-targets(?:\s|$)/.test(line);
+        if (testsAllTargets) {
+            fail(
+                file,
+                `cargo test must not use --workspace --all-targets; keep --lib --tests --doc and compile benches with cargo bench --no-run: ${line.trim()}`
+            );
+        }
+    }
+}
+
 function checkMultilineShellPolicy(file, lines) {
     for (const [index, line] of lines.entries()) {
         if (!/^[\t ]*(?:-[\t ]*)?run:[\t ]*[|>][\t ]*$/.test(line)) {
@@ -127,6 +146,7 @@ function checkWorkflow(file, text) {
     checkUsesPinned(file, text);
     checkCheckoutPolicy(file, lines);
     checkInstallPolicy(file, lines);
+    checkCargoCommandPolicy(file, lines);
     checkMultilineShellPolicy(file, lines);
 }
 

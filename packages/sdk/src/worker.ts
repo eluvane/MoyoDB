@@ -39,6 +39,7 @@ import {
     extractLogicalIndexKey,
     extractLogicalIndexKeyFromDocument,
     findIndexDefinition,
+    assertValidScanRange,
     indexKeyExactRange,
     indexRangeToPhysicalRange,
     isInternalStoreName,
@@ -275,6 +276,7 @@ function toWasmPutOptions(options: PutOptions): unknown {
     return options.ttl === undefined ? options : { ...options, ttl: toWasmU64(options.ttl) };
 }
 function toWasmRange(range: Range): Range {
+    assertValidScanRange(range);
     const normalized: Range = {};
     if (range.gt !== undefined) {
         normalized.gt = range.gt;
@@ -308,6 +310,16 @@ interface TrackedStoreChanges {
     keys: Map<string, TrackedKeyChange>;
 }
 type TrackedTxnChanges = Map<string, TrackedStoreChanges>;
+interface IndexBoundCache {
+    txId: number;
+    def: NormalizedIndexDef;
+    reverse: boolean;
+    gt?: Uint8Array;
+    gte?: Uint8Array;
+    lt?: Uint8Array;
+    lte?: Uint8Array;
+    physical: Range;
+}
 // Published maps stay immutable. Create/drop gives the transaction a private
 // copy, which commit publishes.
 type StoreCompressionSnapshot =
@@ -320,6 +332,8 @@ const MAX_ENGINE_KEY_BYTES = 1024;
 const MAX_PACKED_BYTES = 0xffff_ffff;
 const INDEX_PUT_BATCH_ROWS = 64;
 const INDEX_PUT_BATCH_BYTES = 4 * 1024 * 1024;
+// Same ceiling as compression.ts. Uncompressed writes reject here and skip the encoder.
+const MAX_PLAIN_STORE_VALUE_BYTES = 8 * 1024 * 1024;
 const INDEX_SCAN_PAGE_ROWS = 256;
 const INDEX_SCAN_PAGE_BYTES = 8 * 1024 * 1024 + 18 + MAX_ENGINE_KEY_BYTES + 12;
 const INDEX_SCAN_RAW_CHUNK_ROWS = 512;
@@ -509,6 +523,35 @@ function rangesEqual(left: Range, right: Range): boolean {
     }
     return left.reverse === right.reverse && left.limit === right.limit;
 }
+function sameBound(cached: Uint8Array | undefined, next: Uint8Array | undefined): boolean {
+    if (cached === undefined || next === undefined) {
+        return cached === next;
+    }
+    return bytesEqual(cached, next);
+}
+function copyBound(value: Uint8Array | undefined): Uint8Array | undefined {
+    return value === undefined ? undefined : value.slice();
+}
+function compoundEntryKeyLength(logicalKey: Uint8Array, primaryKey: Uint8Array): number {
+    return escapedPartLength(logicalKey) + escapedPartLength(primaryKey);
+}
+function escapedPartLength(part: Uint8Array): number {
+    let length = 2;
+    for (let index = 0; index < part.length; index += 1) {
+        length += part[index] === 0 ? 2 : 1;
+    }
+    return length;
+}
+function limitPlainStoreValue(value: Uint8Array): Uint8Array {
+    if (value.byteLength > MAX_PLAIN_STORE_VALUE_BYTES) {
+        const error = new Error(
+            `stored value has ${value.byteLength} bytes, exceeding the ${MAX_PLAIN_STORE_VALUE_BYTES} byte limit`
+        );
+        error.name = 'ValueTooLargeError';
+        throw error;
+    }
+    return value;
+}
 
 function normalizeWasmBytes(value: Uint8Array | ArrayBuffer | ArrayLike<number>): Uint8Array {
     if (value instanceof Uint8Array) {
@@ -683,6 +726,9 @@ export class DbWorker implements WorkerApi {
      */
     private txIndexSchemas = new Map<number, NormalizedIndexDef[]>();
     private indexesBySchema = new WeakMap<NormalizedIndexDef[], Map<string, NormalizedIndexDef[]>>();
+    /** Readonly scans reuse a resolved index; readwrite scans recheck so TTL staging still runs. */
+    private readonlyIndexCache = new Map<number, Map<string, Map<string, NormalizedIndexDef>>>();
+    private indexBoundCache: IndexBoundCache | null = null;
     private txEnsuredRawStores = new Map<number, Set<string>>();
     private txIndexSchemaChanged = new Set<number>();
     private txStoreCompression = new Map<number, StoreCompressionSnapshot>();
@@ -984,9 +1030,22 @@ export class DbWorker implements WorkerApi {
         value: Uint8Array,
         options: PutOptions = {}
     ): Promise<void> {
-        const defs = this.indexesForStoreInTx(txId, store);
+        await this.putEntry(txId, store, key, value, options);
+    }
+    private async putEntry(
+        txId: number,
+        store: string,
+        key: Uint8Array,
+        value: Uint8Array,
+        options: PutOptions,
+        knownDefs?: readonly NormalizedIndexDef[],
+        knownCompression?: CompressionOption
+    ): Promise<void> {
+        const defs = knownDefs ?? this.indexesForStoreInTx(txId, store);
+        const compression = knownCompression ?? this.storeCompressionForTx(txId, store);
         if (defs.length === 0) {
-            const storedValue = await this.encodeStoreValueForWrite(txId, store, value);
+            const preparedValue = this.prepareStoredValue(store, value, compression);
+            const storedValue = preparedValue instanceof Uint8Array ? preparedValue : await preparedValue;
             const baselineExists = this.withEngine((engine) =>
                 engine.put(toWasmU64(txId), store, key, storedValue, toWasmPutOptions(options))
             );
@@ -1276,7 +1335,7 @@ export class DbWorker implements WorkerApi {
             if (rows !== null) {
                 bytes = 4;
                 for (const row of rows) {
-                    row.value = await this.decodeStoreValue(cursor.txId, cursor.store, row.value);
+                    row.value = await decodeStoreValueRecord(row.value, { strict: true });
                     bytes += 8 + row.key.byteLength + row.value.byteLength;
                     if (bytes > request.maxBytes) {
                         throw remoteError('ValueTooLargeError', 'decoded scan page exceeds maxBytes');
@@ -1319,9 +1378,14 @@ export class DbWorker implements WorkerApi {
         return page.rows.length === 0 ? null : page.rows[0].value;
     }
     async scanByIndex(txId: number, store: string, indexName: string, range: Range = {}): Promise<ScanItem[]> {
+        assertValidScanRange(range);
         const def = this.resolveIndexDefinition(txId, store, indexName);
         const rows: ScanItem[] = [];
         let remaining = range.limit ?? Number.POSITIVE_INFINITY;
+        if (remaining <= 0) {
+            return rows;
+        }
+        const physical = this.physicalIndexRange(txId, def, range);
         let cursor: Uint8Array | null = null;
         while (remaining > 0) {
             const page = await this.loadVisibleIndexPage(
@@ -1329,7 +1393,9 @@ export class DbWorker implements WorkerApi {
                 def,
                 range,
                 cursor,
-                Math.min(remaining, INDEX_SCAN_PAGE_ROWS)
+                Math.min(remaining, INDEX_SCAN_PAGE_ROWS),
+                INDEX_SCAN_PAGE_BYTES,
+                physical
             );
             rows.push(...page.rows);
             remaining -= page.rows.length;
@@ -1356,7 +1422,15 @@ export class DbWorker implements WorkerApi {
             throw remoteError('InvalidRangeError', 'index scan page maxBytes must be a u32 integer of at least 4');
         }
         const def = this.resolveIndexDefinition(txId, store, indexName);
-        return this.loadVisibleIndexPage(txId, def, range, cursor, limit, maxBytes);
+        return this.loadVisibleIndexPage(
+            txId,
+            def,
+            range,
+            cursor,
+            limit,
+            maxBytes,
+            this.physicalIndexRange(txId, def, range)
+        );
     }
     getIndexes(txId?: number): Promise<IndexDef[]> {
         return Promise.resolve(
@@ -1790,9 +1864,13 @@ export class DbWorker implements WorkerApi {
         this.txChanges.delete(txId);
         this.txModes.delete(txId);
         this.txIndexSchemas.delete(txId);
+        this.readonlyIndexCache.delete(txId);
         this.txEnsuredRawStores.delete(txId);
         this.txIndexSchemaChanged.delete(txId);
         this.txStoreCompression.delete(txId);
+        if (this.indexBoundCache?.txId === txId) {
+            this.indexBoundCache = null;
+        }
     }
     private getOrCreateTrackedTxn(txId: number): TrackedTxnChanges {
         return getOrInsert(this.txChanges, txId, () => new Map<string, TrackedStoreChanges>());
@@ -2073,7 +2151,7 @@ export class DbWorker implements WorkerApi {
         txId: number,
         store: string,
         items: Uint8Array[],
-        defs: NormalizedIndexDef[],
+        defs: readonly NormalizedIndexDef[],
         options: PutOptions
     ): Promise<void> {
         let keys: Uint8Array[] = [];
@@ -2220,21 +2298,18 @@ export class DbWorker implements WorkerApi {
         }
         return storedOps;
     }
-    private async encodeStoreValueForWrite(txId: number, store: string, value: Uint8Array): Promise<Uint8Array> {
+    private prepareStoredValue(
+        store: string,
+        value: Uint8Array,
+        compression: CompressionOption
+    ): Uint8Array | Promise<Uint8Array> {
         if (isInternalStoreName(store)) {
             return value;
         }
-        return encodeStoreValueRecord(value, this.storeCompressionForTx(txId, store));
-    }
-    private async decodeStoreValue(txId: number, store: string, value: Uint8Array): Promise<Uint8Array> {
-        if (isInternalStoreName(store)) {
-            return value;
-        }
-        const compression = this.storeCompressionForTx(txId, store);
         if (compression === false) {
-            return value;
+            return limitPlainStoreValue(value);
         }
-        return decodeStoreValueRecord(value, { strict: true });
+        return encodeStoreValueRecord(value, compression);
     }
     private async decodeStoreValueForFeed(store: string, value: Uint8Array): Promise<Uint8Array> {
         if (isInternalStoreName(store)) {
@@ -2243,9 +2318,21 @@ export class DbWorker implements WorkerApi {
         const compression = this.loadCommittedStoreCompression().get(store) ?? false;
         return decodeStoreValueRecord(value, { strict: compression !== false });
     }
-    private async readStoreValue(txId: number, store: string, key: Uint8Array): Promise<Uint8Array | null> {
+    private async readStoreValue(
+        txId: number,
+        store: string,
+        key: Uint8Array,
+        knownCompression?: CompressionOption
+    ): Promise<Uint8Array | null> {
         const value = this.readRawValue(txId, store, key);
-        return value === null ? null : this.decodeStoreValue(txId, store, value);
+        if (value === null || isInternalStoreName(store)) {
+            return value;
+        }
+        const compression = knownCompression ?? this.storeCompressionForTx(txId, store);
+        if (compression === false) {
+            return value;
+        }
+        return await decodeStoreValueRecord(value, { strict: true });
     }
     private async readStoreScan(txId: number, store: string, range: Range): Promise<ScanItem[]> {
         const rows = this.readRawScan(txId, store, range);
@@ -2260,8 +2347,8 @@ export class DbWorker implements WorkerApi {
         return rows;
     }
     private async decodeStoreValues(
-        txId: number,
-        store: string,
+        _txId: number,
+        _store: string,
         values: Array<Uint8Array | null>
     ): Promise<Array<Uint8Array | null>> {
         const state = { next: 0, failed: false, failure: undefined as unknown };
@@ -2273,7 +2360,7 @@ export class DbWorker implements WorkerApi {
                     continue;
                 }
                 try {
-                    values[index] = await this.decodeStoreValue(txId, store, value);
+                    values[index] = await decodeStoreValueRecord(value, { strict: true });
                 } catch (error) {
                     if (!state.failed) {
                         state.failed = true;
@@ -2309,6 +2396,23 @@ export class DbWorker implements WorkerApi {
         return byStore.get(store) ?? [];
     }
     private resolveIndexDefinition(txId: number, store: string, indexName: string): NormalizedIndexDef {
+        // Readwrite existence checks also stage expired mutations. Readonly
+        // snapshots do not, so later scans of the same index can reuse the def.
+        if (this.txModes.get(txId) === 'readonly') {
+            const byStore = this.readonlyIndexCache.get(txId)?.get(store);
+            if (byStore) {
+                const cached = byStore.get(indexName);
+                if (cached) {
+                    return cached;
+                }
+                const def = findIndexDefinition(this.indexesForStoreInTx(txId, store), store, indexName);
+                if (!def) {
+                    throw remoteError('IndexNotFoundError', `index not found: ${store}.${indexName}`);
+                }
+                byStore.set(indexName, def);
+                return def;
+            }
+        }
         if (!this.rawStoreExistsInTx(txId, store)) {
             throw remoteError('StoreNotFoundError', `store not found: ${store}`);
         }
@@ -2316,7 +2420,41 @@ export class DbWorker implements WorkerApi {
         if (!def) {
             throw remoteError('IndexNotFoundError', `index not found: ${store}.${indexName}`);
         }
+        if (this.txModes.get(txId) === 'readonly') {
+            const byStore = getOrInsert(this.readonlyIndexCache, txId, () => new Map());
+            getOrInsert(byStore, store, () => new Map()).set(indexName, def);
+        }
         return def;
+    }
+    private physicalIndexRange(txId: number, def: NormalizedIndexDef, range: Range): Range {
+        assertValidScanRange(range);
+        const reverse = range.reverse === true;
+        const cached = this.indexBoundCache;
+        if (
+            cached !== null &&
+            cached.txId === txId &&
+            cached.def === def &&
+            cached.reverse === reverse &&
+            sameBound(cached.gt, range.gt) &&
+            sameBound(cached.gte, range.gte) &&
+            sameBound(cached.lt, range.lt) &&
+            sameBound(cached.lte, range.lte)
+        ) {
+            return cached.physical;
+        }
+        const { limit: _ignored, ...withoutLimit } = range;
+        const physical = indexRangeToPhysicalRange(withoutLimit);
+        this.indexBoundCache = {
+            txId,
+            def,
+            reverse,
+            gt: copyBound(range.gt),
+            gte: copyBound(range.gte),
+            lt: copyBound(range.lt),
+            lte: copyBound(range.lte),
+            physical
+        };
+        return physical;
     }
     private indexSchemaForTx(txId: number): NormalizedIndexDef[] {
         const override = this.txIndexSchemas.get(txId);
@@ -2584,11 +2722,17 @@ export class DbWorker implements WorkerApi {
         }
         return physicalKey;
     }
+    private assertIndexEntryKeySize(def: NormalizedIndexDef, logicalKey: Uint8Array, primaryKey: Uint8Array): void {
+        if (compoundEntryKeyLength(logicalKey, primaryKey) > MAX_ENGINE_KEY_BYTES) {
+            throw remoteError('KeyTooLargeError', `index key too large for ${def.store}.${def.name}`);
+        }
+    }
     private async assertUniqueIndexAvailability(
         txId: number,
         def: NormalizedIndexDef,
         logicalKey: Uint8Array,
-        primaryKey: Uint8Array
+        primaryKey: Uint8Array,
+        knownCompression?: CompressionOption
     ): Promise<void> {
         if (!def.unique) {
             return;
@@ -2623,7 +2767,7 @@ export class DbWorker implements WorkerApi {
                     );
                 }
                 // Keep TTL cleanup and document errors in index row order.
-                const value = await this.readStoreValue(txId, def.store, decoded.primaryKey);
+                const value = await this.readStoreValue(txId, def.store, decoded.primaryKey, knownCompression);
                 if (value === null) {
                     this.cleanupStaleIndexRow(txId, def, row.key);
                     continue;
@@ -2655,11 +2799,13 @@ export class DbWorker implements WorkerApi {
         range: Range,
         cursor: Uint8Array | null,
         limit: number,
-        maxBytes: number = INDEX_SCAN_PAGE_BYTES
+        maxBytes: number = INDEX_SCAN_PAGE_BYTES,
+        physicalRange?: Range
     ): Promise<IndexScanPage> {
         const { limit: _ignored, ...withoutLimit } = range;
-        const physical = indexRangeToPhysicalRange(withoutLimit);
+        const physical = physicalRange ?? indexRangeToPhysicalRange(withoutLimit);
         const reverse = physical.reverse === true;
+        const compression = this.storeCompressionForTx(txId, def.store);
         let resumeAfter = cursor;
         const visible: ScanItem[] = [];
         let outputBytes = 4;
@@ -2703,6 +2849,9 @@ export class DbWorker implements WorkerApi {
                         maxBytes - outputBytes
                     );
                     batchEnd = index + (batch?.entries.length ?? 1);
+                    if (batch && compression !== false) {
+                        this.stabilizeWasmValues(batch.values);
+                    }
                 }
                 const row = rawRows[index];
                 const resolved = batch
@@ -2712,9 +2861,11 @@ export class DbWorker implements WorkerApi {
                           row.key,
                           batch.entries[index - batchStart],
                           batch.values[index - batchStart],
-                          batch.trusted[index - batchStart]
+                          batch.trusted[index - batchStart],
+                          compression,
+                          true
                       )
-                    : await this.resolveVisibleIndexedRow(txId, def, row.key);
+                    : await this.visibleIndexedRow(txId, def, row.key, compression);
                 if (batch !== null) {
                     batch.values[index - batchStart] = null;
                 }
@@ -2737,7 +2888,8 @@ export class DbWorker implements WorkerApi {
                 outputBytes = nextBytes;
                 resumeAfter = row.key;
                 if (visible.length >= limit) {
-                    return { rows: visible, cursor: row.key.slice() };
+                    // readRawScan already detached this key from the engine buffer.
+                    return { rows: visible, cursor: row.key };
                 }
             }
             if (rawRows.length < chunkLimit) {
@@ -2866,11 +3018,20 @@ export class DbWorker implements WorkerApi {
         }
         return { entries, values, trusted };
     }
-    private async resolveVisibleIndexedRow(
+    private stabilizeWasmValues(values: Array<Uint8Array | null>): void {
+        for (let index = 0; index < values.length; index += 1) {
+            const value = values[index];
+            if (value !== null) {
+                values[index] = normalizeWasmBytes(value);
+            }
+        }
+    }
+    private visibleIndexedRow(
         txId: number,
         def: NormalizedIndexDef,
-        physicalKey: Uint8Array
-    ): Promise<ScanItem | null> {
+        physicalKey: Uint8Array,
+        compression: CompressionOption
+    ): ScanItem | null | Promise<ScanItem | null> {
         const decoded = decodeIndexEntryKey(physicalKey);
         const state = this.inspectIndexedValue(txId, def, physicalKey, decoded.primaryKey);
         if (state === 'missing') {
@@ -2878,21 +3039,47 @@ export class DbWorker implements WorkerApi {
             return null;
         }
         const value = this.readRawValue(txId, def.store, decoded.primaryKey);
-        return this.resolveVisibleIndexedValue(txId, def, physicalKey, decoded, value, state === 'trusted');
+        return this.resolveVisibleIndexedValue(
+            txId,
+            def,
+            physicalKey,
+            decoded,
+            value,
+            state === 'trusted',
+            compression,
+            true
+        );
     }
-    private async resolveVisibleIndexedValue(
+    private resolveVisibleIndexedValue(
         txId: number,
         def: NormalizedIndexDef,
         physicalKey: Uint8Array,
         decoded: DecodedIndexEntryKey,
         rawValue: Uint8Array | null,
-        trusted: boolean = false
-    ): Promise<ScanItem | null> {
+        trusted: boolean = false,
+        compression: CompressionOption,
+        stable: boolean
+    ): ScanItem | null | Promise<ScanItem | null> {
         if (rawValue === null) {
             this.cleanupStaleIndexRow(txId, def, physicalKey);
             return null;
         }
-        const value = await this.decodeStoreValue(txId, def.store, normalizeWasmBytes(rawValue));
+        const bytes = stable ? rawValue : normalizeWasmBytes(rawValue);
+        if (compression === false) {
+            return this.finishVisibleIndexedValue(txId, def, physicalKey, decoded, bytes, trusted);
+        }
+        return decodeStoreValueRecord(bytes, { strict: true }).then((value) =>
+            this.finishVisibleIndexedValue(txId, def, physicalKey, decoded, value, trusted)
+        );
+    }
+    private finishVisibleIndexedValue(
+        txId: number,
+        def: NormalizedIndexDef,
+        physicalKey: Uint8Array,
+        decoded: DecodedIndexEntryKey,
+        value: Uint8Array,
+        trusted: boolean
+    ): ScanItem | null {
         if (!trusted) {
             const currentLogicalKey = extractLogicalIndexKey(def, value);
             if (currentLogicalKey === null || !bytesEqual(currentLogicalKey, decoded.logicalKey)) {
@@ -2964,6 +3151,8 @@ export class DbWorker implements WorkerApi {
         this.txChanges.clear();
         this.txModes.clear();
         this.txIndexSchemas.clear();
+        this.readonlyIndexCache.clear();
+        this.indexBoundCache = null;
         this.txEnsuredRawStores.clear();
         this.txIndexSchemaChanged.clear();
         this.txStoreCompression.clear();

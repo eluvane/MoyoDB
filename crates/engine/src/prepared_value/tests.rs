@@ -137,8 +137,11 @@ fn prepared_pages_match_previous_encoder_for_flags_prefixes_and_boundaries() -> 
 
 #[test]
 fn generic_overflow_encoder_retains_every_disk_byte_and_length_error() -> Result<()> {
+    assert_eq!(
+        encode_overflow_page(17, 0, &[]).unwrap_err().to_string(),
+        "serialization error: overflow chunk is empty",
+    );
     for len in [
-        0,
         1,
         15,
         16,

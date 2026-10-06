@@ -14,20 +14,29 @@ pub fn crc32(bytes: &[u8]) -> u32 {
 
 /// CRC32 of `bytes` as if `zero_len` bytes starting at `zero_start` were zero.
 /// The region is clamped to the slice. No page copy is needed.
+///
+/// Encoded pages, WAL records, and superblocks already store a zero checksum
+/// field. A short hole that is already zero is covered by one update of the
+/// original slice. A non-zero hole is still replaced from a small zero buffer.
 pub fn checksum_with_zeroed_region(bytes: &[u8], zero_start: usize, zero_len: usize) -> u32 {
     #[cfg(test)]
     work::record(bytes.len());
     let start = zero_start.min(bytes.len());
     let end = zero_start.saturating_add(zero_len).min(bytes.len());
+    let hole = &bytes[start..end];
     let mut hasher = Hasher::new();
-    hasher.update(&bytes[..start]);
-    let mut remaining = end - start;
-    while remaining > 0 {
-        let chunk = remaining.min(ZEROES.len());
-        hasher.update(&ZEROES[..chunk]);
-        remaining -= chunk;
+    if hole.len() <= ZEROES.len() && hole.iter().all(|&byte| byte == 0) {
+        hasher.update(bytes);
+    } else {
+        hasher.update(&bytes[..start]);
+        let mut remaining = end - start;
+        while remaining > 0 {
+            let chunk = remaining.min(ZEROES.len());
+            hasher.update(&ZEROES[..chunk]);
+            remaining -= chunk;
+        }
+        hasher.update(&bytes[end..]);
     }
-    hasher.update(&bytes[end..]);
     hasher.finalize()
 }
 
@@ -226,6 +235,7 @@ mod tests {
             (12, 4),
             (64, 4),
             (4090, 16),
+            (8, 32),
             (5000, 4),
             (0, 0),
         ] {
@@ -233,6 +243,15 @@ mod tests {
                 checksum_with_zeroed_region(&bytes, start, len),
                 reference(&bytes, start, len),
                 "start={start} len={len}"
+            );
+            let mut already_zero = bytes.clone();
+            let zero_at = start.min(already_zero.len());
+            let zero_to = start.saturating_add(len).min(already_zero.len());
+            already_zero[zero_at..zero_to].fill(0);
+            assert_eq!(
+                checksum_with_zeroed_region(&already_zero, start, len),
+                reference(&already_zero, start, len),
+                "already zero start={start} len={len}"
             );
         }
     }

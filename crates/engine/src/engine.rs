@@ -82,7 +82,7 @@ const EXTERNAL_PAYLOAD_THRESHOLD: usize = 32 * 1024;
 
 fn validate_store_name(name: &str) -> Result<()> {
     validate_store_name_length(name)?;
-    if name == PAYLOAD_REGISTRY_STORE_NAME {
+    if name == PAYLOAD_REGISTRY_STORE_NAME || name == SYSTEM_CHANGELOG_STORE_NAME {
         return Err(EngineError::ReservedStoreName(name.into()));
     }
     Ok(())
@@ -434,6 +434,10 @@ pub struct Engine<B: FileBackend> {
     checkpoint_dirty_pages: usize,
     health: EngineHealth,
     free_pages: FreePagePool,
+    /// Verified internal-page copies for repeated point lookups in one tree.
+    /// Leaves stay in the pager. Cleared before any committed page image is
+    /// replaced so a reused page id cannot answer with the previous generation.
+    read_batch: PointReadBatch,
 }
 
 impl<B: FileBackend> std::fmt::Debug for Engine<B> {
@@ -512,6 +516,7 @@ impl<B: FileBackend> Engine<B> {
             checkpoint_dirty_pages: config.checkpoint_dirty_pages.max(1),
             health: EngineHealth::Healthy,
             free_pages: FreePagePool::default(),
+            read_batch: PointReadBatch::default(),
         };
         engine.install_loaded(loaded);
         Ok(engine)
@@ -540,6 +545,12 @@ impl<B: FileBackend> Engine<B> {
         self.change_feed_floor_txid = change_feed_floor_txid;
         self.change_feed_policy = catalog.change_feed_policy;
         self.superblock = superblock;
+        self.read_batch = PointReadBatch::default();
+    }
+
+    fn discard_pager_cache(&mut self) {
+        self.read_batch = PointReadBatch::default();
+        self.pager.discard_cache();
     }
 
     pub fn health(&self) -> &EngineHealth {
@@ -582,7 +593,7 @@ impl<B: FileBackend> Engine<B> {
         self.txns.clear();
         self.next_failpoint = None;
         self.free_pages.clear();
-        self.pager.discard_cache();
+        self.discard_pager_cache();
         // Flush visible bytes before recovery so its result survives a crash.
         // Otherwise, an unflushed superblock could cause recovery to discard
         // WAL records still needed by the durable superblock. Flush main before
@@ -921,16 +932,24 @@ impl<B: FileBackend> Engine<B> {
         let mut tx = self.take_tx(tx_id)?;
         let result = match &mut tx.inner {
             TxInner::Readonly(readonly) => match store_meta(&readonly.snapshot.catalog, store) {
-                Ok(meta) => get_committed_visible(
+                Ok(meta) => get_committed_visible_in_batch(
                     &mut self.pager,
                     meta.store_root_page_id,
                     meta.flags,
                     key,
                     now_ms,
+                    Some(&mut self.read_batch),
                 ),
                 Err(error) => Err(error),
             },
-            TxInner::Readwrite(rw) => get_with_staged(&mut self.pager, rw, store, key, now_ms),
+            TxInner::Readwrite(rw) => get_with_staged(
+                &mut self.pager,
+                Some(&mut self.read_batch),
+                rw,
+                store,
+                key,
+                now_ms,
+            ),
         };
         self.put_tx(tx);
         result
@@ -944,16 +963,24 @@ impl<B: FileBackend> Engine<B> {
         let mut tx = self.take_tx(tx_id)?;
         let result = match &mut tx.inner {
             TxInner::Readonly(readonly) => match store_meta(&readonly.snapshot.catalog, store) {
-                Ok(meta) => exists_committed_visible(
+                Ok(meta) => exists_committed_visible_in_batch(
                     &mut self.pager,
                     meta.store_root_page_id,
                     meta.flags,
                     key,
                     now_ms,
+                    Some(&mut self.read_batch),
                 ),
                 Err(error) => Err(error),
             },
-            TxInner::Readwrite(rw) => exists_with_staged(&mut self.pager, rw, store, key, now_ms),
+            TxInner::Readwrite(rw) => exists_with_staged_in_batch(
+                &mut self.pager,
+                rw,
+                store,
+                key,
+                now_ms,
+                Some(&mut self.read_batch),
+            ),
         };
         self.put_tx(tx);
         result
@@ -1348,6 +1375,7 @@ impl<B: FileBackend> Engine<B> {
             put_with_staged_at(
                 &mut self.pager,
                 &mut self.next_value_revision_ordinal,
+                Some(&mut self.read_batch),
                 rw,
                 index_store,
                 index_key,
@@ -1383,6 +1411,7 @@ impl<B: FileBackend> Engine<B> {
             put_with_staged_at(
                 &mut self.pager,
                 &mut self.next_value_revision_ordinal,
+                Some(&mut self.read_batch),
                 rw,
                 store,
                 key,
@@ -1438,6 +1467,7 @@ impl<B: FileBackend> Engine<B> {
                     put_with_staged_at(
                         &mut self.pager,
                         &mut self.next_value_revision_ordinal,
+                        Some(&mut self.read_batch),
                         rw,
                         store,
                         key,
@@ -1503,6 +1533,7 @@ impl<B: FileBackend> Engine<B> {
                 let baseline_exists = put_with_staged_at(
                     &mut self.pager,
                     &mut self.next_value_revision_ordinal,
+                    Some(&mut self.read_batch),
                     rw,
                     store,
                     key,
@@ -1539,6 +1570,7 @@ impl<B: FileBackend> Engine<B> {
                             put_with_staged_at(
                                 &mut self.pager,
                                 &mut self.next_value_revision_ordinal,
+                                Some(&mut self.read_batch),
                                 rw,
                                 index_store,
                                 index_key,
@@ -1549,6 +1581,7 @@ impl<B: FileBackend> Engine<B> {
                         IndexOpRef::Delete { .. } => {
                             delete_with_staged_at(
                                 &mut self.pager,
+                                Some(&mut self.read_batch),
                                 rw,
                                 index_store,
                                 index_key,
@@ -1604,7 +1637,14 @@ impl<B: FileBackend> Engine<B> {
         let operation_now_ms = now_unix_ms()?;
         let mut tx = self.take_tx(tx_id)?;
         let result = tx.readwrite_mut().and_then(|rw| {
-            delete_with_staged_at(&mut self.pager, rw, store, key, operation_now_ms)
+            delete_with_staged_at(
+                &mut self.pager,
+                Some(&mut self.read_batch),
+                rw,
+                store,
+                key,
+                operation_now_ms,
+            )
         });
         self.put_tx(tx);
         result
@@ -1627,7 +1667,14 @@ impl<B: FileBackend> Engine<B> {
             let result = validate_key(key)
                 .and_then(|_| tx.readwrite_mut())
                 .and_then(|rw| {
-                    delete_with_staged_at(&mut self.pager, rw, store, key, operation_now_ms)
+                    delete_with_staged_at(
+                        &mut self.pager,
+                        Some(&mut self.read_batch),
+                        rw,
+                        store,
+                        key,
+                        operation_now_ms,
+                    )
                 });
             match result {
                 Ok(deleted) => completed.push(deleted),
@@ -1681,6 +1728,7 @@ impl<B: FileBackend> Engine<B> {
                         put_with_staged_at(
                             &mut self.pager,
                             &mut self.next_value_revision_ordinal,
+                            Some(&mut self.read_batch),
                             rw,
                             store,
                             key,
@@ -1692,7 +1740,14 @@ impl<B: FileBackend> Engine<B> {
                 BatchOpRef::Delete { key } => validate_key(key)
                     .and_then(|_| tx.readwrite_mut())
                     .and_then(|rw| {
-                        delete_with_staged_at(&mut self.pager, rw, store, key, operation_now_ms)
+                        delete_with_staged_at(
+                            &mut self.pager,
+                            Some(&mut self.read_batch),
+                            rw,
+                            store,
+                            key,
+                            operation_now_ms,
+                        )
                     })
                     .map(|deleted| BatchOpOutcome::Delete { deleted }),
             };
@@ -2343,6 +2398,7 @@ impl<B: FileBackend> Engine<B> {
             staged_policy,
             new_txid,
             commit_now_ms,
+            &mut self.read_batch,
             &mut alloc,
         );
         let plan = match plan {
@@ -2495,6 +2551,9 @@ impl<B: FileBackend> Engine<B> {
             return Err(err);
         }
 
+        // Page images can reuse ids whose previous bytes are still in the
+        // point-read cache. Drop it before those bytes become reachable.
+        self.read_batch = PointReadBatch::default();
         for (page_id, bytes) in page_images {
             if let Err(err) = self.pager.stage_page_image(page_id, bytes) {
                 self.poison(
@@ -2605,6 +2664,7 @@ fn plan_commit<B: FileBackend>(
     staged_policy: Option<ChangeFeedPolicy>,
     new_txid: u64,
     now_ms: u64,
+    batch: &mut PointReadBatch,
     alloc: &mut PageAllocator,
 ) -> Result<CommitPlan> {
     let mut catalog_delta = CatalogDelta::default();
@@ -2630,7 +2690,7 @@ fn plan_commit<B: FileBackend>(
         }
         let change_start = change_payloads.len();
         if final_policy.enabled && !is_internal_store_name(name) {
-            collect_change_payloads(pager, name, stage, now_ms, &mut change_payloads)?;
+            collect_change_payloads(pager, name, stage, now_ms, batch, &mut change_payloads)?;
         }
         if stage.dropped {
             if let Some(meta) = stage.base_meta.as_ref() {
@@ -3135,6 +3195,7 @@ fn collect_change_payloads<'a, B: FileBackend>(
     store_name: &str,
     stage: &'a StagedStore,
     now_ms: u64,
+    batch: &mut PointReadBatch,
     out: &mut Vec<PreparedChange<'a>>,
 ) -> Result<()> {
     if stage.dropped {
@@ -3177,12 +3238,13 @@ fn collect_change_payloads<'a, B: FileBackend>(
                 let Some(base) = base else {
                     continue;
                 };
-                if exists_committed_visible(
+                if exists_committed_visible_in_batch(
                     pager,
                     base.store_root_page_id,
                     base.flags,
                     key,
                     now_ms,
+                    Some(batch),
                 )? {
                     out.push(PreparedChange::new(
                         store_name,
@@ -3198,22 +3260,18 @@ fn collect_change_payloads<'a, B: FileBackend>(
 }
 
 fn ensure_stage_for_write<'a>(rw: &'a mut ReadwriteTx, store: &str) -> Result<&'a mut StagedStore> {
-    use std::collections::btree_map::Entry;
-
+    // Repeat hits must not allocate another copy of the store name.
     if rw.stores.contains_key(store) {
         return rw
             .stores
             .get_mut(store)
             .ok_or_else(|| EngineError::StoreNotFound(store.into()));
     }
-
-    match rw.stores.entry(store.to_string()) {
-        Entry::Occupied(entry) => Ok(entry.into_mut()),
-        Entry::Vacant(vacant) => {
-            let base_meta = store_meta(&rw.snapshot.catalog, store)?.clone();
-            Ok(vacant.insert(StagedStore::existing(base_meta)))
-        }
-    }
+    let base_meta = store_meta(&rw.snapshot.catalog, store)?.clone();
+    Ok(rw
+        .stores
+        .entry(store.to_string())
+        .or_insert_with(|| StagedStore::existing(base_meta)))
 }
 
 fn ensure_readwrite_store_visible(rw: &ReadwriteTx, store: &str) -> Result<()> {
@@ -3326,16 +3384,6 @@ fn store_meta<'a>(catalog: &'a CatalogMap, store: &str) -> Result<&'a StoreMetad
         .ok_or_else(|| EngineError::StoreNotFound(store.into()))
 }
 
-fn get_committed_visible<B: FileBackend>(
-    pager: &mut Pager<B>,
-    root_page_id: u64,
-    store_flags: u64,
-    key: &[u8],
-    now_ms: u64,
-) -> Result<Option<Vec<u8>>> {
-    get_committed_visible_in_batch(pager, root_page_id, store_flags, key, now_ms, None)
-}
-
 fn get_committed_visible_in_batch<B: FileBackend>(
     pager: &mut Pager<B>,
     root_page_id: u64,
@@ -3357,16 +3405,6 @@ fn get_committed_visible_in_batch<B: FileBackend>(
 }
 
 /// Checks existence from leaf metadata and the TTL header without loading value bodies.
-fn exists_committed_visible<B: FileBackend>(
-    pager: &mut Pager<B>,
-    root_page_id: u64,
-    store_flags: u64,
-    key: &[u8],
-    now_ms: u64,
-) -> Result<bool> {
-    exists_committed_visible_in_batch(pager, root_page_id, store_flags, key, now_ms, None)
-}
-
 fn exists_committed_visible_in_batch<B: FileBackend>(
     pager: &mut Pager<B>,
     root_page_id: u64,
@@ -3386,7 +3424,7 @@ fn exists_committed_visible_in_batch<B: FileBackend>(
 
 enum StagedLookup<'a> {
     Staged(Option<&'a StoredValue>),
-    Committed(StoreMetadata),
+    Committed { root_page_id: u64, flags: u64 },
     Absent,
 }
 
@@ -3404,14 +3442,19 @@ fn staged_lookup<'a>(rw: &'a ReadwriteTx, store: &str, key: &[u8]) -> Result<Sta
         if stage.created || stage.cleared {
             return Ok(StagedLookup::Absent);
         }
-        return Ok(match stage.base_meta.clone() {
-            Some(meta) => StagedLookup::Committed(meta),
+        return Ok(match stage.base_meta.as_ref() {
+            Some(meta) => StagedLookup::Committed {
+                root_page_id: meta.store_root_page_id,
+                flags: meta.flags,
+            },
             None => StagedLookup::Absent,
         });
     }
-    Ok(StagedLookup::Committed(
-        store_meta(&rw.snapshot.catalog, store)?.clone(),
-    ))
+    let meta = store_meta(&rw.snapshot.catalog, store)?;
+    Ok(StagedLookup::Committed {
+        root_page_id: meta.store_root_page_id,
+        flags: meta.flags,
+    })
 }
 
 fn stored_value_state_with_staged<B: FileBackend>(
@@ -3454,14 +3497,10 @@ fn stored_value_state_with_staged<B: FileBackend>(
             }))
         }
         StagedLookup::Staged(None) | StagedLookup::Absent => Ok(None),
-        StagedLookup::Committed(meta) => lookup_stored_value_state(
-            pager,
-            meta.store_root_page_id,
-            key,
-            meta.flags,
-            now_ms,
-            Some(batch),
-        ),
+        StagedLookup::Committed {
+            root_page_id,
+            flags,
+        } => lookup_stored_value_state(pager, root_page_id, key, flags, now_ms, Some(batch)),
     }
 }
 
@@ -3488,14 +3527,10 @@ fn stored_value_size_with_staged<B: FileBackend>(
             Ok(Some(encoded_length.max(decoded_length)))
         }
         StagedLookup::Staged(None) | StagedLookup::Absent => Ok(None),
-        StagedLookup::Committed(meta) => lookup_stored_value_size(
-            pager,
-            meta.store_root_page_id,
-            key,
-            meta.flags,
-            now_ms,
-            Some(batch),
-        ),
+        StagedLookup::Committed {
+            root_page_id,
+            flags,
+        } => lookup_stored_value_size(pager, root_page_id, key, flags, now_ms, Some(batch)),
     }
 }
 
@@ -3509,9 +3544,10 @@ fn stored_value_info_with_staged<B: FileBackend>(
     match staged_lookup(rw, store, key)? {
         StagedLookup::Staged(Some(stored)) => Ok(Some((stored.value.len(), stored.expires_at_ms))),
         StagedLookup::Staged(None) | StagedLookup::Absent => Ok(None),
-        StagedLookup::Committed(meta) => {
-            lookup_stored_value_info(pager, meta.store_root_page_id, key, meta.flags, Some(batch))
-        }
+        StagedLookup::Committed {
+            root_page_id,
+            flags,
+        } => lookup_stored_value_info(pager, root_page_id, key, flags, Some(batch)),
     }
 }
 
@@ -3530,14 +3566,10 @@ fn stored_value_into_with_staged<B: FileBackend>(
             Some(stored.expires_at_ms)
         }
         StagedLookup::Staged(None) | StagedLookup::Absent => None,
-        StagedLookup::Committed(meta) => lookup_stored_value_into(
-            pager,
-            meta.store_root_page_id,
-            key,
-            meta.flags,
-            Some(batch),
-            write,
-        )?,
+        StagedLookup::Committed {
+            root_page_id,
+            flags,
+        } => lookup_stored_value_into(pager, root_page_id, key, flags, Some(batch), write)?,
     };
     if matches!(expiry, Some(Some(timestamp)) if now_ms >= timestamp) {
         expire_staged_key(rw, store, key)?;
@@ -3547,24 +3579,25 @@ fn stored_value_into_with_staged<B: FileBackend>(
 
 fn expire_staged_key(rw: &mut ReadwriteTx, store: &str, key: &[u8]) -> Result<()> {
     let stage = ensure_stage_for_write(rw, store)?;
-    match stage.mutations.get(key) {
-        Some(MutationValue::Put(_)) => {
+    match stage.mutations.get_mut(key) {
+        Some(slot @ MutationValue::Put(_)) => *slot = MutationValue::Delete,
+        Some(MutationValue::Delete) => {}
+        None => {
             stage.mutations.insert(key.to_vec(), MutationValue::Delete);
         }
-        Some(MutationValue::Delete) => {}
-        None => mark_key_expired(stage, key),
     }
     Ok(())
 }
 
 fn get_with_staged<B: FileBackend>(
     pager: &mut Pager<B>,
+    batch: Option<&mut PointReadBatch>,
     rw: &mut ReadwriteTx,
     store: &str,
     key: &[u8],
     now_ms: u64,
 ) -> Result<Option<Vec<u8>>> {
-    get_with_staged_in_batch(pager, rw, store, key, now_ms, None)
+    get_with_staged_in_batch(pager, rw, store, key, now_ms, batch)
 }
 
 fn get_with_staged_in_batch<B: FileBackend>(
@@ -3584,33 +3617,24 @@ fn get_with_staged_in_batch<B: FileBackend>(
             }
         }
         StagedLookup::Staged(None) | StagedLookup::Absent => (None, false),
-        StagedLookup::Committed(meta) => {
-            match lookup_stored_value(pager, meta.store_root_page_id, key, meta.flags, batch)? {
-                Some(stored) => {
-                    if stored.is_expired_at(now_ms) {
-                        (None, true)
-                    } else {
-                        (Some(stored.value), false)
-                    }
+        StagedLookup::Committed {
+            root_page_id,
+            flags,
+        } => match lookup_stored_value(pager, root_page_id, key, flags, batch)? {
+            Some(stored) => {
+                if stored.is_expired_at(now_ms) {
+                    (None, true)
+                } else {
+                    (Some(stored.value), false)
                 }
-                None => (None, false),
             }
-        }
+            None => (None, false),
+        },
     };
     if expired {
         expire_staged_key(rw, store, key)?;
     }
     Ok(value)
-}
-
-fn exists_with_staged<B: FileBackend>(
-    pager: &mut Pager<B>,
-    rw: &mut ReadwriteTx,
-    store: &str,
-    key: &[u8],
-    now_ms: u64,
-) -> Result<bool> {
-    exists_with_staged_in_batch(pager, rw, store, key, now_ms, None)
 }
 
 fn exists_with_staged_in_batch<B: FileBackend>(
@@ -3627,18 +3651,19 @@ fn exists_with_staged_in_batch<B: FileBackend>(
             (!expired, expired)
         }
         StagedLookup::Staged(None) | StagedLookup::Absent => (false, false),
-        StagedLookup::Committed(meta) => {
-            match lookup_value_expiry(pager, meta.store_root_page_id, key, meta.flags, batch)? {
-                None => (false, false),
-                Some(expiry) => {
-                    let expired = matches!(
-                        expiry,
-                        Some(expires_at_ms) if now_ms >= expires_at_ms
-                    );
-                    (!expired, expired)
-                }
+        StagedLookup::Committed {
+            root_page_id,
+            flags,
+        } => match lookup_value_expiry(pager, root_page_id, key, flags, batch)? {
+            None => (false, false),
+            Some(expiry) => {
+                let expired = matches!(
+                    expiry,
+                    Some(expires_at_ms) if now_ms >= expires_at_ms
+                );
+                (!expired, expired)
             }
-        }
+        },
     };
     if expired {
         expire_staged_key(rw, store, key)?;
@@ -3663,19 +3688,19 @@ fn exists_with_staged_deferred_base<B: FileBackend>(
             (!expired, expired)
         }
         StagedLookup::Staged(None) | StagedLookup::Absent => (false, false),
-        StagedLookup::Committed(meta) => {
-            match lookup_value_expiry(pager, meta.store_root_page_id, key, meta.flags, Some(batch))?
-            {
-                None => (false, false),
-                Some(expiry) => {
-                    let expired = matches!(expiry, Some(timestamp) if now_ms >= timestamp);
-                    if expired {
-                        expired_base_keys.push(key.to_vec());
-                    }
-                    (!expired, false)
+        StagedLookup::Committed {
+            root_page_id,
+            flags,
+        } => match lookup_value_expiry(pager, root_page_id, key, flags, Some(batch))? {
+            None => (false, false),
+            Some(expiry) => {
+                let expired = matches!(expiry, Some(timestamp) if now_ms >= timestamp);
+                if expired {
+                    expired_base_keys.push(key.to_vec());
                 }
+                (!expired, false)
             }
-        }
+        },
     };
     if expired_staged {
         expire_staged_key(rw, store, key)?;
@@ -3683,16 +3708,80 @@ fn exists_with_staged_deferred_base<B: FileBackend>(
     Ok(exists)
 }
 
+/// Where a put's previous live value lives. Resolved before the stage is mutated
+/// so a failed base read does not leave an empty stage or a TTL rewrite flag.
+enum PutBase {
+    Staged(bool),
+    Tree { root_page_id: u64, flags: u64 },
+    Empty,
+}
+
+fn prepare_put_base(rw: &ReadwriteTx, store: &str, key: &[u8], now_ms: u64) -> Result<PutBase> {
+    if let Some(stage) = rw.stores.get(store) {
+        if stage.dropped {
+            return Err(EngineError::StoreNotFound(store.into()));
+        }
+        if let Some(mutation) = stage.mutations.get(key) {
+            let existed = match mutation {
+                MutationValue::Put(stored) => !stored.is_expired_at(now_ms),
+                MutationValue::Delete => false,
+            };
+            return Ok(PutBase::Staged(existed));
+        }
+        if stage.created || stage.cleared {
+            return Ok(PutBase::Empty);
+        }
+        if let Some(meta) = stage.base_meta.as_ref() {
+            return Ok(PutBase::Tree {
+                root_page_id: meta.store_root_page_id,
+                flags: meta.flags,
+            });
+        }
+        return Ok(PutBase::Empty);
+    }
+    let meta = store_meta(&rw.snapshot.catalog, store)?;
+    Ok(PutBase::Tree {
+        root_page_id: meta.store_root_page_id,
+        flags: meta.flags,
+    })
+}
+
+fn committed_key_live<B: FileBackend>(
+    pager: &mut Pager<B>,
+    batch: Option<&mut PointReadBatch>,
+    root_page_id: u64,
+    store_flags: u64,
+    key: &[u8],
+    now_ms: u64,
+) -> Result<bool> {
+    Ok(
+        match lookup_value_expiry(pager, root_page_id, key, store_flags, batch)? {
+            None => false,
+            Some(expiry) => !matches!(expiry, Some(expires_at_ms) if now_ms >= expires_at_ms),
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn put_with_staged_at<B: FileBackend>(
     pager: &mut Pager<B>,
     next_value_revision_ordinal: &mut u64,
+    batch: Option<&mut PointReadBatch>,
     rw: &mut ReadwriteTx,
     store: &str,
     key: &[u8],
     mut value: StoredValue,
     now_ms: u64,
 ) -> Result<bool> {
-    let existed = exists_with_staged(pager, rw, store, key, now_ms)?;
+    let base = prepare_put_base(rw, store, key, now_ms)?;
+    let existed = match base {
+        PutBase::Staged(existed) => existed,
+        PutBase::Empty => false,
+        PutBase::Tree {
+            root_page_id,
+            flags,
+        } => committed_key_live(pager, batch, root_page_id, flags, key, now_ms)?,
+    };
     let flags = ensure_stage_for_write(rw, store)?.flags;
     if !store_uses_system_raw_values(flags) && value.revision.is_none() {
         let epoch = rw
@@ -3722,20 +3811,25 @@ fn put_with_staged_at<B: FileBackend>(
     if value.expires_at_ms.is_some() && !store_uses_system_raw_values(stage.flags) {
         stage.flags |= STORE_FLAG_VALUE_ENVELOPE_V1;
     }
-    stage
-        .mutations
-        .insert(key.to_vec(), MutationValue::Put(value));
+    if let Some(slot) = stage.mutations.get_mut(key) {
+        *slot = MutationValue::Put(value);
+    } else {
+        stage
+            .mutations
+            .insert(key.to_vec(), MutationValue::Put(value));
+    }
     Ok(existed)
 }
 
 fn delete_with_staged_at<B: FileBackend>(
     pager: &mut Pager<B>,
+    batch: Option<&mut PointReadBatch>,
     rw: &mut ReadwriteTx,
     store: &str,
     key: &[u8],
     now_ms: u64,
 ) -> Result<bool> {
-    let existed = exists_with_staged(pager, rw, store, key, now_ms)?;
+    let existed = exists_with_staged_in_batch(pager, rw, store, key, now_ms, batch)?;
     // The lookup already stages expired values as deletes. An absent key
     // needs no new mutation. Keep any existing staged delete.
     if !existed {
@@ -3745,7 +3839,11 @@ fn delete_with_staged_at<B: FileBackend>(
     if stage.dropped {
         return Err(EngineError::StoreNotFound(store.into()));
     }
-    stage.mutations.insert(key.to_vec(), MutationValue::Delete);
+    if let Some(slot) = stage.mutations.get_mut(key) {
+        *slot = MutationValue::Delete;
+    } else {
+        stage.mutations.insert(key.to_vec(), MutationValue::Delete);
+    }
     Ok(existed)
 }
 
@@ -4002,8 +4100,8 @@ fn visit_with_staged<B: FileBackend>(
     Ok(exhausted)
 }
 
-/// Checks only the envelope header. Expired overflow values need no further
-/// chain reads after the header is available.
+/// Checks only the envelope header. Inline headers are already in hand.
+/// Expired overflow values need no further chain reads after the header.
 fn pending_value_expired<B: FileBackend>(
     pager: &mut Pager<B>,
     store_flags: u64,

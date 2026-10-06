@@ -57,7 +57,10 @@ fn generated_images(count: usize) -> Result<Vec<(u64, Vec<u8>)>> {
                         },
                     ],
                 )?,
-                _ => encode_overflow_page(page_id, 0, &value)?,
+                _ => {
+                    let chunk = if value.is_empty() { vec![0] } else { value };
+                    encode_overflow_page(page_id, 0, &chunk)?
+                }
             };
             Ok((page_id, image))
         })

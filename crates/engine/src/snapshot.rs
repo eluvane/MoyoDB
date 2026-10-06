@@ -84,18 +84,18 @@ pub fn collect_snapshot_contents<B: FileBackend>(
 }
 
 pub fn encode_snapshot(contents: &SnapshotContents) -> Result<Vec<u8>> {
-    let mut snapshot = vec![0u8; SNAPSHOT_HEADER_SIZE];
+    // One buffer: geometric growth would copy every key and value again.
+    // Checks run first so a rejected snapshot does not allocate that buffer.
+    let encoded_len = validated_snapshot_len(contents)?;
+    let mut snapshot = Vec::with_capacity(encoded_len);
+    snapshot.resize(SNAPSHOT_HEADER_SIZE, 0);
     snapshot.extend_from_slice(&contents.source_last_committed_txid.to_le_bytes());
     snapshot.extend_from_slice(&contents.schema_version.to_le_bytes());
-    snapshot.extend_from_slice(
-        &u32::try_from(contents.stores.len())
-            .map_err(|_| EngineError::Serialization("snapshot store count overflow".into()))?
-            .to_le_bytes(),
-    );
+    snapshot.extend_from_slice(&store_count(contents)?.to_le_bytes());
     snapshot.extend_from_slice(&0u32.to_le_bytes());
 
     for store in &contents.stores {
-        encode_store(&mut snapshot, store)?;
+        write_store(&mut snapshot, store)?;
     }
 
     snapshot[..8].copy_from_slice(&SNAPSHOT_MAGIC);
@@ -109,6 +109,7 @@ pub fn encode_snapshot(contents: &SnapshotContents) -> Result<Vec<u8>> {
 
     let checksum = checksum_with_zeroed_region(&snapshot, SNAPSHOT_CHECKSUM_OFFSET, 4);
     write_u32_le(&mut snapshot, SNAPSHOT_CHECKSUM_OFFSET, checksum)?;
+    debug_assert_eq!(snapshot.len(), encoded_len);
     Ok(snapshot)
 }
 
@@ -137,8 +138,15 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotContents> {
         0
     };
     let store_count = usize_from_u32(take_u32(bytes, &mut offset)?, "snapshot store count")?;
-    let directory_flags = read_u32_le(bytes, offset).map_err(corruption_from_engine_error)?;
-    offset += 4;
+    let directory_flags_at = offset;
+    skip_reserved(
+        bytes,
+        &mut offset,
+        4,
+        "reserved field after the store count",
+    )?;
+    let directory_flags =
+        read_u32_le(bytes, directory_flags_at).map_err(corruption_from_engine_error)?;
     if directory_flags != 0 {
         return Err(corruption(format!(
             "unsupported snapshot directory flags {directory_flags:#x}"
@@ -146,11 +154,15 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotContents> {
     }
 
     let mut stores = Vec::with_capacity(store_count.min(1024));
-    let mut seen_store_names = BTreeSet::new();
+    let mut seen_store_names: BTreeSet<&str> = BTreeSet::new();
     for _ in 0..store_count {
         let name_len = usize::from(take_u16(bytes, &mut offset)?);
-        // Reserved u16. `take_u16` already consumed the name length.
-        offset += 2;
+        skip_reserved(
+            bytes,
+            &mut offset,
+            2,
+            "reserved field after the store name length",
+        )?;
         let flags = take_u64(bytes, &mut offset)?;
         validate_store_flags(flags).map_err(corruption_from_engine_error)?;
         let entry_count = usize_from_u64(take_u64(bytes, &mut offset)?, "snapshot entry count")?;
@@ -164,7 +176,8 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotContents> {
         }
 
         let mut entries = Vec::with_capacity(entry_count.min(4096));
-        let mut seen_keys = BTreeSet::new();
+        // References into `bytes`: uniqueness must not copy key bytes.
+        let mut seen_keys: BTreeSet<&[u8]> = BTreeSet::new();
         for _ in 0..entry_count {
             let key_len = usize::from(take_u16(bytes, &mut offset)?);
             let raw_flags = take_u16(bytes, &mut offset)?;
@@ -211,7 +224,7 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotContents> {
     if offset != bytes.len() {
         return Err(corruption(format!(
             "snapshot trailing bytes: {}",
-            bytes.len().saturating_sub(offset)
+            bytes.len() - offset
         )));
     }
 
@@ -222,23 +235,41 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotContents> {
     })
 }
 
-fn encode_store(dst: &mut Vec<u8>, store: &SnapshotStore) -> Result<()> {
+fn store_count(contents: &SnapshotContents) -> Result<u32> {
+    u32::try_from(contents.stores.len())
+        .map_err(|_| EngineError::Serialization("snapshot store count overflow".into()))
+}
+
+fn entry_count(store: &SnapshotStore) -> Result<u64> {
+    u64::try_from(store.entries.len())
+        .map_err(|_| EngineError::Serialization("snapshot entry count overflow".into()))
+}
+
+fn add_snapshot_len(len: usize, extra: usize) -> Result<usize> {
+    len.checked_add(extra)
+        .ok_or_else(|| EngineError::Serialization("snapshot body too large".into()))
+}
+
+/// Validation order matches the previous single-pass encoder, including
+/// duplicate keys and length checks, before any snapshot buffer exists.
+fn validated_snapshot_len(contents: &SnapshotContents) -> Result<usize> {
+    store_count(contents)?;
+    let mut len = add_snapshot_len(SNAPSHOT_HEADER_SIZE, SNAPSHOT_BODY_PREFIX_SIZE)?;
+    for store in &contents.stores {
+        len = add_snapshot_len(len, validated_store_len(store)?)?;
+    }
+    Ok(len)
+}
+
+fn validated_store_len(store: &SnapshotStore) -> Result<usize> {
     validate_user_store_name(&store.name)?;
     validate_store_flags(store.flags)?;
     let name_bytes = store.name.as_bytes();
-    let name_len = try_u16_len(name_bytes.len(), "snapshot store name too long")?;
+    try_u16_len(name_bytes.len(), "snapshot store name too long")?;
+    entry_count(store)?;
 
-    dst.extend_from_slice(&name_len.to_le_bytes());
-    dst.extend_from_slice(&0u16.to_le_bytes());
-    dst.extend_from_slice(&store.flags.to_le_bytes());
-    dst.extend_from_slice(
-        &u64::try_from(store.entries.len())
-            .map_err(|_| EngineError::Serialization("snapshot entry count overflow".into()))?
-            .to_le_bytes(),
-    );
-    dst.extend_from_slice(name_bytes);
-
-    let mut seen_keys = BTreeSet::new();
+    let mut len = add_snapshot_len(SNAPSHOT_STORE_HEADER_SIZE, name_bytes.len())?;
+    let mut seen_keys: BTreeSet<&[u8]> = BTreeSet::new();
     for entry in &store.entries {
         validate_key(&entry.key)?;
         validate_store_value(&entry.value, store.flags)?;
@@ -248,9 +279,28 @@ fn encode_store(dst: &mut Vec<u8>, store: &SnapshotStore) -> Result<()> {
                 store.name
             )));
         }
+        try_u16_len(entry.key.len(), "snapshot key too long")?;
+        try_u32_len(entry.value.len(), "snapshot value too large to encode")?;
+        len = add_snapshot_len(len, SNAPSHOT_ENTRY_HEADER_SIZE)?;
+        len = add_snapshot_len(len, entry.key.len())?;
+        len = add_snapshot_len(len, entry.value.len())?;
+    }
+    Ok(len)
+}
 
+fn write_store(dst: &mut Vec<u8>, store: &SnapshotStore) -> Result<()> {
+    let name_bytes = store.name.as_bytes();
+    let name_len = try_u16_len(name_bytes.len(), "snapshot store name too long")?;
+    dst.extend_from_slice(&name_len.to_le_bytes());
+    dst.extend_from_slice(&0u16.to_le_bytes());
+    dst.extend_from_slice(&store.flags.to_le_bytes());
+    dst.extend_from_slice(&entry_count(store)?.to_le_bytes());
+    dst.extend_from_slice(name_bytes);
+
+    for entry in &store.entries {
         let key_len = try_u16_len(entry.key.len(), "snapshot key too long")?;
         let value_len = try_u32_len(entry.value.len(), "snapshot value too large to encode")?;
+        // Some(0) keeps the flag. A zero timestamp alone means no expiry.
         let entry_flags = if entry.expires_at_ms.is_some() {
             SNAPSHOT_ENTRY_FLAG_HAS_EXPIRY
         } else {
@@ -310,6 +360,17 @@ fn validate_snapshot_header(bytes: &[u8]) -> Result<u32> {
 }
 
 #[inline]
+fn skip_reserved(bytes: &[u8], offset: &mut usize, len: usize, what: &str) -> Result<()> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| corruption(format!("snapshot {what} length overflow")))?;
+    if end > bytes.len() {
+        return Err(corruption(format!("snapshot {what} is truncated")));
+    }
+    *offset = end;
+    Ok(())
+}
+
 fn take_u16(bytes: &[u8], offset: &mut usize) -> Result<u16> {
     let value = read_u16_le(bytes, *offset).map_err(corruption_from_engine_error)?;
     *offset += 2;

@@ -39,7 +39,7 @@ jobs:
       - name: Install Node dependencies
         run: npm ci --ignore-scripts --no-audit --no-fund --prefer-online --registry=https://registry.npmjs.org/
       - name: Install wasm-pack
-        run: cargo install --locked wasm-pack --version 0.15.0
+        run: node scripts/ci/install-wasm-pack.mjs
       - name: Install Playwright browsers
         run: npm exec --workspace @moyodb/sdk -- playwright install --with-deps
       - name: Run benchmarks and collect baseline

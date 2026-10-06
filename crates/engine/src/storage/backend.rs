@@ -2,6 +2,33 @@ use crate::error::{EngineError, Result};
 
 pub trait FileBackend: Send {
     fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>>;
+
+    /// Fills `buf` with the same bytes as `read_at(offset, buf.len())`.
+    ///
+    /// Holes and bytes past the end of the file are zeroes. A short or long
+    /// owned read is a storage error and leaves `buf` unchanged. The default
+    /// copies that owned read. Override it when the bytes are already in hand
+    /// so the caller does not pay for a second buffer.
+    fn read_at_into(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        let bytes = ensure_exact_len(self.read_at(offset, buf.len())?, buf.len(), "read")?;
+        buf.copy_from_slice(&bytes);
+        Ok(())
+    }
+
+    /// Replaces `buf` with `len` bytes at `offset`, keeping spare capacity.
+    ///
+    /// The bytes and errors match `read_at`. On error the previous contents
+    /// stay. The default copies the owned read after `buf` can hold `len`
+    /// bytes. Override it to copy straight into `buf` when the caller already
+    /// reserved that space.
+    fn read_at_into_vec(&self, offset: u64, len: usize, buf: &mut Vec<u8>) -> Result<()> {
+        let bytes = ensure_exact_len(self.read_at(offset, len)?, len, "read")?;
+        ensure_vec_capacity(buf, len, "read")?;
+        buf.clear();
+        buf.extend_from_slice(&bytes);
+        Ok(())
+    }
+
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()>;
     fn flush(&mut self) -> Result<()>;
     fn len(&self) -> Result<u64>;
@@ -70,6 +97,23 @@ pub fn ensure_exact_len(bytes: Vec<u8>, expected_len: usize, what: &str) -> Resu
         )));
     }
     Ok(bytes)
+}
+
+/// Grows `bytes` so `capacity >= needed` without changing its contents.
+///
+/// `Vec::try_reserve` adds to the length, not the capacity. Requesting
+/// `needed - len` makes room for a later `clear` plus an exact fill, and a
+/// failure leaves the vector as it was.
+fn ensure_vec_capacity(bytes: &mut Vec<u8>, needed: usize, what: &str) -> Result<()> {
+    if needed > bytes.capacity() {
+        let additional = needed - bytes.len();
+        bytes.try_reserve(additional).map_err(|err| {
+            EngineError::Storage(format!(
+                "{what} allocation failed for {needed} bytes: {err}"
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

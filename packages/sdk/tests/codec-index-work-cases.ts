@@ -236,6 +236,22 @@ export async function checkCodecIndexWork(api: {
             );
         }
     });
+    await test('scan ranges reject conflicting bounds and limits the engine cannot store', async () => {
+        const bound = Uint8Array.of(1);
+        await rejects(() => indexing.indexRangeToPhysicalRange({ gt: bound, gte: bound }), 'InvalidRangeError');
+        await rejects(() => indexing.indexRangeToPhysicalRange({ lt: bound, lte: bound }), 'InvalidRangeError');
+        for (const limit of [-1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, 0x1_0000_0000]) {
+            await rejects(() => indexing.assertValidScanRange({ limit }), 'InvalidRangeError');
+            await rejects(() => indexing.indexRangeToPhysicalRange({ limit }), 'InvalidRangeError');
+        }
+        ok(indexing.indexRangeToPhysicalRange({ limit: 0 }).limit === 0, 'zero scan limit');
+        ok(indexing.indexRangeToPhysicalRange({}).limit === undefined, 'omitted scan limit');
+        ok(
+            indexing.indexRangeToPhysicalRange({ limit: indexing.MAX_ENGINE_SCAN_LIMIT }).limit ===
+                indexing.MAX_ENGINE_SCAN_LIMIT,
+            'maximum engine scan limit'
+        );
+    });
     await test('compression rejects oversized logical values before starting streams', async () => {
         const OriginalCompressionStream = globalThis.CompressionStream;
         let streams = 0;
@@ -254,6 +270,34 @@ export async function checkCodecIndexWork(api: {
         } finally {
             globalThis.CompressionStream = OriginalCompressionStream;
         }
+    });
+    await test('compression preserves maximum logical values with a raw fallback envelope', async () => {
+        const OriginalCompressionStream = globalThis.CompressionStream;
+        globalThis.CompressionStream = function IdentityCompressionStream(_format: CompressionFormat) {
+            return new TransformStream();
+        } as unknown as typeof CompressionStream;
+        try {
+            const value = new Uint8Array(8 * 1024 * 1024);
+            for (const kind of ['gzip', 'deflate'] as const) {
+                const record = await compression.encodeStoreValueRecord(value, kind);
+                ok(record.byteLength === value.byteLength + 18, 'raw envelope truncated a maximum value');
+                const decoded = await compression.decodeStoreValueRecord(record, { strict: true });
+                equalBytes(decoded, value, 'raw envelope changed a maximum value');
+            }
+        } finally {
+            globalThis.CompressionStream = OriginalCompressionStream;
+        }
+    });
+    await test('snapshot wrapper rejects payloads above the unwrap size cap', async () => {
+        const snapshot = new Proxy(new Uint8Array(1), {
+            get(target, property, receiver) {
+                if (property === 'byteLength') {
+                    return 256 * 1024 * 1024 + 1;
+                }
+                return Reflect.get(target, property, receiver);
+            }
+        }) as Uint8Array;
+        await rejects(() => compression.wrapSnapshotWithCompression(snapshot, 'gzip'), 'SerializationError');
     });
     await test('strict value decoding rejects truncated recognized envelopes', async () => {
         const record = await compression.encodeStoreValueRecord(Uint8Array.of(1), 'gzip');

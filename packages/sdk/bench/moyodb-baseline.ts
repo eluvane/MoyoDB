@@ -183,6 +183,12 @@ export const moyoDbBaseline: WorkloadRunner = {
             return () => cleanupPrepared(ctx.dbName);
         }
 
+        if (ctx.workload.name === 'recovery_after_dirty_close') {
+            await prepareRecoveryDirtyClose(ctx.dbName, ctx.workload);
+            preparedSamples.set(ctx.dbName, prepared);
+            return () => cleanupPrepared(ctx.dbName);
+        }
+
         if (ctx.workload.name === 'snapshot_export_import') {
             const sourceName = `${ctx.dbName}-source`;
             const targetName = `${ctx.dbName}-target`;
@@ -330,8 +336,10 @@ async function runMoyoDbWorkload(dbName: string, workload: WorkloadSpec, sampleI
             jsNoopLoop(workload.recordCount);
             return;
         case 'noop_worker_roundtrip_10k':
-        case 'worker_roundtrip_noop':
             await workerRoundtripNoop(dbName, workload.recordCount);
+            return;
+        case 'worker_roundtrip_noop':
+            await workerRoundtripProtocolNoop(dbName, workload.recordCount);
             return;
         case 'worker_roundtrip_small_payload':
         case 'worker_roundtrip_256b_payload':
@@ -666,7 +674,7 @@ async function coldOpenAfterPrepared(dbName: string, workload: WorkloadSpec): Pr
     }
 }
 
-async function recoveryAfterDirtyClose(dbName: string, workload: WorkloadSpec): Promise<void> {
+async function prepareRecoveryDirtyClose(dbName: string, workload: WorkloadSpec): Promise<void> {
     const db = await freshDb(dbName, workload);
     try {
         const entries = buildEntryBatches(workload, workload.recordCount, effectiveBatchSize(workload));
@@ -687,7 +695,9 @@ async function recoveryAfterDirtyClose(dbName: string, workload: WorkloadSpec): 
     } finally {
         await db.close().catch(() => undefined);
     }
+}
 
+async function recoveryAfterDirtyClose(dbName: string, workload: WorkloadSpec): Promise<void> {
     const recovered = await openEmptyDb(dbName, workload);
     try {
         const base = await recovered.get(STORE_NAME, keyBytes(0, workload.keySize));
@@ -697,7 +707,6 @@ async function recoveryAfterDirtyClose(dbName: string, workload: WorkloadSpec): 
         }
     } finally {
         await recovered.close().catch(() => undefined);
-        await deleteDBIfExists(dbName);
     }
 }
 
@@ -769,6 +778,19 @@ self.onmessage = (event) => {
     const worker = new Worker(url, { type: 'module' });
     URL.revokeObjectURL(url);
     return worker;
+}
+
+async function workerRoundtripProtocolNoop(dbName: string, count: number): Promise<void> {
+    const worker = requirePrepared(dbName).worker;
+    if (!worker) {
+        throw new Error('prepared echo worker missing');
+    }
+    for (let i = 0; i < count; i += 1) {
+        const response = await postWorker<unknown>(worker, {});
+        if (response === null || typeof response !== 'object' || Object.keys(response).length !== 0) {
+            throw new Error('worker protocol noop returned a payload');
+        }
+    }
 }
 
 async function workerRoundtripNoop(dbName: string, count: number): Promise<void> {

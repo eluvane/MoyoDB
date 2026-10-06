@@ -496,7 +496,9 @@ export async function checkWritePipeline({ DbWorker, indexing, codec, compressio
         assert.ok(f.counts.packets[0].byteLength < (100 * 4096) / 4);
         for (const [key, raw] of entries)
             assert.deepEqual(
-                await compression.decodeStoreValueRecord(f.stores.get('docs').get(hex(key)).value, { strict: true }),
+                await compression.decodeStoreValueRecord(f.stores.get('docs').get(hex(key)).value, {
+                    strict: true
+                }),
                 raw
             );
         return {
@@ -897,24 +899,33 @@ export async function checkWritePipeline({ DbWorker, indexing, codec, compressio
     });
     async function observeValidation(f, run) {
         const originalParse = JSON.parse;
-        const originalDecode = f.worker.decodeStoreValue;
+        const originalResolve = f.worker.finishVisibleIndexedValue;
+        const originalRead = f.worker.readStoreValue;
+        assert.equal(typeof originalResolve, 'function');
+        assert.equal(typeof originalRead, 'function');
         const beforeBodies = f.counts.primaryBodyReads;
         let jsonParses = 0;
-        let valueDecodes = 0;
+        let valueResolutions = 0;
         JSON.parse = function (...args) {
             jsonParses++;
             return originalParse.apply(this, args);
         };
-        f.worker.decodeStoreValue = function (...args) {
-            valueDecodes++;
-            return originalDecode.apply(this, args);
+        f.worker.finishVisibleIndexedValue = function (...args) {
+            valueResolutions++;
+            return originalResolve.apply(this, args);
+        };
+        f.worker.readStoreValue = async function (...args) {
+            const value = await originalRead.apply(this, args);
+            if (value !== null) valueResolutions++;
+            return value;
         };
         try {
             await run();
-            return { bodyReads: f.counts.primaryBodyReads - beforeBodies, jsonParses, valueDecodes };
+            return { bodyReads: f.counts.primaryBodyReads - beforeBodies, jsonParses, valueResolutions };
         } finally {
             JSON.parse = originalParse;
-            f.worker.decodeStoreValue = originalDecode;
+            f.worker.finishVisibleIndexedValue = originalResolve;
+            f.worker.readStoreValue = originalRead;
         }
     }
     await test('matching native revisions reject unique conflicts without primary bodies or JSON', async () => {
@@ -926,7 +937,7 @@ export async function checkWritePipeline({ DbWorker, indexing, codec, compressio
                 { name: 'UniqueIndexConstraintError' }
             );
         });
-        assert.deepEqual(evidence, { bodyReads: 0, jsonParses: 0, valueDecodes: 0 });
+        assert.deepEqual(evidence, { bodyReads: 0, jsonParses: 0, valueResolutions: 0 });
         return { ...evidence, metadataCalls: f.counts.stateCalls };
     });
     await test('native key-only index pages do not materialize raw index payload bodies', async () => {
@@ -943,7 +954,7 @@ export async function checkWritePipeline({ DbWorker, indexing, codec, compressio
                 { name: 'UniqueIndexConstraintError' }
             )
         );
-        assert.deepEqual(evidence, { bodyReads: 1, jsonParses: 1, valueDecodes: 1 });
+        assert.deepEqual(evidence, { bodyReads: 1, jsonParses: 1, valueResolutions: 1 });
         assert.equal(f.counts.indexBodyBytes, 0);
         assert.equal(f.counts.keyPages, 1);
         assert.equal(f.counts.keyCursorCloses, 1);
@@ -971,7 +982,7 @@ export async function checkWritePipeline({ DbWorker, indexing, codec, compressio
                 { name: 'UniqueIndexConstraintError' }
             )
         );
-        assert.deepEqual(evidence, { bodyReads: 0, jsonParses: 0, valueDecodes: 0 });
+        assert.deepEqual(evidence, { bodyReads: 0, jsonParses: 0, valueResolutions: 0 });
         assert.equal(f.counts.indexedCalls, 4);
     });
     await test('scalar managed index failures preserve the changed primary without a completed-row event', async () => {
@@ -998,7 +1009,7 @@ export async function checkWritePipeline({ DbWorker, indexing, codec, compressio
             assert.equal(page.rows.length, 3);
             assert.ok(page.rows.every((row) => row.value.byteLength > 4096));
         });
-        assert.deepEqual(evidence, { bodyReads: 3, jsonParses: 0, valueDecodes: 3 });
+        assert.deepEqual(evidence, { bodyReads: 3, jsonParses: 0, valueResolutions: 3 });
         assert.equal(f.counts.getManyCalls, 1);
         return evidence;
     });
@@ -1013,7 +1024,7 @@ export async function checkWritePipeline({ DbWorker, indexing, codec, compressio
                 { name: 'UniqueIndexConstraintError' }
             )
         );
-        assert.deepEqual(evidence, { bodyReads: 1, jsonParses: 1, valueDecodes: 1 });
+        assert.deepEqual(evidence, { bodyReads: 1, jsonParses: 1, valueResolutions: 1 });
         assert.equal(f.stores.get(f.defs[0].internalStore).size, 1);
     });
     await test('raw index bytes cannot forge a matching native revision proof', async () => {
@@ -1031,7 +1042,7 @@ export async function checkWritePipeline({ DbWorker, indexing, codec, compressio
         const evidence = await observeValidation(f, () =>
             f.worker.assertUniqueIndexAvailability(1, f.defs[0], codec.indexKey('forged'), codec.u64Key(2))
         );
-        assert.deepEqual(evidence, { bodyReads: 1, jsonParses: 1, valueDecodes: 1 });
+        assert.deepEqual(evidence, { bodyReads: 1, jsonParses: 1, valueResolutions: 1 });
         assert.equal(f.stores.get(f.defs[0].internalStore).has(hex(physical)), false);
     });
     await test('raw indexed-field rewrites and unknown legacy proof use full stale validation', async () => {
@@ -1055,7 +1066,7 @@ export async function checkWritePipeline({ DbWorker, indexing, codec, compressio
                         codec.u64Key(2)
                     );
             });
-            assert.deepEqual(evidence, { bodyReads: 1, jsonParses: 1, valueDecodes: 1 });
+            assert.deepEqual(evidence, { bodyReads: 1, jsonParses: 1, valueResolutions: 1 });
             assert.equal(f.stores.get(f.defs[0].internalStore).size, legacy ? 1 : 0);
         }
     });
@@ -1067,7 +1078,7 @@ export async function checkWritePipeline({ DbWorker, indexing, codec, compressio
         const evidence = await observeValidation(f, () =>
             f.worker.assertUniqueIndexAvailability(1, f.defs[0], codec.indexKey('same'), codec.u64Key(2))
         );
-        assert.deepEqual(evidence, { bodyReads: 0, jsonParses: 0, valueDecodes: 0 });
+        assert.deepEqual(evidence, { bodyReads: 0, jsonParses: 0, valueResolutions: 0 });
         assert.equal(f.stores.get('docs').size, 0);
         assert.equal(f.stores.get(f.defs[0].internalStore).size, 0);
         assert.equal(f.counts.expiryStages, 1);
@@ -1088,7 +1099,7 @@ export async function checkWritePipeline({ DbWorker, indexing, codec, compressio
                 cursor: null
             });
         });
-        assert.deepEqual(evidence, { bodyReads: 0, jsonParses: 0, valueDecodes: 0 });
+        assert.deepEqual(evidence, { bodyReads: 0, jsonParses: 0, valueResolutions: 0 });
         assert.equal(f.counts.getManyCalls, 0);
         assert.equal(f.stores.get('docs').size, 2);
         assert.equal(f.stores.get(f.defs[0].internalStore).size, 2);
@@ -1107,7 +1118,7 @@ export async function checkWritePipeline({ DbWorker, indexing, codec, compressio
                 { name: 'UniqueIndexConstraintError' }
             )
         );
-        assert.deepEqual(old, { bodyReads: 0, jsonParses: 0, valueDecodes: 0 });
+        assert.deepEqual(old, { bodyReads: 0, jsonParses: 0, valueResolutions: 0 });
         const current = await observeValidation(f, () =>
             assert.rejects(
                 f.worker.assertUniqueIndexAvailability(1, f.defs[0], codec.indexKey('same'), codec.u64Key(2)),
@@ -1123,7 +1134,7 @@ export async function checkWritePipeline({ DbWorker, indexing, codec, compressio
                 { name: 'UniqueIndexConstraintError' }
             )
         );
-        assert.deepEqual(restored, { bodyReads: 0, jsonParses: 0, valueDecodes: 0 });
+        assert.deepEqual(restored, { bodyReads: 0, jsonParses: 0, valueResolutions: 0 });
     });
     await test('reconcile stamps validated raw primary rows with checked native revisions', async () => {
         const f = fixture({ unique: true, nativeRevisions: true });
@@ -1143,7 +1154,7 @@ export async function checkWritePipeline({ DbWorker, indexing, codec, compressio
                 { name: 'UniqueIndexConstraintError' }
             )
         );
-        assert.deepEqual(evidence, { bodyReads: 0, jsonParses: 0, valueDecodes: 0 });
+        assert.deepEqual(evidence, { bodyReads: 0, jsonParses: 0, valueResolutions: 0 });
     });
     await test('checked reconcile refuses a primary revision change before the native stamp', async () => {
         const f = fixture({ unique: true, nativeRevisions: true });

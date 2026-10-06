@@ -31,8 +31,9 @@ use crate::value::{
     COMPRESSION_VALUE_HEADER_SIZE,
 };
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -227,7 +228,9 @@ pub fn lookup_prefix<B: FileBackend>(
 ) -> Result<Option<Vec<u8>>> {
     match lookup_pending(pager, root_page_id, key, prefix_len)? {
         Some(PendingValue::Inline(value)) => Ok(Some(value)),
-        Some(value) => pending_value_prefix(pager, &value, prefix_len).map(Some),
+        Some(value) => {
+            pending_value_prefix(pager, &value, prefix_len).map(|prefix| Some(prefix.into_owned()))
+        }
         None => Ok(None),
     }
 }
@@ -257,6 +260,9 @@ fn lookup_pending<B: FileBackend>(
 #[derive(Default)]
 pub(crate) struct PointReadBatch {
     ancestors: Vec<PointReadAncestor>,
+    // Reused page image. Bulk lookups snapshot internal pages so a one-page
+    // cache can evict them during overflow reads without rereading ancestors.
+    spare: Vec<u8>,
 }
 
 struct PointReadAncestor {
@@ -289,19 +295,41 @@ impl PointReadBatch {
             }
             return inspect(&node.bytes, &node.header);
         }
-        self.ancestors.truncate(depth);
+        while self.ancestors.len() > depth {
+            let dropped = self
+                .ancestors
+                .pop()
+                .ok_or_else(|| EngineError::Internal("point-read ancestor missing".into()))?;
+            self.recycle(dropped.bytes);
+        }
         pager.with_page(page_id, |bytes| {
             let header = node_header(bytes, page_id, expected_level)?;
             let result = inspect(bytes, &header)?;
             if header.page_kind == PageKind::Internal {
+                let stored = self.snapshot_page(bytes);
                 self.ancestors.push(PointReadAncestor {
                     page_id,
                     header,
-                    bytes: bytes.to_vec(),
+                    bytes: stored,
                 });
             }
             Ok(result)
         })
+    }
+
+    fn recycle(&mut self, bytes: Vec<u8>) {
+        if bytes.len() == PAGE_SIZE && bytes.capacity() >= self.spare.capacity() {
+            self.spare = bytes;
+        }
+    }
+
+    fn snapshot_page(&mut self, bytes: &[u8]) -> Vec<u8> {
+        if self.spare.len() == bytes.len() {
+            self.spare.copy_from_slice(bytes);
+            std::mem::take(&mut self.spare)
+        } else {
+            bytes.to_vec()
+        }
     }
 }
 
@@ -795,12 +823,25 @@ pub fn scan<B: FileBackend>(
 ) -> Result<Vec<KvPair>> {
     range.validate()?;
     let limit = range.limit.unwrap_or(usize::MAX);
-    let mut out = Vec::new();
     if limit == 0 {
-        return Ok(out);
+        return Ok(Vec::new());
     }
+    // Known limits request one exact buffer. Unlimited scans reserve after the
+    // first leaf is staged, so push does not grow geometrically.
+    let mut out = if range.limit.is_some() && limit <= 4096 {
+        Vec::with_capacity(limit)
+    } else {
+        Vec::new()
+    };
     let mut iter = TreeIter::new(pager, root_page_id, range)?;
     while let Some(pair) = iter.next(pager)? {
+        let pending = iter.ready_remaining();
+        if pending > 0 {
+            let needed = out.len() + 1 + pending;
+            if needed > out.capacity() {
+                out.reserve_exact(needed - out.capacity());
+            }
+        }
         out.push(KvPair {
             key: pair.key,
             value: materialize_pending_value(pager, pair.value)?,
@@ -1215,13 +1256,22 @@ pub fn collect_keys_below<B: FileBackend>(
     upper: &[u8],
     limit: usize,
 ) -> Result<Vec<Vec<u8>>> {
-    let range = RangeSpec {
-        lt: Some(upper.to_vec()),
-        limit: Some(limit),
-        ..RangeSpec::default()
+    // Borrow the caller bound. An owned RangeSpec would copy it once, and the
+    // iterator would copy it again.
+    let mut iter = TreeIter::with_bounds(
+        pager,
+        root_page_id,
+        None,
+        Some((upper, false)),
+        false,
+        Some(limit),
+        0,
+    )?;
+    let mut out = if limit <= 4096 {
+        Vec::with_capacity(limit)
+    } else {
+        Vec::new()
     };
-    let mut iter = TreeIter::new_keys_only(pager, root_page_id, &range)?;
-    let mut out = Vec::new();
     while out.len() < limit {
         let Some(key) = iter.next_key(pager)? else {
             break;
@@ -1974,12 +2024,13 @@ struct ValidatedLeafWindow {
 /// Reads one tree in key order or reverse order.
 /// A finite limit restricts copying after the full leaf window is validated.
 /// Unlimited scans buffer one leaf to avoid rereads after overflow I/O.
-pub(crate) struct TreeIter {
+pub(crate) struct TreeIter<'a> {
     cursor: Option<LeafCursor>,
-    buffer: VecDeque<PendingKvPair>,
+    ready: Vec<PendingKvPair>,
+    ready_at: usize,
     window: Option<ValidatedLeafWindow>,
-    lower: Option<(Vec<u8>, bool)>,
-    upper: Option<(Vec<u8>, bool)>,
+    lower: Option<(Cow<'a, [u8]>, bool)>,
+    upper: Option<(Cow<'a, [u8]>, bool)>,
     max_buffered_entries: usize,
     inline_prefix_len: usize,
     reverse: bool,
@@ -1987,7 +2038,7 @@ pub(crate) struct TreeIter {
     exhausted: bool,
 }
 
-impl TreeIter {
+impl TreeIter<'static> {
     pub(crate) fn new<B: FileBackend>(
         pager: &mut Pager<B>,
         root_page_id: u64,
@@ -1996,18 +2047,60 @@ impl TreeIter {
         range.validate()?;
         let lower = range
             .lower_bound()
-            .map(|(key, inclusive)| (key.to_vec(), inclusive));
+            .map(|(key, inclusive)| (Cow::Owned(key.to_vec()), inclusive));
         let upper = range
             .upper_bound()
-            .map(|(key, inclusive)| (key.to_vec(), inclusive));
-        let descent = if range.reverse {
+            .map(|(key, inclusive)| (Cow::Owned(key.to_vec()), inclusive));
+        TreeIter::open(
+            pager,
+            root_page_id,
+            lower,
+            upper,
+            range.reverse,
+            range.limit,
+            usize::MAX,
+        )
+    }
+}
+
+impl<'a> TreeIter<'a> {
+    fn with_bounds<B: FileBackend>(
+        pager: &mut Pager<B>,
+        root_page_id: u64,
+        lower: Option<(&'a [u8], bool)>,
+        upper: Option<(&'a [u8], bool)>,
+        reverse: bool,
+        limit: Option<usize>,
+        inline_prefix_len: usize,
+    ) -> Result<Self> {
+        Self::open(
+            pager,
+            root_page_id,
+            lower.map(|(key, inclusive)| (Cow::Borrowed(key), inclusive)),
+            upper.map(|(key, inclusive)| (Cow::Borrowed(key), inclusive)),
+            reverse,
+            limit,
+            inline_prefix_len,
+        )
+    }
+
+    fn open<B: FileBackend>(
+        pager: &mut Pager<B>,
+        root_page_id: u64,
+        lower: Option<(Cow<'a, [u8]>, bool)>,
+        upper: Option<(Cow<'a, [u8]>, bool)>,
+        reverse: bool,
+        limit: Option<usize>,
+        inline_prefix_len: usize,
+    ) -> Result<Self> {
+        let descent = if reverse {
             match upper.as_ref() {
-                Some((key, _)) => Descent::Key(key.as_slice()),
+                Some((key, _)) => Descent::Key(key.as_ref()),
                 None => Descent::Rightmost,
             }
         } else {
             match lower.as_ref() {
-                Some((key, _)) => Descent::Key(key.as_slice()),
+                Some((key, _)) => Descent::Key(key.as_ref()),
                 None => Descent::Leftmost,
             }
         };
@@ -2015,27 +2108,33 @@ impl TreeIter {
         Ok(Self {
             exhausted: cursor.is_none(),
             cursor,
-            buffer: VecDeque::new(),
+            ready: Vec::new(),
+            ready_at: 0,
             window: None,
             lower,
             upper,
             // Filtering and staged deletes may require more entries than range.limit.
-            max_buffered_entries: if range.limit.is_some() { 1 } else { usize::MAX },
-            inline_prefix_len: usize::MAX,
-            reverse: range.reverse,
+            max_buffered_entries: if limit.is_some() { 1 } else { usize::MAX },
+            inline_prefix_len,
+            reverse,
             loaded_first: false,
         })
     }
 
-    fn new_keys_only<B: FileBackend>(
-        pager: &mut Pager<B>,
-        root_page_id: u64,
-        range: &RangeSpec,
-    ) -> Result<Self> {
-        let mut iter = Self::new(pager, root_page_id, range)?;
-        // Preserve cell validation without copying values that keys-only scans discard.
-        iter.inline_prefix_len = 0;
-        Ok(iter)
+    fn ready_remaining(&self) -> usize {
+        self.ready.len().saturating_sub(self.ready_at)
+    }
+
+    fn pop_ready(&mut self) -> Option<PendingKvPair> {
+        if self.ready_at >= self.ready.len() {
+            return None;
+        }
+        let index = self.ready_at;
+        self.ready_at += 1;
+        Some(std::mem::replace(
+            &mut self.ready[index],
+            blank_pending_pair(),
+        ))
     }
 
     fn next_key<B: FileBackend>(&mut self, pager: &mut Pager<B>) -> Result<Option<Vec<u8>>> {
@@ -2047,7 +2146,7 @@ impl TreeIter {
         pager: &mut Pager<B>,
     ) -> Result<Option<PendingKvPair>> {
         loop {
-            if let Some(pair) = self.buffer.pop_front() {
+            if let Some(pair) = self.pop_ready() {
                 validate_pending_payload_range(pager, &pair.value)?;
                 return Ok(Some(pair));
             }
@@ -2104,29 +2203,33 @@ impl TreeIter {
             }
             self.loaded_first = true;
             let page_id = cursor.current;
-            let lower = self
-                .lower
-                .as_ref()
-                .map(|(key, inclusive)| (key.as_slice(), *inclusive));
-            let upper = self
-                .upper
-                .as_ref()
-                .map(|(key, inclusive)| (key.as_slice(), *inclusive));
+            let mut ready = std::mem::take(&mut self.ready);
+            self.ready_at = 0;
             let reverse = self.reverse;
             let max_buffered_entries = self.max_buffered_entries;
             let inline_prefix_len = self.inline_prefix_len;
-            let (window, pairs) = pager.with_page(page_id, |bytes| {
-                collect_leaf_window(
-                    bytes,
-                    page_id,
-                    lower,
-                    upper,
-                    reverse,
-                    max_buffered_entries,
-                    inline_prefix_len,
-                )
-            })?;
-            self.buffer.extend(pairs);
+            let window = {
+                let lower = self
+                    .lower
+                    .as_ref()
+                    .map(|(key, inclusive)| (key.as_ref(), *inclusive));
+                let upper = self
+                    .upper
+                    .as_ref()
+                    .map(|(key, inclusive)| (key.as_ref(), *inclusive));
+                pager.with_page(page_id, |bytes| {
+                    collect_leaf_window(
+                        bytes,
+                        page_id,
+                        (lower, upper),
+                        reverse,
+                        max_buffered_entries,
+                        inline_prefix_len,
+                        &mut ready,
+                    )
+                })?
+            };
+            self.ready = ready;
             if window.hit_bound {
                 self.exhausted = true;
             }
@@ -2135,16 +2238,26 @@ impl TreeIter {
     }
 }
 
+fn blank_pending_pair() -> PendingKvPair {
+    PendingKvPair {
+        key: Vec::new(),
+        value: PendingValue::Inline(Vec::new()),
+    }
+}
+
+type ScanBound<'a> = Option<(&'a [u8], bool)>;
+
 /// Validates every cell in the window before returning a batch in scan order.
 fn collect_leaf_window(
     bytes: &[u8],
     page_id: u64,
-    lower: Option<(&[u8], bool)>,
-    upper: Option<(&[u8], bool)>,
+    bounds: (ScanBound<'_>, ScanBound<'_>),
     reverse: bool,
     max_buffered_entries: usize,
     inline_prefix_len: usize,
-) -> Result<(ValidatedLeafWindow, Vec<PendingKvPair>)> {
+    pairs: &mut Vec<PendingKvPair>,
+) -> Result<ValidatedLeafWindow> {
+    let (lower, upper) = bounds;
     let header = node_header(bytes, page_id, Some(0))?;
     let count = header.cell_count as usize;
     let start = match lower {
@@ -2167,7 +2280,10 @@ fn collect_leaf_window(
     } else {
         (start, start + buffered_count)
     };
-    let mut pairs = Vec::with_capacity(buffered_count);
+    pairs.clear();
+    if buffered_count > pairs.capacity() {
+        pairs.reserve_exact(buffered_count - pairs.capacity());
+    }
     for index in start..end.max(start) {
         let slot = read_cell_slot(bytes, &header, index)?;
         let cell = decode_leaf_cell_ref(bytes, slot)?;
@@ -2184,15 +2300,12 @@ fn collect_leaf_window(
     } else {
         end < count
     };
-    Ok((
-        ValidatedLeafWindow {
-            header,
-            start: if reverse { start } else { copy_end },
-            end: if reverse { copy_start } else { end.max(start) },
-            hit_bound,
-        },
-        pairs,
-    ))
+    Ok(ValidatedLeafWindow {
+        header,
+        start: if reverse { start } else { copy_end },
+        end: if reverse { copy_start } else { end.max(start) },
+        hit_bound,
+    })
 }
 
 /// First index whose key does not satisfy `before`.
@@ -2252,17 +2365,35 @@ fn choose_internal_child_in_page(
     }
     let mut lo = 0usize;
     let mut hi = child_count;
+    // The rightmost separator <= key, plus child 0 when every probe is greater.
+    // Both were already decoded, so the chosen child does not need a second read.
+    let mut chosen: Option<(usize, u64)> = None;
+    let mut leftmost_child = None;
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
         let slot = read_cell_slot(bytes, header, mid)?;
         let cell = decode_internal_cell_ref(bytes, slot)?;
+        if mid == 0 {
+            leftmost_child = Some(cell.child_page_id);
+        }
         if compare_keys(cell.separator, key) != Ordering::Greater {
+            chosen = Some((mid, cell.child_page_id));
             lo = mid + 1;
         } else {
             hi = mid;
         }
     }
     let index = lo.saturating_sub(1);
+    if let Some((chosen_index, child_page_id)) = chosen {
+        if chosen_index == index {
+            return Ok((index, child_page_id));
+        }
+    }
+    if index == 0 {
+        if let Some(child_page_id) = leftmost_child {
+            return Ok((index, child_page_id));
+        }
+    }
     Ok((index, child_page_id_at(bytes, header, index)?))
 }
 
@@ -2522,17 +2653,22 @@ pub(crate) fn write_pending_stored_value<B: FileBackend>(
     }
 }
 
-pub(crate) fn pending_value_prefix<B: FileBackend>(
+pub(crate) fn pending_value_prefix<'a, B: FileBackend>(
     pager: &mut Pager<B>,
-    value: &PendingValue,
+    value: &'a PendingValue,
     prefix_len: usize,
-) -> Result<Vec<u8>> {
+) -> Result<Cow<'a, [u8]>> {
     match value {
-        PendingValue::Inline(value) => Ok(value[..prefix_len.min(value.len())].to_vec()),
+        PendingValue::Inline(value) => Ok(Cow::Borrowed(&value[..prefix_len.min(value.len())])),
         PendingValue::Overflow {
             head_page_id,
             total_len,
-        } => read_overflow_prefix(pager, *head_page_id, *total_len, prefix_len),
+        } => Ok(Cow::Owned(read_overflow_prefix(
+            pager,
+            *head_page_id,
+            *total_len,
+            prefix_len,
+        )?)),
         PendingValue::External { payload, prefix } => {
             validate_optional_payload_range(pager, Some(payload))?;
             let wanted = prefix_len.min(prefix.len() + payload.body_len as usize);
@@ -2546,7 +2682,7 @@ pub(crate) fn pending_value_prefix<B: FileBackend>(
                     wanted - prefix_take,
                 )?);
             }
-            Ok(value)
+            Ok(Cow::Owned(value))
         }
     }
 }

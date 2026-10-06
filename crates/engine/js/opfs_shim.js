@@ -107,10 +107,13 @@ export function writeAll(handle, bytes, at) {
     return writtenTotal;
 }
 // Reads until the buffer is full or a read returns zero. The unread suffix is unchanged.
+// The first attempt borrows the caller view. A short read retries through a suffix
+// view so bytes already stored stay put without copying them.
 export function readAll(handle, buffer, at) {
     let readTotal = 0;
     while (readTotal < buffer.length) {
-        const rawRead = handle.read(buffer.subarray(readTotal), { at: at + readTotal });
+        const chunk = readTotal === 0 ? buffer : buffer.subarray(readTotal);
+        const rawRead = handle.read(chunk, { at: at + readTotal });
         const read = Number(rawRead);
         if (!Number.isSafeInteger(read) || read < 0 || read > buffer.length - readTotal) {
             throw namedError('StorageError', `opfs read failed: invalid byte count ${String(rawRead)}`);
@@ -192,7 +195,10 @@ export function readControlStateFromAccessHandle(accessHandle) {
         return { status: 'absent', control: null };
     }
     const buffer = new Uint8Array(CONTROL_SLOT_SIZE * 2);
-    readAll(accessHandle, buffer.subarray(0, Math.min(buffer.length, size)), 0);
+    // A short file must not be presented as a full two-slot buffer. A file that
+    // already covers both slots can be read through the allocated buffer itself.
+    const readable = size < buffer.length ? buffer.subarray(0, size) : buffer;
+    readAll(accessHandle, readable, 0);
     const slot0 = decodeControlSlot(0, buffer.subarray(0, CONTROL_SLOT_SIZE));
     const slot1 = decodeControlSlot(1, buffer.subarray(CONTROL_SLOT_SIZE, CONTROL_SLOT_SIZE * 2));
     if (slot0 && slot1) {

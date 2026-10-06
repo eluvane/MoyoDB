@@ -65,7 +65,7 @@ fn wal_append_scan_and_replay() {
 }
 
 #[test]
-fn wal_batch_append_matches_page_count() {
+fn wal_batch_append_rejects_commit_page_count_mismatch() {
     let mut wal = MemoryBackend::new();
     let mut offset = 0u64;
     let page = leaf_image(11, 9);

@@ -1,6 +1,8 @@
 use moyodb_engine::bytes::MAX_KEY_BYTES;
 use moyodb_engine::snapshot::{
     decode_snapshot, encode_snapshot, SnapshotContents, SnapshotEntry, SnapshotStore,
+    SNAPSHOT_BODY_PREFIX_SIZE, SNAPSHOT_CHECKSUM_OFFSET, SNAPSHOT_ENTRY_HEADER_SIZE,
+    SNAPSHOT_HEADER_SIZE, SNAPSHOT_STORE_HEADER_SIZE,
 };
 use moyodb_engine::EngineError;
 
@@ -124,5 +126,82 @@ fn duplicate_detection_keeps_its_store_scope_and_decoder_boundary() {
     assert_eq!(
         duplicate.to_string(),
         "database corruption: duplicate snapshot store z"
+    );
+}
+
+fn reseal(bytes: &mut [u8]) {
+    bytes[SNAPSHOT_CHECKSUM_OFFSET..SNAPSHOT_CHECKSUM_OFFSET + 4].fill(0);
+    let checksum = crc32fast::hash(bytes);
+    bytes[SNAPSHOT_CHECKSUM_OFFSET..SNAPSHOT_CHECKSUM_OFFSET + 4]
+        .copy_from_slice(&checksum.to_le_bytes());
+}
+
+#[test]
+fn store_name_reserved_bytes_still_round_trip() {
+    let contents = format_fixture();
+    let mut bytes = encode_snapshot(&contents).unwrap();
+    let mut reserved_at = SNAPSHOT_HEADER_SIZE + SNAPSHOT_BODY_PREFIX_SIZE;
+    for store in &contents.stores {
+        bytes[reserved_at + 2..reserved_at + 4].fill(0xab);
+        reserved_at += SNAPSHOT_STORE_HEADER_SIZE + store.name.len();
+        for entry in &store.entries {
+            reserved_at += SNAPSHOT_ENTRY_HEADER_SIZE + entry.key.len() + entry.value.len();
+        }
+    }
+    assert_eq!(reserved_at, bytes.len());
+    reseal(&mut bytes);
+    assert_eq!(decode_snapshot(&bytes).unwrap(), contents);
+}
+
+#[test]
+fn unknown_header_and_directory_flags_fail_closed() {
+    let encoded = encode_snapshot(&format_fixture()).unwrap();
+    for (offset, field) in [
+        (12, "header"),
+        (28, "header"),
+        (
+            SNAPSHOT_HEADER_SIZE + SNAPSHOT_BODY_PREFIX_SIZE - 4,
+            "directory",
+        ),
+    ] {
+        let mut bytes = encoded.clone();
+        bytes[offset..offset + 4].fill(0xa5);
+        reseal(&mut bytes);
+        assert_eq!(
+            decode_snapshot(&bytes).unwrap_err(),
+            EngineError::Corruption(format!("unsupported snapshot {field} flags 0xa5a5a5a5"))
+        );
+    }
+}
+
+#[test]
+fn truncated_reserved_field_does_not_look_like_trailing_bytes() {
+    let contents = format_fixture();
+    let encoded = encode_snapshot(&contents).unwrap();
+
+    let mut missing_store_count_reserved = encoded.clone();
+    let store_count_end = SNAPSHOT_HEADER_SIZE + SNAPSHOT_BODY_PREFIX_SIZE - 4;
+    missing_store_count_reserved.truncate(store_count_end);
+    let body_len = (store_count_end - SNAPSHOT_HEADER_SIZE) as u64;
+    missing_store_count_reserved[16..24].copy_from_slice(&body_len.to_le_bytes());
+    reseal(&mut missing_store_count_reserved);
+    assert_eq!(
+        decode_snapshot(&missing_store_count_reserved).unwrap_err(),
+        EngineError::Corruption(
+            "snapshot reserved field after the store count is truncated".into()
+        )
+    );
+
+    let mut missing_name_reserved = encoded;
+    let name_len_end = SNAPSHOT_HEADER_SIZE + SNAPSHOT_BODY_PREFIX_SIZE + 2;
+    missing_name_reserved.truncate(name_len_end);
+    let body_len = (name_len_end - SNAPSHOT_HEADER_SIZE) as u64;
+    missing_name_reserved[16..24].copy_from_slice(&body_len.to_le_bytes());
+    reseal(&mut missing_name_reserved);
+    assert_eq!(
+        decode_snapshot(&missing_name_reserved).unwrap_err(),
+        EngineError::Corruption(
+            "snapshot reserved field after the store name length is truncated".into()
+        )
     );
 }

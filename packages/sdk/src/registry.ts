@@ -66,7 +66,7 @@ export interface RegistryEntry {
 }
 const registry = new Map<string, RegistryEntry>();
 const lifecycleOperations = new Map<string, Promise<void>>();
-function queueLifecycleOperation<T>(dbName: string, operation: () => Promise<T>): Promise<T> {
+function queueLifecycleOperation<T>(dbName: string, operation: () => Promise<T> | T): Promise<T> {
     const previous = lifecycleOperations.get(dbName) ?? Promise.resolve();
     const result = previous.then(operation);
     const settled = result.then(
@@ -158,19 +158,26 @@ export function normalizeOptions(options: OpenOptions = {}): NormalizedOpenOptio
 function sameChangeFeed(left: NormalizedOpenOptions['changeFeed'], right: NormalizedOpenOptions['changeFeed']) {
     return left?.enabled === right?.enabled && left?.retainTxids === right?.retainTxids;
 }
-export function assertCompatibleOptions(dbName: string, current: NormalizedOpenOptions, next: NormalizedOpenOptions) {
+function liveOptionsMismatch(
+    dbName: string,
+    current: NormalizedOpenOptions,
+    next: NormalizedOpenOptions
+): string | null {
     if (current.workerMode !== next.workerMode) {
-        throw new InvalidOpenOptionsError(`database ${dbName} is already open with workerMode=${current.workerMode}`);
+        return `database ${dbName} is already open with workerMode=${current.workerMode}`;
     }
     if (current.cachePages !== next.cachePages) {
-        throw new InvalidOpenOptionsError(
-            `database ${dbName} is already open in this tab with cachePages=${current.cachePages}; requested cachePages=${next.cachePages}`
-        );
+        return `database ${dbName} is already open in this tab with cachePages=${current.cachePages}; requested cachePages=${next.cachePages}`;
     }
     if (next.changeFeed !== null && !sameChangeFeed(current.changeFeed, next.changeFeed)) {
-        throw new InvalidOpenOptionsError(
-            `database ${dbName} is already open in this tab with a different changeFeed policy`
-        );
+        return `database ${dbName} is already open in this tab with a different changeFeed policy`;
+    }
+    return null;
+}
+export function assertCompatibleOptions(dbName: string, current: NormalizedOpenOptions, next: NormalizedOpenOptions) {
+    const mismatch = liveOptionsMismatch(dbName, current, next);
+    if (mismatch !== null) {
+        throw new InvalidOpenOptionsError(mismatch);
     }
 }
 async function callStorageManager(method: 'persist' | 'persisted'): Promise<boolean> {
@@ -316,45 +323,85 @@ export function unsafeDebugCrashWorker(dbName: string): boolean {
     void current.worker.terminate();
     return true;
 }
-export async function acquireDbWorker(dbName: string, options: OpenOptions = {}): Promise<RegistryEntry> {
-    const normalized = normalizeOptions(options);
-    return queueLifecycleOperation(dbName, async () => {
-        const existing = registry.get(dbName);
-        if (existing) {
-            if (existing.invalidated) {
-                registry.delete(dbName);
-            } else {
-                if (existing.schemaMigrationInProgress) {
-                    throw new DatabaseBusyError(`database ${dbName} is migrating; wait for openDB() to resolve`);
-                }
-                assertCompatibleOptions(dbName, existing.options, normalized);
-                if (normalized.debugFailpoint !== null) {
-                    try {
-                        await existing.proxy.setFailpoint(normalized.debugFailpoint);
-                    } catch (error) {
-                        throw normalizeError(error);
-                    }
-                }
+function tryReuseIdleEntry(dbName: string, normalized: NormalizedOpenOptions): RegistryEntry | undefined {
+    // An idle live owner only needs another handle. In-flight close/delete,
+    // migration, and failpoint changes stay queued so one worker keeps the lock.
+    if (lifecycleOperations.has(dbName) || normalized.debugFailpoint !== null) {
+        return undefined;
+    }
+    const existing = registry.get(dbName);
+    if (!existing || existing.invalidated || existing.schemaMigrationInProgress) {
+        return undefined;
+    }
+    if (liveOptionsMismatch(dbName, existing.options, normalized) !== null) {
+        return undefined;
+    }
+    existing.refs += 1;
+    return existing;
+}
+function adoptQueuedEntry(
+    existing: RegistryEntry,
+    dbName: string,
+    normalized: NormalizedOpenOptions
+): RegistryEntry | Promise<RegistryEntry> {
+    if (existing.schemaMigrationInProgress) {
+        throw new DatabaseBusyError(`database ${dbName} is migrating; wait for openDB() to resolve`);
+    }
+    assertCompatibleOptions(dbName, existing.options, normalized);
+    if (normalized.debugFailpoint !== null) {
+        return existing.proxy.setFailpoint(normalized.debugFailpoint).then(
+            () => {
                 existing.refs += 1;
                 return existing;
+            },
+            (error: unknown) => {
+                throw normalizeError(error);
             }
+        );
+    }
+    existing.refs += 1;
+    return existing;
+}
+async function openFreshEntry(dbName: string, normalized: NormalizedOpenOptions): Promise<RegistryEntry> {
+    const { worker, proxy, persistenceBridge } = createWorker(dbName, normalized.workerMode);
+    const entry = createEntry(dbName, worker, proxy, persistenceBridge, normalized);
+    try {
+        await proxy.open({
+            dbName,
+            options: normalized
+        });
+        registry.set(dbName, entry);
+        return entry;
+    } catch (error) {
+        persistenceBridge.close();
+        proxy.dispose(new Error('worker open failed'));
+        await worker.terminate();
+        throw normalizeError(error);
+    }
+}
+function acquireQueuedEntry(dbName: string, normalized: NormalizedOpenOptions): RegistryEntry | Promise<RegistryEntry> {
+    const existing = registry.get(dbName);
+    if (existing) {
+        if (existing.invalidated) {
+            registry.delete(dbName);
+        } else {
+            return adoptQueuedEntry(existing, dbName, normalized);
         }
-        const { worker, proxy, persistenceBridge } = createWorker(dbName, normalized.workerMode);
-        const entry = createEntry(dbName, worker, proxy, persistenceBridge, normalized);
-        try {
-            await proxy.open({
-                dbName,
-                options: normalized
-            });
-            registry.set(dbName, entry);
-            return entry;
-        } catch (error) {
-            persistenceBridge.close();
-            proxy.dispose(new Error('worker open failed'));
-            await worker.terminate();
-            throw normalizeError(error);
-        }
-    });
+    }
+    return openFreshEntry(dbName, normalized);
+}
+export function acquireDbWorker(dbName: string, options: OpenOptions = {}): Promise<RegistryEntry> {
+    let normalized: NormalizedOpenOptions;
+    try {
+        normalized = normalizeOptions(options);
+    } catch (error) {
+        return Promise.reject(error);
+    }
+    const reused = tryReuseIdleEntry(dbName, normalized);
+    if (reused) {
+        return Promise.resolve(reused);
+    }
+    return queueLifecycleOperation(dbName, () => acquireQueuedEntry(dbName, normalized));
 }
 export async function releaseDbWorker(entry: RegistryEntry): Promise<void> {
     if (entry.release) return entry.release();

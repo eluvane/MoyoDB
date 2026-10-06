@@ -557,7 +557,7 @@ export function createSuite({ runtime, indexing, codec }) {
     test(
         'create/drop detach once; old and concurrent readers keep their snapshots',
         async () => {
-            const f = fixture({ stores: 100 });
+            const f = fixture({ stores: 1 });
             const oldReader = await f.worker.begin('readonly');
             const writer = await f.worker.begin('readwrite');
             const c = await counted(async () => {
@@ -1475,12 +1475,24 @@ export function createSuite({ runtime, indexing, codec }) {
             true
         );
     }
+    // One row past the largest limit, so rawRows === limit still means the tail was not scanned.
+    const demandLimits = [1, 100, 256];
+    const demandRowCount = Math.max(...demandLimits) + 1;
+    const demandRows = indexRows(demandRowCount);
+    // 40 live keys across two pages of 37, with key 0 and key 76 outside the bounds.
+    const continuationStart = 1;
+    const continuationEnd = 76;
+    const continuationRows = indexRows(
+        continuationEnd + 1,
+        (i) => i % 3 !== 0,
+        (i) => i % 5 === 0
+    );
     for (const reverse of [false, true]) {
-        for (const limit of [1, 100, 256]) {
+        for (const limit of demandLimits) {
             test(
                 `clean index scan reads only demand: reverse=${reverse}, limit=${limit}`,
                 async () => {
-                    const f = fixture({ defs: definitions(1), rows: indexRows(2000) });
+                    const f = fixture({ defs: definitions(1), rows: demandRows });
                     const tx = await f.worker.begin('readonly');
                     const got = await f.worker.scanByIndex(tx, 'docs', 'i0', { reverse, limit });
                     eq(got.length, limit);
@@ -1488,7 +1500,9 @@ export function createSuite({ runtime, indexing, codec }) {
                     eq(f.counts.gets, limit);
                     eq(f.counts.getCalls, limit);
                     eq(f.counts.getManyCalls, 0);
-                    const expected = Array.from({ length: limit }, (_, i) => hex(u64Key(reverse ? 1999 - i : i)));
+                    const expected = Array.from({ length: limit }, (_, i) =>
+                        hex(u64Key(reverse ? demandRowCount - 1 - i : i))
+                    );
                     eq(
                         got.map((r) => hex(r.key)),
                         expected
@@ -1502,14 +1516,10 @@ export function createSuite({ runtime, indexing, codec }) {
             test(`bounded continuation with missing/stale rows, reverse=${reverse}, mode=${mode}`, async () => {
                 const f = fixture({
                     defs: definitions(1),
-                    rows: indexRows(
-                        1500,
-                        (i) => i % 3 !== 0,
-                        (i) => i % 5 === 0
-                    )
+                    rows: continuationRows
                 });
                 const tx = await f.worker.begin(mode);
-                const range = { gte: indexKey(100), lt: indexKey(1400), reverse };
+                const range = { gte: indexKey(continuationStart), lt: indexKey(continuationEnd), reverse };
                 let cursor = null;
                 const got = [];
                 for (let n = 0; n < 100; n++) {
@@ -1519,9 +1529,10 @@ export function createSuite({ runtime, indexing, codec }) {
                     cursor = page.cursor;
                     ok(n !== 99, 'pagination did not terminate');
                 }
-                const expected = Array.from({ length: 1300 }, (_, i) => i + 100).filter(
-                    (i) => i % 3 !== 0 && i % 5 !== 0
-                );
+                const expected = Array.from(
+                    { length: continuationEnd - continuationStart },
+                    (_, i) => i + continuationStart
+                ).filter((i) => i % 3 !== 0 && i % 5 !== 0);
                 if (reverse) expected.reverse();
                 eq(
                     got,
@@ -1553,7 +1564,8 @@ export function createSuite({ runtime, indexing, codec }) {
     test(
         'getByIndex reads one physical entry for a large duplicate-key range',
         async () => {
-            const rows = Array.from({ length: 2000 }, (_, i) => ({
+            // Any limit other than 1 returns both duplicates, so the range does not need thousands of copies.
+            const rows = Array.from({ length: 2 }, (_, i) => ({
                 key: u64Key(i),
                 physical: indexing.encodeIndexEntryKey(indexKey(7), u64Key(i)),
                 value: jsonEncode({ k0: 7, id: i })

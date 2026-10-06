@@ -1,15 +1,23 @@
 mod common;
 
+use std::cmp::Ordering;
+
+use moyodb_engine::bytes::{
+    compare_keys, key_in_range, read_u16_le, read_u32_le, read_u64_le, validate_key,
+    validate_store_name, validate_value, write_u16_le, write_u32_le, write_u64_le, MAX_KEY_BYTES,
+    MAX_STORE_NAME_BYTES, MAX_VALUE_BYTES,
+};
 use moyodb_engine::checksum::checksum_with_zeroed_region;
 use moyodb_engine::layout::{
-    decode_superblock_slot, encode_superblock_slot, PageKind, SuperblockState, ValueKind,
-    FORMAT_VERSION, PAGE_HEADER_CHECKSUM_OFFSET, PAGE_HEADER_SIZE, PAGE_SIZE, SUPERBLOCK_MAGIC,
-    SUPERBLOCK_SLOT_SIZE,
+    decode_superblock_slot, encode_superblock_slot, page_offset, unsafe_read_struct, PageKind,
+    SuperblockState, ValueKind, FORMAT_VERSION, PAGE_HEADER_CHECKSUM_OFFSET, PAGE_HEADER_SIZE,
+    PAGE_SIZE, SUPERBLOCK_MAGIC, SUPERBLOCK_SLOT_SIZE,
 };
 use moyodb_engine::page::{
     decode_page, encode_internal_page, encode_leaf_page, encode_overflow_page, InternalCell,
     LeafCell,
 };
+use moyodb_engine::EngineError;
 
 fn inline_a_page(page_id: u64) -> Vec<u8> {
     encode_leaf_page(
@@ -206,4 +214,71 @@ fn exported_layout_constants_are_stable() {
     assert_eq!(FORMAT_VERSION, 2);
     assert_eq!(SUPERBLOCK_MAGIC, *b"STKDB001");
     assert_eq!(SUPERBLOCK_SLOT_SIZE, 4096);
+}
+
+#[test]
+fn endian_key_and_page_offset_contracts() {
+    let mut buf = [0u8; 16];
+    write_u16_le(&mut buf, 1, 0xAABB).unwrap();
+    write_u32_le(&mut buf, 3, 0x1122_3344).unwrap();
+    write_u64_le(&mut buf, 8, 0x0102_0304_0506_0708).unwrap();
+    assert_eq!(buf[1..3], [0xBB, 0xAA]);
+    assert_eq!(buf[3..7], [0x44, 0x33, 0x22, 0x11]);
+    assert_eq!(buf[8..16], [0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+    assert_eq!(read_u16_le(&buf, 1).unwrap(), 0xAABB);
+    assert_eq!(read_u32_le(&buf, 3).unwrap(), 0x1122_3344);
+    assert_eq!(read_u64_le(&buf, 8).unwrap(), 0x0102_0304_0506_0708);
+
+    assert_eq!(
+        read_u32_le(&buf, usize::MAX - 1).unwrap_err(),
+        EngineError::Serialization(format!("u32 offset overflow at {}", usize::MAX - 1))
+    );
+    assert_eq!(
+        read_u64_le(&buf, 9).unwrap_err(),
+        EngineError::Serialization("u64 out of bounds at 9".into())
+    );
+    assert!(write_u16_le(&mut buf, 15, 1).is_err());
+
+    let prefix = [0xff, 0x12, 0x34, 0x56, 0x78, 0xee];
+    assert_eq!(
+        unsafe_read_struct::<u32>(&prefix[1..]).unwrap(),
+        u32::from_ne_bytes([0x12, 0x34, 0x56, 0x78])
+    );
+    assert_eq!(
+        unsafe_read_struct::<u64>(&[0; 7]).unwrap_err(),
+        EngineError::Serialization("short struct read: need 8, got 7".into())
+    );
+
+    assert_eq!(compare_keys(b"a", b"a"), Ordering::Equal);
+    assert_eq!(compare_keys(b"a", b"b"), Ordering::Less);
+    assert_eq!(compare_keys(b"ab", b"a"), Ordering::Greater);
+    assert_eq!(compare_keys(&[0x80], &[0x7f]), Ordering::Greater);
+    assert!(key_in_range(b"m", Some(b"a"), None, Some(b"z"), None));
+    assert!(!key_in_range(b"a", Some(b"a"), None, None, None));
+    assert!(key_in_range(b"a", None, Some(b"a"), None, Some(b"a")));
+
+    assert!(validate_store_name(&"n".repeat(MAX_STORE_NAME_BYTES)).is_ok());
+    assert_eq!(
+        validate_store_name(&"n".repeat(MAX_STORE_NAME_BYTES + 1)).unwrap_err(),
+        EngineError::StoreNameTooLong(MAX_STORE_NAME_BYTES + 1)
+    );
+    assert!(validate_key(&vec![0; MAX_KEY_BYTES]).is_ok());
+    assert_eq!(
+        validate_key(&vec![0; MAX_KEY_BYTES + 1]).unwrap_err(),
+        EngineError::KeyTooLarge(MAX_KEY_BYTES + 1)
+    );
+    assert_eq!(MAX_VALUE_BYTES, 8 * 1024 * 1024);
+    assert!(validate_value(&vec![0; MAX_VALUE_BYTES]).is_ok());
+    assert_eq!(
+        validate_value(&vec![0; MAX_VALUE_BYTES + 1]).unwrap_err(),
+        EngineError::ValueTooLarge(MAX_VALUE_BYTES + 1)
+    );
+
+    assert_eq!(page_offset(0), 0);
+    assert_eq!(page_offset(1), 0);
+    assert_eq!(page_offset(2), PAGE_SIZE as u64);
+    let max_fit = u64::MAX / PAGE_SIZE as u64;
+    assert_eq!(page_offset(max_fit + 1), max_fit * PAGE_SIZE as u64);
+    assert_eq!(page_offset(max_fit + 2), u64::MAX);
+    assert_eq!(page_offset(u64::MAX), u64::MAX);
 }

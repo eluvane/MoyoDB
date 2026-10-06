@@ -165,6 +165,67 @@ export function createTransportSuite({ WorkerProtocolClient, exposeWorkerApi, pr
         }
     });
 
+    test('queued request accessors are read once at the snapshot boundary', async () => {
+        const received = [];
+        let reads = 0;
+        const options = {
+            get ttl() {
+                return ++reads;
+            }
+        };
+        const h = await harness({
+            put: (_id, _store, _key, _value, opts) => received.push(opts.ttl)
+        });
+        try {
+            await Promise.all([
+                h.client.put(1, 'kv', new Uint8Array([1]), new Uint8Array([2]), options),
+                h.client.put(1, 'kv', new Uint8Array([3]), new Uint8Array([4]), { ttl: 17 })
+            ]);
+            assert.equal(reads, 1);
+            assert.deepEqual(received, [1, 17]);
+        } finally {
+            h.dispose();
+        }
+    });
+
+    test('queued response accessors are read once at the snapshot boundary', async () => {
+        let reads = 0;
+        const h = await harness({
+            get: () => ({
+                get value() {
+                    return ++reads;
+                }
+            })
+        });
+        try {
+            const values = await Promise.all([
+                h.client.get(1, 'kv', new Uint8Array([1])),
+                h.client.get(1, 'kv', new Uint8Array([2]))
+            ]);
+            assert.equal(reads, 2);
+            assert.deepEqual(values, [{ value: 1 }, { value: 2 }]);
+        } finally {
+            h.dispose();
+        }
+    });
+
+    test('queued responses preserve an own __proto__ data property', async () => {
+        const h = await harness({ get: () => JSON.parse('{"__proto__":{"marker":"data"}}') });
+        try {
+            const values = await Promise.all([
+                h.client.get(1, 'kv', new Uint8Array([1])),
+                h.client.get(1, 'kv', new Uint8Array([2]))
+            ]);
+            for (const value of values) {
+                assert.equal(Object.getPrototypeOf(value), Object.prototype);
+                assert.equal(Object.hasOwn(value, '__proto__'), true);
+                assert.deepEqual(value.__proto__, { marker: 'data' });
+            }
+        } finally {
+            h.dispose();
+        }
+    });
+
     test('single partial views arrive intact and caller buffers remain reusable', async () => {
         const received = [];
         const h = await harness({
@@ -922,7 +983,14 @@ export function createTransportSuite({ WorkerProtocolClient, exposeWorkerApi, pr
             const replies = h.toClient.filter(({ data }) => data.type !== protocol.WORKER_PROTOCOL_READY);
             for (const { data } of replies) {
                 const items = data.responses ?? [data];
-                const bytes = items.reduce((sum, item) => sum + protocol.captureWorkerPayload(item, []).byteLength, 0);
+                // The wire snapshot already owns these bytes. Transfer them into the
+                // production size estimate so it does not structuredClone the payloads again.
+                const bytes = items.reduce((sum, item) => {
+                    return (
+                        sum +
+                        protocol.captureWorkerPayload(item, protocol.collectTransferablesForValue(item)).byteLength
+                    );
+                }, 0);
                 assert.ok(items.length === 1 || bytes <= protocol.MAX_WORKER_BATCH_BYTES);
             }
             assert.equal(

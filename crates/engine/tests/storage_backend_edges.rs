@@ -55,6 +55,12 @@ fn memory_backend_rejects_operations_after_close() {
     backend.close().unwrap();
 
     assert_storage_error(backend.read_at(0, 1));
+    let mut buf = [0xAB];
+    assert_storage_error(backend.read_at_into(0, &mut buf));
+    assert_eq!(buf, [0xAB]);
+    let mut owned = b"keep".to_vec();
+    assert_storage_error(backend.read_at_into_vec(0, 1, &mut owned));
+    assert_eq!(owned, b"keep");
     assert_storage_error(backend.write_at(0, b"y"));
     assert_storage_error(backend.flush());
     assert_storage_error(backend.len());

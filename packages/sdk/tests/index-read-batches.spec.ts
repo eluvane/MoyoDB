@@ -122,15 +122,25 @@ test('paged compressed index reads preserve duplicate order, TTL filtering and o
                 await db.createStore('docs', { compression: 'gzip' });
             }
         });
-        const body = 'compressed indexed document '.repeat(80);
+        // 36 repeats keeps every document above the 1024-byte compression threshold.
+        const body = 'compressed indexed document '.repeat(36);
         const keyFor = (id: number) => sdk.utf8Encode(String(id).padStart(4, '0'));
         const value = (id: number, group = 'G') => sdk.jsonEncode({ id, group, body });
         try {
             const seed = await db.begin('readwrite');
             try {
+                const expired: Array<[Uint8Array, Uint8Array]> = [];
+                const live: Array<[Uint8Array, Uint8Array]> = [];
                 for (let id = 0; id < 300; id += 1) {
-                    await seed.put('docs', keyFor(id), value(id), id < 24 ? { ttl: 0 } : {});
+                    const entry: [Uint8Array, Uint8Array] = [keyFor(id), value(id)];
+                    if (id < 24) {
+                        expired.push(entry);
+                    } else {
+                        live.push(entry);
+                    }
                 }
+                await seed.putMany('docs', expired, { ttl: 0 });
+                await seed.putMany('docs', live);
                 await seed.commit();
             } finally {
                 await seed.rollback().catch(() => undefined);
