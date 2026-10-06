@@ -50,7 +50,7 @@ fn engine_commit_hashes_shared_payload_once_with_full_page_and_wal_coverage() ->
         let pages = committed.page_images.len();
         let page_and_record_headers = overflow * (PAGE_HEADER_SIZE + 12)
             + pages * (WAL_RECORD_HEADER_SIZE + WAL_PAGE_IMAGE_BODY_HEADER_SIZE);
-        let expected = count as usize * (len + VALUE_ENVELOPE_HEADER_SIZE + 14 + 2 + 4)
+        let expected = count as usize * (len + crate::payload::PAYLOAD_HEADER_SIZE)
             + page_and_record_headers
             + (pages - overflow) * PAGE_SIZE
             + wal_record_total_len(WAL_COMMIT_BODY_SIZE);
@@ -58,7 +58,10 @@ fn engine_commit_hashes_shared_payload_once_with_full_page_and_wal_coverage() ->
         let previous = pages
             * (PAGE_SIZE + WAL_RECORD_HEADER_SIZE + WAL_PAGE_IMAGE_BODY_HEADER_SIZE)
             + wal_record_total_len(WAL_COMMIT_BODY_SIZE);
-        assert!(previous - hashed >= count as usize * len);
+        assert_eq!(
+            hashed - previous,
+            count as usize * (len + crate::payload::PAYLOAD_HEADER_SIZE)
+        );
     }
     Ok(())
 }
@@ -81,6 +84,14 @@ fn fix_expiry(engine: &mut Engine<MemoryBackend>, tx: u64, store: &str, key: &[u
 
 fn complete_commit_bytes() -> Result<Vec<Vec<u8>>> {
     let (bundle, mut engine) = engine()?;
+    let frame = |value: &[u8]| {
+        let mut encoded = b"BDBZVAL1".to_vec();
+        encoded.extend_from_slice(&[1, 0]);
+        encoded.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        encoded.extend_from_slice(&crc32fast::hash(value).to_le_bytes());
+        encoded.extend_from_slice(value);
+        encoded
+    };
     let names = [
         "raw".to_string(),
         "ttl".to_string(),
@@ -147,9 +158,12 @@ fn complete_commit_bytes() -> Result<Vec<Vec<u8>>> {
         .collect();
     for (name_index, name) in names.iter().enumerate() {
         for (index, (&len, key)) in lengths.iter().zip(&keys).enumerate() {
-            let value: Vec<_> = (0..len)
+            let mut value: Vec<_> = (0..len)
                 .map(|offset| (offset * 197 + index * 29 + name_index) as u8)
                 .collect();
+            if name_index >= 2 {
+                value = frame(&value);
+            }
             engine.put_with_ttl(tx, name, key, &value, (name_index == 1).then_some(60_000))?;
             if name_index == 1 {
                 fix_expiry(&mut engine, tx, name, key)?;
@@ -169,7 +183,7 @@ fn complete_commit_bytes() -> Result<Vec<Vec<u8>>> {
         engine.put(tx, name, &keys[11], &vec![0x72; 16 * 1024])?;
     }
     engine.clear_store(tx, &names[2])?;
-    engine.put(tx, &names[2], &keys[3], &vec![0x31; 8192])?;
+    engine.put(tx, &names[2], &keys[3], &frame(&vec![0x31; 8192]))?;
     engine.commit_tx(tx)?;
     images.push(bundle.wal.durable_snapshot().unwrap());
 

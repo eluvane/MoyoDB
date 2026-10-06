@@ -201,6 +201,12 @@ if (failOnRegression && missingCases.length > 0) {
     );
     process.exit(1);
 }
+if (failOnRegression && unmatchedCases.length > 0) {
+    console.error(
+        `Benchmark regression gate failed: ${unmatchedCases.length} current case(s) lack a matching policy baseline.`
+    );
+    process.exit(1);
+}
 
 async function exists(filePath) {
     if (!filePath) {

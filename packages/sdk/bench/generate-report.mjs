@@ -115,6 +115,45 @@ for (const { file, report } of reports) {
     }
 }
 
+lines.push('');
+lines.push('## Dataset policies and separate phases');
+lines.push('');
+lines.push(
+    'Run time measures the workload callback; setup, verification, metrics collection and subsequent cleanup are excluded. Named recovery/snapshot callbacks can include lifecycle operations. Commit time sums explicit tx.commit calls; autocommit internals and backend I/O counts are unavailable through public APIs. Close includes drain/checkpoint work performed by the ordinary close API. Codec and change feed policies apply to MoyoDB; IndexedDB stores the same input bytes unchanged.'
+);
+lines.push('');
+lines.push(
+    '| File | Engine | Workload | Dataset | Moyo codec | Moyo feed | Commit p50 ms | Close p50 ms | Cleanup p50 ms | DB bytes p50 | Main bytes p50 | WAL bytes p50 |'
+);
+lines.push(
+    '| ---- | ------ | -------- | ------- | ---------- | --------- | ------------- | ------------ | -------------- | ------------ | -------------- | ------------- |'
+);
+for (const { file, report } of reports) {
+    for (const result of report.results) {
+        if (result.status !== 'ok') continue;
+        lines.push(
+            [
+                file,
+                result.engine,
+                result.workloadName,
+                result.policy?.dataset?.profile ?? 'unknown',
+                String(result.policy?.compression ?? 'unknown'),
+                String(result.policy?.changeFeed?.enabled ?? 'unknown'),
+                sampleMedian(result, 'explicitCommitMs'),
+                sampleMedian(result, 'closeMs'),
+                sampleMedian(result, 'cleanupMs'),
+                sampleMedian(result, 'databaseBytes'),
+                sampleMedian(result, 'mainBytes'),
+                sampleMedian(result, 'walBytes')
+            ]
+                .map((value) => tableText(value))
+                .join(' | ')
+                .replace(/^/, '| ')
+                .replace(/$/, ' |')
+        );
+    }
+}
+
 const parityRows = [];
 for (const { file, report } of reports) {
     const byWorkload = new Map();
@@ -155,7 +194,10 @@ lines.push('## Reading this report');
 lines.push('');
 lines.push('\\- Percentiles are computed from raw browser samples; warmups are excluded.\\');
 lines.push(
-    '\\- Compare only rows with matching workload, browser, record count, key/value size, batch size, and transaction boundaries.\\'
+    '\\- Compare only rows with matching workload, browser, record count, key/value size, batch size, transaction boundaries, dataset version/seed, codec settings, change feed policy and timing policy.\\'
+);
+lines.push(
+    '\\- Compression ratio describes stored bytes. It does not establish speed or equivalent stored representations.\\'
 );
 lines.push(
     '\\- Random-read rows name their request mode: sequential, pipelined, or bulk. Compare rows of the same mode across engines.\\'
@@ -172,6 +214,14 @@ console.log(`wrote ${join('bench', 'results', 'report.md')}`);
 
 function metric(value) {
     return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(2) : 'n/a';
+}
+
+function sampleMedian(result, field) {
+    const values = (result.sampleMetrics ?? [])
+        .map((sample) => sample[field])
+        .filter((value) => typeof value === 'number' && Number.isFinite(value))
+        .sort((a, b) => a - b);
+    return metric(values.length === 0 ? undefined : values[Math.ceil(values.length * 0.5) - 1]);
 }
 
 function tableText(value = '') {

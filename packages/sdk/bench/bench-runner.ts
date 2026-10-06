@@ -7,12 +7,13 @@ import type {
     BenchOptions,
     BenchReport,
     BenchResult,
+    BenchSampleMetrics,
     BrowserInfo,
     SampleContext,
     WorkloadRunner,
     WorkloadSpec
 } from './types';
-import { selectWorkloads } from './workloads';
+import { OPFS_DIAGNOSTIC_BYTES, selectWorkloads, workloadPolicy } from './workloads';
 
 const RUNNERS: Record<BenchEngine, WorkloadRunner> = {
     moyodb: moyoDbBaseline,
@@ -146,7 +147,8 @@ async function runOneWorkload(
     const warmupSamples: number[] = [];
     const rawSamples: number[] = [];
     const contentChecksums: Array<string | null> = [];
-    const base: Omit<BenchResult, 'status' | 'warmupSamples' | 'rawSamples' | 'contentChecksums'> = {
+    const sampleMetrics: BenchSampleMetrics[] = [];
+    const base: Omit<BenchResult, 'status' | 'warmupSamples' | 'rawSamples' | 'contentChecksums' | 'sampleMetrics'> = {
         engine: runner.engine,
         workloadName: workload.name,
         browser: settings.browser,
@@ -156,6 +158,7 @@ async function runOneWorkload(
         valueSize: workload.valueSize,
         batchSize: workload.batchSize,
         transactionBoundaries: workload.transactionBoundaries,
+        policy: workloadPolicy(workload),
         warmupCount,
         sampleCount,
         notes: workload.notes
@@ -176,6 +179,7 @@ async function runOneWorkload(
             warmupSamples,
             rawSamples,
             contentChecksums,
+            sampleMetrics,
             notes: `${workload.notes} Not applicable to ${runner.engine}.`
         };
     }
@@ -191,13 +195,14 @@ async function runOneWorkload(
             await yieldToBrowser();
         }
         for (let i = 0; i < sampleCount; i += 1) {
-            const { elapsed, checksum } = await runPreparedSample(
+            const { elapsed, checksum, metrics } = await runPreparedSample(
                 runner,
                 sampleContext('sample', i),
                 workloadTimeoutMs
             );
             rawSamples.push(elapsed);
             contentChecksums.push(checksum);
+            sampleMetrics.push(metrics);
             console.info(
                 `[bench] sample ${runner.engine}/${workload.name} ${i + 1}/${sampleCount}: ${elapsed.toFixed(2)}ms`
             );
@@ -211,6 +216,7 @@ async function runOneWorkload(
                 warmupSamples,
                 rawSamples,
                 contentChecksums,
+                sampleMetrics,
                 error: 'benchmark sample timings were empty or non-finite'
             };
         }
@@ -220,6 +226,7 @@ async function runOneWorkload(
             warmupSamples,
             rawSamples,
             contentChecksums,
+            sampleMetrics,
             stats: computeStats(rawSamples)
         };
     } catch (error) {
@@ -231,6 +238,7 @@ async function runOneWorkload(
                 warmupSamples,
                 rawSamples,
                 contentChecksums,
+                sampleMetrics,
                 notes: `${workload.notes} ${error.message}`
             };
         }
@@ -243,6 +251,7 @@ async function runOneWorkload(
             warmupSamples,
             rawSamples,
             contentChecksums,
+            sampleMetrics,
             error: error instanceof Error ? `${error.name}: ${error.message}` : String(error)
         };
     }
@@ -537,11 +546,30 @@ function yieldToBrowser(): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-async function runPreparedSample(
+export async function runPreparedSample(
     runner: WorkloadRunner,
     ctx: SampleContext,
     timeoutMs: number | undefined
-): Promise<{ elapsed: number; checksum: string | null }> {
+): Promise<{ elapsed: number; checksum: string | null; metrics: BenchSampleMetrics }> {
+    const metrics: BenchSampleMetrics = {
+        explicitCommitMs: null,
+        explicitCommitCount: 0,
+        verificationMs: 0,
+        cleanupMs: 0,
+        closeMs: null,
+        logicalValueBytes:
+            ctx.workload.name === 'opfs_raw_write_100mb'
+                ? OPFS_DIAGNOSTIC_BYTES
+                : ctx.workload.recordCount * ctx.workload.valueSize,
+        databaseBytes: null,
+        manifestBytes: null,
+        mainBytes: null,
+        walBytes: null,
+        backendReads: null,
+        backendWrites: null,
+        backendFlushes: null
+    };
+    let collected: Partial<BenchSampleMetrics> = {};
     const cleanup = await withOptionalTimeout(
         Promise.resolve(runner.prepare?.(ctx)),
         timeoutMs,
@@ -555,15 +583,29 @@ async function runPreparedSample(
             `${runner.engine}/${ctx.workload.name} sample timed out after ${timeoutMs}ms`
         );
         const elapsed = performance.now() - started;
+        collected = await withOptionalTimeout(
+            Promise.resolve(runner.metrics?.(ctx) ?? {}),
+            timeoutMs,
+            `${runner.engine}/${ctx.workload.name} metrics timed out after ${timeoutMs}ms`
+        );
+        Object.assign(metrics, collected);
+        const verificationStarted = performance.now();
         const checksum = await withOptionalTimeout(
             Promise.resolve(runner.verify?.(ctx) ?? null),
             timeoutMs,
             `${runner.engine}/${ctx.workload.name} verification timed out after ${timeoutMs}ms`
         );
-        return { elapsed, checksum };
+        metrics.verificationMs = performance.now() - verificationStarted;
+        return { elapsed, checksum, metrics };
     } finally {
-        await cleanup?.();
-        await runner.cleanup?.(ctx);
+        const cleanupStarted = performance.now();
+        try {
+            await cleanup?.();
+        } finally {
+            await runner.cleanup?.(ctx);
+            Object.assign(metrics, collected);
+            metrics.cleanupMs = performance.now() - cleanupStarted;
+        }
     }
 }
 

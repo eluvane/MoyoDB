@@ -1,6 +1,47 @@
 export type BenchEngine = 'moyodb' | 'indexeddb';
 export type BenchStatus = 'ok' | 'skipped' | 'error';
 export type BenchProfile = 'smoke' | 'standard' | 'full';
+export type DatasetProfile =
+    'lcg-repeat-256' | 'high-entropy-binary' | 'realistic-json' | 'realistic-text' | 'precompressed';
+export type BenchCompression = false | 'snappy' | 'gzip' | 'deflate';
+
+export interface BenchPolicy {
+    dataset: { profile: DatasetProfile; version: 1; seed: number };
+    /** MoyoDB store codec. IndexedDB writes the same input bytes without this codec. */
+    compression: BenchCompression;
+    compressionTuning: {
+        algorithm: 'snappy-raw-block';
+        algorithmVersion: number;
+        thresholdBytes: number;
+        minimumSavingPercent: number;
+        envelopeBytes: number;
+        sampling: {
+            minimumInputBytes: number;
+            windowBytes: number;
+            windowCount: number;
+            positioning: 'start-middle-end';
+            profitability: 'aggregate-size-plus-one-envelope';
+        };
+    };
+    changeFeed: { enabled: boolean; retainTxids: number | null };
+    timing: 'run-callback-only-v1';
+}
+
+export interface BenchSampleMetrics {
+    explicitCommitMs: number | null;
+    explicitCommitCount: number;
+    verificationMs: number;
+    cleanupMs: number;
+    closeMs: number | null;
+    logicalValueBytes: number;
+    databaseBytes: number | null;
+    manifestBytes: number | null;
+    mainBytes: number | null;
+    walBytes: number | null;
+    backendReads: number | null;
+    backendWrites: number | null;
+    backendFlushes: number | null;
+}
 
 export interface WorkloadSpec {
     name: string;
@@ -15,6 +56,7 @@ export interface WorkloadSpec {
     tags?: string[];
     smoke?: boolean;
     supports: BenchEngine[];
+    policy?: BenchPolicy;
 }
 
 export interface SampleContext {
@@ -36,6 +78,7 @@ export interface WorkloadRunner {
      */
     verify?(ctx: SampleContext): Promise<string | null>;
     cleanup?(ctx: SampleContext): Promise<void>;
+    metrics?(ctx: SampleContext): Promise<Partial<BenchSampleMetrics>>;
 }
 
 export interface BenchOptions {
@@ -99,12 +142,14 @@ export interface BenchResult {
     valueSize: number;
     batchSize: number;
     transactionBoundaries: string;
+    policy: BenchPolicy;
     warmupCount: number;
     sampleCount: number;
     warmupSamples: number[];
     rawSamples: number[];
     /** One entry per measured sample, aligned with `rawSamples`. */
     contentChecksums: Array<string | null>;
+    sampleMetrics: BenchSampleMetrics[];
     stats?: BenchStats;
     notes: string;
     error?: string;

@@ -31,9 +31,15 @@ The SDK golden file and public interface fixture live under
 SDK source directory and the target JSON path. `compatibility-v1-types.ts` is a
 copy of the baseline `packages/sdk/src/types.ts`.
 
-These fixtures pin observable 1.0.1 formats and public interfaces. Storage format 1
-includes the existing manifest, page, WAL, catalog, value and index encodings.
-Snapshot readers accept v1, v2 and v3; writers emit v3. The API checks permit
-additions while retaining old exports and consumer signatures. An incompatible
-format requires a distinct version and an explicit migration path. These tests
-do not promise that an old reader can open every future format.
+These fixtures pin historical 1.0.1 formats and public interfaces. Their bytes and
+recorded hashes remain unchanged. Version 1.2.0 creates fresh databases with
+storage format 2 and rejects these format 1 database files without changing them.
+No in-place migration is provided. Current-format recovery tests generate a fresh
+manifest instead of changing the historical fixtures.
+
+Self-contained snapshot readers still accept v1, v2 and v3; writers emit v3.
+Snapshot tests import the historical data into fresh format 2 databases and check
+that it remains writable. Historical page, WAL, key and index vectors remain
+byte-encoding checks. API checks permit additions while retaining old exports
+and consumer signatures. These tests do not promise that an old reader can open
+the current database format.

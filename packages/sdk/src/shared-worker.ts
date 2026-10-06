@@ -1,4 +1,4 @@
-import type { WorkerApi, WorkerOpenRequest } from './worker-api';
+import type { WorkerApi, WorkerOpenRequest, WorkerScanPageRequest } from './worker-api';
 import { WorkerProtocolClient } from './worker-client';
 import { exposeWorkerApi, type WorkerServerHandle, type WorkerServerScope } from './worker-server';
 import {
@@ -51,6 +51,9 @@ interface Session {
     closing: boolean;
     nextTxId: number;
     transactions: Map<number, number>;
+    nextCursorId: number;
+    cursors: Map<number, { ownerId: number; localTxId?: number }>;
+    cursorGeneration: number;
     pending: Set<Promise<unknown>>;
     lastSeen: number;
     closingPromise: Promise<void> | null;
@@ -95,6 +98,9 @@ export class SharedWorkerCoordinator {
             closing: false,
             nextTxId: 1,
             transactions: new Map(),
+            nextCursorId: 1,
+            cursors: new Map(),
+            cursorGeneration: 0,
             pending: new Set(),
             lastSeen: Date.now(),
             closingPromise: null
@@ -131,7 +137,13 @@ export class SharedWorkerCoordinator {
             if (data.op === 'ping') {
                 reply();
             } else if (data.op === 'detach') {
-                void this.closeSession(session).catch((error) => this.failAll(error));
+                void this.closeSession(session).then(
+                    () => reply(),
+                    (error) => {
+                        reply(error);
+                        this.failAll(error);
+                    }
+                );
             } else if (data.op === 'crash') {
                 this.failAll(
                     workerProtocolError(
@@ -192,7 +204,9 @@ export class SharedWorkerCoordinator {
                 if (
                     args[0] === 'readwrite' &&
                     this.migrationOwner === session &&
-                    Array.from(this.sessions).some((client) => client !== session && client.transactions.size > 0)
+                    Array.from(this.sessions).some(
+                        (client) => client !== session && (client.transactions.size > 0 || client.cursors.size > 0)
+                    )
                 ) {
                     throw workerProtocolError(
                         'DatabaseBusyError',
@@ -203,6 +217,58 @@ export class SharedWorkerCoordinator {
                 const localTxId = session.nextTxId++;
                 session.transactions.set(localTxId, ownerTxId);
                 return localTxId;
+            }
+            if (command === 'scanPage') {
+                if (!isRecord(args[0])) throw workerProtocolError('WorkerProtocolError', 'invalid scan page request');
+                const request = args[0] as unknown as WorkerScanPageRequest;
+                const localCursorId = request.cursorId;
+                const cursor = localCursorId === undefined ? undefined : session.cursors.get(localCursorId);
+                if (localCursorId !== undefined && !cursor) {
+                    throw workerProtocolError(
+                        'TransactionClosedError',
+                        'scan cursor does not belong to this shared client'
+                    );
+                }
+                if (cursor && cursor.localTxId !== request.txId) {
+                    throw workerProtocolError(
+                        'TransactionClosedError',
+                        'scan cursor does not belong to this transaction'
+                    );
+                }
+                const ownerTxId = request.txId === undefined ? undefined : session.transactions.get(request.txId);
+                if (request.txId !== undefined && ownerTxId === undefined) {
+                    throw workerProtocolError(
+                        'TransactionClosedError',
+                        'transaction does not belong to this shared client'
+                    );
+                }
+                const generation = session.cursorGeneration;
+                const page = await owner.proxy.scanPage({ ...request, txId: ownerTxId, cursorId: cursor?.ownerId });
+                if (generation !== session.cursorGeneration || this.owner !== owner) {
+                    if (page.cursorId !== undefined && this.owner === owner)
+                        await owner.proxy.closeCursor(page.cursorId);
+                    throw workerProtocolError('TransactionClosedError', 'scan snapshot was invalidated');
+                }
+                if (localCursorId !== undefined) session.cursors.delete(localCursorId);
+                if (page.cursorId === undefined) return page;
+                const nextCursorId = localCursorId ?? session.nextCursorId++;
+                session.cursors.set(nextCursorId, { ownerId: page.cursorId, localTxId: request.txId });
+                return { ...page, cursorId: nextCursorId };
+            }
+            if (command === 'closeCursor') {
+                const cursor = session.cursors.get(args[0] as number);
+                if (!cursor) {
+                    throw workerProtocolError(
+                        'TransactionClosedError',
+                        'scan cursor does not belong to this shared client'
+                    );
+                }
+                try {
+                    await owner.proxy.closeCursor(cursor.ownerId);
+                } finally {
+                    session.cursors.delete(args[0] as number);
+                }
+                return;
             }
             if (TRANSACTION_COMMANDS.has(command) || (command === 'getIndexes' && args[0] !== undefined)) {
                 const localTxId = args[0] as number;
@@ -216,7 +282,12 @@ export class SharedWorkerCoordinator {
                 try {
                     return await owner.proxy.request(command, [ownerTxId, ...args.slice(1)] as never);
                 } finally {
-                    if (command === 'commit' || command === 'rollback') session.transactions.delete(localTxId);
+                    if (command === 'commit' || command === 'rollback') {
+                        session.transactions.delete(localTxId);
+                        for (const [cursorId, cursor] of session.cursors) {
+                            if (cursor.localTxId === localTxId) session.cursors.delete(cursorId);
+                        }
+                    }
                 }
             }
             if (MAINTENANCE_COMMANDS.has(command)) {
@@ -321,7 +392,7 @@ export class SharedWorkerCoordinator {
             this.pendingOwners.set(id, { session, resolve, reject, timeout });
             session.port.postMessage({ type: SHARED_WORKER_OWNER_REQUEST, id });
         });
-        const proxy = new WorkerProtocolClient(port, { readyTimeoutMs: 10_000 });
+        const proxy = new WorkerProtocolClient(port, { readyTimeoutMs: 10_000, forwardScanPackets: true });
         const owner: Owner = { port, hostPort, proxy, request, session, lastSeen: Date.now() };
         proxy.setFatalHandler((error) => this.failAll(error));
         hostPort.addEventListener('message', (event: MessageEvent<unknown>) => {
@@ -343,9 +414,10 @@ export class SharedWorkerCoordinator {
             await Promise.allSettled(Array.from(session.pending));
             const owner = this.owner;
             if (owner && session.opened) {
-                const results = await Promise.allSettled(
-                    Array.from(session.transactions.values(), (id) => owner.proxy.rollback(id))
-                );
+                const results = await Promise.allSettled([
+                    ...Array.from(session.cursors.values(), (cursor) => owner.proxy.closeCursor(cursor.ownerId)),
+                    ...Array.from(session.transactions.values(), (id) => owner.proxy.rollback(id))
+                ]);
                 const failure = results.find(
                     (result) => result.status === 'rejected' && result.reason?.name !== 'TransactionClosedError'
                 );
@@ -355,6 +427,8 @@ export class SharedWorkerCoordinator {
                 }
             }
             session.transactions.clear();
+            session.cursors.clear();
+            session.cursorGeneration += 1;
             session.opened = false;
             this.releaseMigration(session);
             session.server?.close();
@@ -422,6 +496,8 @@ export class SharedWorkerCoordinator {
     private invalidateTransactions(): void {
         for (const session of this.sessions) {
             session.transactions.clear();
+            session.cursors.clear();
+            session.cursorGeneration += 1;
             if (session.opened) session.port.postMessage({ type: SHARED_WORKER_INVALIDATE_TRANSACTIONS });
         }
     }
@@ -502,6 +578,8 @@ export class SharedWorkerCoordinator {
             session.opened = false;
             session.closing = true;
             session.transactions.clear();
+            session.cursors.clear();
+            session.cursorGeneration += 1;
             session.server?.close();
             this.releaseMigration(session);
         }

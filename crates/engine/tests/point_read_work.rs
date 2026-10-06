@@ -1,8 +1,9 @@
 use moyodb_engine::catalog::ChangeFeedPolicy;
 use moyodb_engine::engine::{Engine, OpenConfig, TxMode};
 use moyodb_engine::error::{EngineError, Result};
-use moyodb_engine::layout::{page_offset, PageKind, PAGE_SIZE};
-use moyodb_engine::page::{decode_page, encode_overflow_page};
+use moyodb_engine::layout::{page_offset, PageKind, ValueKind, PAGE_SIZE};
+use moyodb_engine::page::{decode_page, encode_leaf_page, encode_overflow_page};
+use moyodb_engine::payload::{decode_payload_descriptor, PayloadRef};
 use moyodb_engine::storage::backend::{FileBackend, FileSet};
 use moyodb_engine::storage::memory::MemoryBackend;
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -84,6 +85,7 @@ const MAX_FIXTURE_PAGES: usize = 256;
 
 struct ReadWork {
     reads: [AtomicUsize; MAX_FIXTURE_PAGES],
+    body_reads: [AtomicUsize; MAX_FIXTURE_PAGES],
     failures: [AtomicBool; MAX_FIXTURE_PAGES],
 }
 
@@ -91,6 +93,7 @@ impl ReadWork {
     fn new() -> Self {
         Self {
             reads: std::array::from_fn(|_| AtomicUsize::new(0)),
+            body_reads: std::array::from_fn(|_| AtomicUsize::new(0)),
             failures: std::array::from_fn(|_| AtomicBool::new(false)),
         }
     }
@@ -99,10 +102,17 @@ impl ReadWork {
         for count in &self.reads {
             count.store(0, Ordering::Relaxed);
         }
+        for count in &self.body_reads {
+            count.store(0, Ordering::Relaxed);
+        }
     }
 
     fn reads(&self, page: u64) -> usize {
         self.reads[page as usize].load(Ordering::Relaxed)
+    }
+
+    fn body_reads(&self, page: u64) -> usize {
+        self.body_reads[page as usize].load(Ordering::Relaxed)
     }
 
     fn fail(&self, page: u64, enabled: bool) {
@@ -118,13 +128,17 @@ struct CountingBackend {
 impl FileBackend for CountingBackend {
     fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
         if let Some(work) = &self.work {
-            assert_eq!(len, PAGE_SIZE, "main-file reads must be complete pages");
-            assert_eq!(offset % PAGE_SIZE as u64, 0);
-            let page = offset / PAGE_SIZE as u64 + 1;
-            assert!((page as usize) < MAX_FIXTURE_PAGES);
-            work.reads[page as usize].fetch_add(1, Ordering::Relaxed);
-            if work.failures[page as usize].load(Ordering::Relaxed) {
-                return Err(EngineError::Storage(format!("injected main page {page}")));
+            let first = offset / PAGE_SIZE as u64 + 1;
+            let last = (offset + len as u64 - 1) / PAGE_SIZE as u64 + 1;
+            assert!((last as usize) < MAX_FIXTURE_PAGES);
+            for page in first..=last {
+                work.reads[page as usize].fetch_add(1, Ordering::Relaxed);
+                if !offset.is_multiple_of(PAGE_SIZE as u64) {
+                    work.body_reads[page as usize].fetch_add(1, Ordering::Relaxed);
+                }
+                if work.failures[page as usize].load(Ordering::Relaxed) {
+                    return Err(EngineError::Storage(format!("injected main page {page}")));
+                }
             }
         }
         self.inner.read_at(offset, len)
@@ -165,7 +179,15 @@ struct Fixture {
 impl Fixture {
     fn new(entries: &[(Vec<u8>, Vec<u8>)], cache_pages: usize) -> Result<Self> {
         assert!(entries.len() <= 32);
-        assert!(entries.iter().all(|(_, value)| value.len() <= 16 * 1024));
+        assert!(entries.iter().all(|(_, value)| value.len() <= 64 * 1024));
+        assert!(
+            entries
+                .iter()
+                .map(|(_, value)| value.len().div_ceil(PAGE_SIZE))
+                .sum::<usize>()
+                + entries.len() * 3
+                < MAX_FIXTURE_PAGES
+        );
         let files: [MemoryBackend; 3] = std::array::from_fn(|_| MemoryBackend::new());
         let mut engine = Engine::open(
             "point-read-work",
@@ -256,6 +278,36 @@ impl Fixture {
                 .next_overflow_page_id;
         }
         pages
+    }
+
+    fn external_reference(&self, key: &[u8]) -> PayloadRef {
+        let leaf = *self.path(key).last().unwrap();
+        let node = decode_page(page_bytes(&self.images[1], leaf)).unwrap();
+        let cell = node.leaf_cells.iter().find(|cell| cell.key == key).unwrap();
+        assert_eq!(cell.value_kind, ValueKind::External);
+        decode_payload_descriptor(
+            cell.overflow_head_page_id,
+            cell.total_value_len,
+            &cell.value,
+        )
+        .unwrap()
+        .0
+    }
+
+    fn expire_external(mut self, key: &[u8]) -> Result<Self> {
+        let leaf = *self.path(key).last().unwrap();
+        let mut node = decode_page(page_bytes(&self.images[1], leaf))?;
+        let cell = node
+            .leaf_cells
+            .iter_mut()
+            .find(|cell| cell.key == key)
+            .unwrap();
+        assert_eq!(cell.value_kind, ValueKind::External);
+        cell.value[16..24].copy_from_slice(&1u64.to_le_bytes());
+        let image = encode_leaf_page(leaf, 0, node.header.right_sibling_page_id, &node.leaf_cells)?;
+        let start = page_offset(leaf) as usize;
+        self.images[1][start..start + PAGE_SIZE].copy_from_slice(&image);
+        Self::open_images(self.images, self.cache_pages)
     }
 
     // A fixed expired timestamp avoids timers and commit-time TTL removal.
@@ -476,6 +528,141 @@ fn get_checks_expired_overflow_tail_and_readwrite_still_cleans_it_up() -> Result
         old_root,
         "readwrite get must stage expired-key deletion"
     );
+    Ok(())
+}
+
+#[test]
+fn external_has_reads_only_metadata_and_get_preserves_the_hot_leaf() -> Result<()> {
+    let value = vec![0x53; 64 * 1024];
+    let mut fixture = Fixture::new(&[(b"external".to_vec(), value.clone())], 1)?;
+    let payload = fixture.external_reference(b"external");
+    let leaf = *fixture.path(b"external").last().unwrap();
+    let tx = fixture.engine.begin_tx(TxMode::Readonly)?;
+    assert!(fixture.engine.has(tx, "kv", b"external")?);
+    fixture.work.reset();
+    let (exists, allocation) = allocation_work(|| fixture.engine.has(tx, "kv", b"external"));
+    assert!(exists?);
+    assert_eq!(allocation.allocations, 0);
+    for page in payload.first_page_id..payload.end_page_id()? {
+        assert_eq!(fixture.work.reads(page), 0, "has read payload page {page}");
+    }
+    assert_eq!(
+        fixture.engine.get(tx, "kv", b"external")?,
+        Some(value.clone())
+    );
+    fixture.work.reset();
+    fixture.work.fail(leaf, true);
+    assert_eq!(fixture.engine.get(tx, "kv", b"external")?, Some(value));
+    assert_eq!(
+        fixture.work.reads(leaf),
+        0,
+        "external body evicted the hot leaf"
+    );
+    for page in payload.first_page_id..payload.end_page_id()? {
+        assert_eq!(
+            fixture.work.body_reads(page),
+            1,
+            "external body read page {page} twice"
+        );
+    }
+    fixture.work.fail(leaf, false);
+    fixture.engine.rollback_tx(tx)?;
+    Ok(())
+}
+
+#[test]
+fn duplicate_get_many_reads_each_external_body_once() -> Result<()> {
+    let a = vec![0x31; 64 * 1024];
+    let b = vec![0x42; 64 * 1024];
+    let mut fixture = Fixture::new(&[(b"a".to_vec(), a.clone()), (b"b".to_vec(), b.clone())], 1)?;
+    let payloads = [
+        fixture.external_reference(b"a"),
+        fixture.external_reference(b"b"),
+    ];
+    let tx = fixture.engine.begin_tx(TxMode::Readonly)?;
+    fixture.work.reset();
+    let mut actual =
+        fixture
+            .engine
+            .get_many(tx, "kv", &[b"b".as_slice(), b"a", b"b", b"missing", b"a"])?;
+    assert_eq!(
+        actual,
+        vec![Some(b.clone()), Some(a.clone()), Some(b), None, Some(a)]
+    );
+    actual[0].as_mut().unwrap()[0] = 0x99;
+    assert_eq!(actual[2].as_ref().unwrap()[0], 0x42);
+    for payload in payloads {
+        assert_eq!(
+            fixture.work.reads(payload.first_page_id),
+            2,
+            "expected one header and one body read"
+        );
+        for page in payload.first_page_id..payload.end_page_id()? {
+            assert_eq!(
+                fixture.work.body_reads(page),
+                1,
+                "duplicate external body read page {page}"
+            );
+        }
+    }
+    fixture.engine.rollback_tx(tx)?;
+    Ok(())
+}
+
+#[test]
+fn external_get_many_preserves_sorted_storage_error_order() -> Result<()> {
+    let value = vec![0x31; 64 * 1024];
+    let mut fixture = Fixture::new(
+        &[
+            (b"a".to_vec(), value.clone()),
+            (b"b".to_vec(), vec![0x42; 64 * 1024]),
+        ],
+        1,
+    )?;
+    let tail_a = fixture.external_reference(b"a").end_page_id()? - 1;
+    let head_b = fixture.external_reference(b"b").first_page_id;
+    fixture.work.fail(tail_a, true);
+    fixture.work.fail(head_b, true);
+    let tx = fixture.engine.begin_tx(TxMode::Readonly)?;
+    assert_eq!(
+        fixture
+            .engine
+            .get_many(tx, "kv", &[b"b".as_slice(), b"a"])
+            .unwrap_err(),
+        EngineError::Storage(format!("injected main page {tail_a}"))
+    );
+    fixture.work.fail(tail_a, false);
+    fixture.work.fail(head_b, false);
+    assert_eq!(fixture.engine.get(tx, "kv", b"a")?, Some(value));
+    fixture.engine.rollback_tx(tx)?;
+    Ok(())
+}
+
+#[test]
+fn external_get_checks_expired_tail_and_readwrite_cleans_it_up() -> Result<()> {
+    let mut fixture = Fixture::new(&[(b"expired".to_vec(), vec![0x31; 64 * 1024])], 1)?
+        .expire_external(b"expired")?;
+    let tail = fixture.external_reference(b"expired").end_page_id()? - 1;
+    let tx = fixture.engine.begin_tx(TxMode::Readonly)?;
+    fixture.work.fail(tail, true);
+    assert!(matches!(
+        fixture.engine.get(tx, "kv", b"expired"),
+        Err(EngineError::Storage(_))
+    ));
+    assert!(!fixture.engine.has(tx, "kv", b"expired")?);
+    fixture.work.fail(tail, false);
+    assert_eq!(fixture.engine.get(tx, "kv", b"expired")?, None);
+    fixture.engine.rollback_tx(tx)?;
+    let old_root = fixture.root();
+    let tx = fixture.engine.begin_tx(TxMode::Readwrite)?;
+    assert_eq!(
+        fixture
+            .engine
+            .get_many(tx, "kv", &[b"expired".as_slice(), b"expired"])?,
+        vec![None, None]
+    );
+    fixture.engine.commit_tx(tx)?;
+    assert_ne!(fixture.root(), old_root);
     Ok(())
 }
 

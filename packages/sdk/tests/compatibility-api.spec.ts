@@ -43,8 +43,11 @@ const _compatibleDelete: (name: string) => Promise<void> = sdk.deleteDB;
 const _compatibleCrash: (name: string) => boolean = sdk.unsafeDebugCrashWorker;
 const _compatibleDb = (db: sdk.DB): V1.DB => db;
 const _compatibleTransaction = (transaction: sdk.Transaction): V1.Transaction => transaction;
-const _compatibleDbImplementation = (db: V1.DB): sdk.DB => db;
-const _compatibleTransactionImplementation = (transaction: V1.Transaction): sdk.Transaction => transaction;
+type LegacyDbImplementation = Omit<Pick<sdk.DB, keyof V1.DB>, 'begin'> & { begin: V1.DB['begin'] };
+const _compatibleDbImplementation = (db: V1.DB): LegacyDbImplementation => db;
+const _compatibleTransactionImplementation = (
+    transaction: V1.Transaction
+): Pick<sdk.Transaction, keyof V1.Transaction> => transaction;
 const _compatibleMigration: (context: sdk.MigrationContext) => V1.MigrationContext = (context) => context;
 
 function hex(bytes: Uint8Array): string {

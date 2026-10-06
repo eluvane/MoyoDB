@@ -18,7 +18,7 @@ const value = (flag) => {
 const source = resolve(value('--source-root') ?? join(here, '../src'));
 const keep = value('--emit-dir');
 const output = keep ? resolve(keep) : await mkdtemp(join(tmpdir(), 'moyo-read-work-'));
-const modules = ['worker', 'indexing', 'codec', 'errors', 'internal', 'compression', 'worker-protocol'];
+const modules = ['worker', 'indexing', 'codec', 'errors', 'internal', 'compression', 'snappy', 'worker-protocol'];
 await mkdir(output, { recursive: true });
 let runtime;
 const originalSelf = globalThis.self;

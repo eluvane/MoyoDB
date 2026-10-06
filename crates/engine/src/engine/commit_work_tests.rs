@@ -120,8 +120,10 @@ fn staged_ttl_expiry_hides_live_base_and_survives_clock_reversal_and_commit() ->
     let writer = engine.begin_tx(TxMode::Readwrite)?;
     let mut tx = engine.take_tx(writer)?;
     let rw = tx.readwrite_mut()?;
+    engine.ensure_revision_epoch(rw)?;
     assert!(put_with_staged_at(
         &mut engine.pager,
+        &mut engine.next_value_revision_ordinal,
         rw,
         "kv",
         b"key",
@@ -222,7 +224,10 @@ impl TtlCleanupFixture {
             .find(|cell| cell.key == b"a")
             .ok_or_else(|| EngineError::Internal("fixture missing early base key".into()))?;
         assert_eq!(cell.value_kind, ValueKind::Inline);
-        assert_eq!(&cell.value[..8], &crate::value::VALUE_ENVELOPE_MAGIC);
+        assert_eq!(
+            &cell.value[..8],
+            &crate::value::VALUE_REVISION_ENVELOPE_MAGIC
+        );
         // Keep the expired key's leaf valid so only the later leaf is corrupt.
         cell.value[8..16].copy_from_slice(&1u64.to_le_bytes());
         let image = encode_leaf_page(
@@ -252,8 +257,10 @@ impl TtlCleanupFixture {
         self.repair()?;
         let mut tx = self.engine.take_tx(tx_id)?;
         let result = tx.readwrite_mut().and_then(|rw| {
+            self.engine.ensure_revision_epoch(rw)?;
             put_with_staged_at(
                 &mut self.engine.pager,
+                &mut self.engine.next_value_revision_ordinal,
                 rw,
                 "kv",
                 b"zz-staged",

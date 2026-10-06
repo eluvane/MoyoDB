@@ -360,6 +360,26 @@ function report(persistentContext, mean = 10, profile = 'full') {
                 valueSize: 32,
                 batchSize: 10,
                 transactionBoundaries: 'one batch per transaction',
+                policy: {
+                    dataset: { profile: 'lcg-repeat-256', version: 1, seed: 0 },
+                    compression: false,
+                    compressionTuning: {
+                        algorithm: 'snappy-raw-block',
+                        algorithmVersion: 2,
+                        thresholdBytes: 1024,
+                        minimumSavingPercent: 10,
+                        envelopeBytes: 18,
+                        sampling: {
+                            minimumInputBytes: 65_536,
+                            windowBytes: 1024,
+                            windowCount: 3,
+                            positioning: 'start-middle-end',
+                            profitability: 'aggregate-size-plus-one-envelope'
+                        }
+                    },
+                    changeFeed: { enabled: true, retainTxids: 100_000 },
+                    timing: 'run-callback-only-v1'
+                },
                 warmupCount: 1,
                 sampleCount: 3,
                 stats: { mean, p50: mean, p95: mean, p99: mean }
@@ -435,6 +455,34 @@ test('benchmark gate accepts unchanged metrics with complete matching settings',
     assert.equal(comparison.comparisons[0].regression, false);
 });
 
+test('benchmark gate rejects an unmatched current row beside a matching row', (t) => {
+    const directory = fixture(t, benchmarkScripts);
+    write(directory, 'packages/sdk/bench/results/browser.json', report(false));
+    assert.equal(run(directory, benchmarkScripts[0], ['--from-results', '--out-dir', 'previous']).status, 0);
+    const current = report(false);
+    const additional = structuredClone(current.results[0]);
+    additional.workloadName = 'new-case-without-policy';
+    delete additional.policy;
+    current.results.push(additional);
+    write(directory, 'packages/sdk/bench/results/browser.json', current);
+    assert.equal(run(directory, benchmarkScripts[0], ['--from-results', '--out-dir', 'current']).status, 0);
+    const result = run(directory, benchmarkScripts[1], [
+        '--previous',
+        'previous/baseline.json',
+        '--current',
+        'current/baseline.json',
+        '--out-dir',
+        'comparison',
+        '--fail-on-regression'
+    ]);
+    assert.equal(result.status, 1, result.output);
+    assert.match(result.output, /1 current case\(s\) lack a matching policy baseline/u);
+    const comparison = JSON.parse(readFileSync(join(directory, 'comparison/comparison.json'), 'utf8'));
+    assert.equal(comparison.comparisons.length, 1);
+    assert.equal(comparison.unmatchedCases.length, 1);
+    assert.equal(comparison.comparisons[0].regression, false);
+});
+
 for (const [name, change] of [
     [
         'profile',
@@ -464,6 +512,72 @@ for (const [name, change] of [
         'sample count',
         (value) => {
             value.results[0].sampleCount = 1;
+        }
+    ],
+    [
+        'dataset',
+        (value) => {
+            value.results[0].policy.dataset.profile = 'high-entropy-binary';
+        }
+    ],
+    [
+        'compression',
+        (value) => {
+            value.results[0].policy.compression = 'snappy';
+        }
+    ],
+    [
+        'feed policy',
+        (value) => {
+            value.results[0].policy.changeFeed.enabled = false;
+        }
+    ],
+    [
+        'compression threshold',
+        (value) => {
+            value.results[0].policy.compressionTuning.thresholdBytes = 2048;
+        }
+    ],
+    [
+        'compression algorithm version',
+        (value) => {
+            value.results[0].policy.compressionTuning.algorithmVersion = 1;
+        }
+    ],
+    [
+        'compression sample size',
+        (value) => {
+            value.results[0].policy.compressionTuning.sampling.windowBytes = 2048;
+        }
+    ],
+    [
+        'compression sample count',
+        (value) => {
+            value.results[0].policy.compressionTuning.sampling.windowCount = 4;
+        }
+    ],
+    [
+        'compression profitability rule',
+        (value) => {
+            value.results[0].policy.compressionTuning.sampling.profitability = 'each-window';
+        }
+    ],
+    [
+        'legacy full encode policy',
+        (value) => {
+            value.results[0].policy.compressionTuning = { thresholdBytes: 1024, minimumSavingPercent: 10 };
+        }
+    ],
+    [
+        'timing policy',
+        (value) => {
+            value.results[0].policy.timing = 'unknown';
+        }
+    ],
+    [
+        'missing dataset policy',
+        (value) => {
+            delete value.results[0].policy;
         }
     ]
 ]) {

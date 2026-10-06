@@ -74,6 +74,10 @@ For million-row read/scan workloads, preload uses one setup transaction so the r
 
 Warmup samples are recorded separately and excluded from percentiles. Raw measured samples are preserved in `bench/results/*.json`.
 
+Each result records `policy` and a `sampleMetrics` entry for every measured sample. `explicitCommitMs` sums timed explicit `tx.commit()` calls; `explicitCommitCount` records their number. Autocommit internals are not timed separately. `verificationMs`, `cleanupMs` and `closeMs` are separate from the run timer. Close uses the ordinary API and includes its drain/checkpoint work; it is part of cleanup, so do not add close and cleanup times. Named recovery/snapshot run callbacks can include lifecycle operations.
+
+Database-directory bytes from `storageInfo()` and active manifest/main/WAL bytes from `stats()` are collected after the run and before verification, outside the run timer. Unsupported storage metrics, autocommit timings and backend read/write/flush counters are `null`, not zero. Compression ratio describes storage size and does not establish speed.
+
 `open_empty_db` opens a fresh database in a fresh Worker, while `cold_open_after_100k` reopens an existing database in a fresh Worker. Neither proves first-runtime or device-cache coldness: suite capability/build-profile probes, setup/cleanup Workers, warmups, and earlier samples can warm the JavaScript module graph, compiled WASM, and storage caches. Setting warmups to zero does not disable those probes. Report a separate first-runtime experiment if that is the startup cost being investigated. The normal launcher serves SDK modules through Vite's development server with release WASM; compare production bundle startup separately and retain the reported build modes.
 
 ## Diagnostic layer workloads
@@ -119,6 +123,34 @@ Representative write/read/scan rows include:
 \- `worker_roundtrip_overhead`
 
 The `bulk_insert_1m_single_tx`/`cold_insert_1m_single_tx` row is a pathological large single-transaction probe for the current architecture. It must be reported next to batched rows, commit diagnostics, and IndexedDB transaction-boundary notes. It is not the headline browser benchmark by itself.
+
+## Manual dataset matrix
+
+The original case IDs and value bytes remain stable. Their declared profile is `lcg-repeat-256`: a compressible low-byte LCG with a 256-byte period. Their MoyoDB store codec is explicitly raw. Additional dataset cases are opt-in through `MOYODB_BENCH_WORKLOADS`; they do not expand the default `full` suite.
+
+Case names use `large_value_<profile token>_<bytes>b_<raw|snappy>`:
+
+| Profile token         | Input bytes                                                        |
+| --------------------- | ------------------------------------------------------------------ |
+| `lcg_repeat_256`      | Original repeatable, compressible LCG bytes.                       |
+| `high_entropy_binary` | Deterministic binary noise without the 256-byte repetition.        |
+| `realistic_json`      | Valid synthetic order JSON with varied event details.              |
+| `realistic_text`      | Synthetic order/event prose with varied identifiers and amounts.   |
+| `precompressed`       | Valid gzip data containing entropy bytes in stored DEFLATE blocks. |
+
+Available value sizes are 1023, 1024, 1025, 4033, 4066, 65536 and 1048576 bytes. Cases below 1 MiB use 256 values in four batches of 64; 1 MiB cases use 16 values in four batches of four. The 64 KiB high-entropy raw/Snappy cases also have an optional `_feed_off` suffix.
+
+For a small raw/Snappy comparison, run from `packages/sdk` after building release WASM:
+
+```bash
+MOYODB_BENCH_WORKLOADS=large_value_high_entropy_binary_65536b_raw,large_value_high_entropy_binary_65536b_snappy \
+MOYODB_BENCH_WARMUP_COUNT=1 MOYODB_BENCH_SAMPLE_COUNT=2 npm run bench:browser
+npm run bench:report
+```
+
+The `policy` metadata declares dataset profile/version/seed, MoyoDB codec, compression algorithm/version/tuning, change-feed enablement/retention and `run-callback-only-v1` timing. Codec and feed settings apply to MoyoDB; IndexedDB stores the identical input bytes unchanged. Matching inputs do not imply equal stored representations.
+
+Snappy policy version 2 uses three distributed 1 KiB windows for inputs of at least 64 KiB. Aggregate sample sizes plus one 18-byte envelope must save at least 10%; accepted inputs still undergo full encoding and the final profitability check. Algorithm/version, sample dimensions/positions and profitability settings all enter comparison keys. Older full-encode artifacts lack this policy and cannot be used as a comparable baseline; recollect them. Historical measurements below retain their original scope and do not establish results for the new dataset matrix or policy version.
 
 ## Fair IndexedDB baseline
 

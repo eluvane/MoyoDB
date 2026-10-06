@@ -191,6 +191,7 @@ fn catalog_view(state: &CatalogState, root: u64) -> CommittedView<'_> {
         schema_version: state.schema_version,
         change_feed_floor_txid: state.change_feed_floor_txid,
         change_feed_policy: state.change_feed_policy,
+        oldest_snapshot_txid: u64::MAX,
     }
 }
 

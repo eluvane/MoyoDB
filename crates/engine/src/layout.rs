@@ -7,7 +7,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 pub const PAGE_SIZE: usize = 4096;
 pub const SUPERBLOCK_SLOT_SIZE: usize = 4096;
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 pub const SUPERBLOCK_MAGIC: [u8; 8] = *b"STKDB001";
 pub const WAL_MAGIC: [u8; 4] = *b"WAL1";
 pub const PAGE_MAGIC: [u8; 4] = *b"PAG1";
@@ -44,6 +44,7 @@ impl PageKind {
 pub enum ValueKind {
     Inline = 1,
     Overflow = 2,
+    External = 3,
 }
 
 impl ValueKind {
@@ -51,6 +52,7 @@ impl ValueKind {
         match v {
             1 => Ok(ValueKind::Inline),
             2 => Ok(ValueKind::Overflow),
+            3 => Ok(ValueKind::External),
             _ => Err(EngineError::Corruption(format!("unknown value kind {v}"))),
         }
     }

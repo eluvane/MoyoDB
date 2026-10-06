@@ -22,6 +22,7 @@ const {
 const key = utf8Encode('key');
 const text = (value) => (value === null ? null : utf8Decode(value));
 const childCommand = process.argv[2];
+const interopLargeValue = (byte) => new Uint8Array(64 * 1024 + 1).fill(byte);
 
 if (childCommand) {
     const directory = process.argv[3];
@@ -49,16 +50,19 @@ if (childCommand) {
             } else if (childCommand === 'wait') {
                 assert.equal(text(await db.get('data', key)), 'persisted');
             } else if (childCommand === 'interop-create' || childCommand === 'interop-create-compacted') {
-                await db.createStore('kv');
+                await db.createStore('kv', { compression: false });
                 await db.put('kv', utf8Encode('interop'), utf8Encode('shared-file-format'));
+                await db.put('kv', utf8Encode('interop-large'), interopLargeValue(0x5a));
                 if (childCommand === 'interop-create-compacted') {
                     await db.compact();
                     await db.rebuild();
                 }
             } else if (childCommand === 'interop-read' || childCommand === 'interop-read-native-append') {
                 assert.equal(text(await db.get('kv', utf8Encode('interop'))), 'shared-file-format');
+                assert.deepEqual(await db.get('kv', utf8Encode('interop-large')), interopLargeValue(0x5a));
                 if (childCommand === 'interop-read-native-append') {
                     assert.equal(text(await db.get('kv', utf8Encode('native-append'))), 'shared-file-format');
+                    assert.deepEqual(await db.get('kv', utf8Encode('native-large')), interopLargeValue(0xa5));
                 }
             } else {
                 throw new Error(`unknown child command: ${childCommand}`);

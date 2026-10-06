@@ -28,7 +28,8 @@ try {
         'codec',
         'errors',
         'internal',
-        'compression'
+        'compression',
+        'snappy'
     ]) {
         const result = ts.transpileModule(await readFile(join(source, `${name}.ts`), 'utf8'), {
             fileName: `${name}.ts`,

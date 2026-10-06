@@ -9,11 +9,15 @@ import type {
     DebugFailpoint,
     ExportSnapshotOptions,
     IndexDef,
+    IndexScanOptions,
     MigrateHook,
     OpenOptions,
     PutOptions,
     Range,
     ScanItem,
+    ScanCursor,
+    ScanPage,
+    ScanPageOptions,
     StorageInfo,
     Transaction,
     TxId,
@@ -49,10 +53,12 @@ import {
 } from './indexing';
 import { SubscriptionHub } from './subscriptions';
 import { compareStringsByCodeUnit, withTimeout } from './internal';
-import type { AutocommitCommand, IndexScanPage } from './worker-api';
+import type { AutocommitCommand, IndexScanPage, WorkerScanPage } from './worker-api';
 import type { AutocommitArgs, WorkerCommandResult } from './worker-protocol';
 
 const INDEX_SCAN_PAGE_ROWS = 256;
+const SCAN_PAGE_ROWS = 256;
+const SCAN_PAGE_BYTES = 8 * 1024 * 1024 + 18 + 1024 + 12;
 
 async function callProxy<T>(fn: () => Promise<T>): Promise<T> {
     try {
@@ -67,6 +73,7 @@ class TransactionImpl implements Transaction {
     #entry: RegistryEntry;
     #txId: number;
     #closed = false;
+    #scanCursors = new Set<ScanCursor>();
     #onClose: () => void;
     constructor(entry: RegistryEntry, txId: number, mode: TxMode, onClose: () => void) {
         this.#entry = entry;
@@ -123,22 +130,58 @@ class TransactionImpl implements Transaction {
         assertPublicStoreName(store);
         return callProxy(() => this.#entry.proxy.scan(this.#txId, store, range));
     }
+    async scanPage(store: string, range: Range = {}, options: ScanPageOptions = {}): Promise<ScanPage> {
+        this.#ensureOpen();
+        assertPublicStoreName(store);
+        const normalized = normalizeScanPageOptions(options);
+        if (normalized.cursor !== undefined && !this.#scanCursors.has(normalized.cursor)) {
+            throw new TypeError('scan cursor does not belong to this transaction');
+        }
+        const page = await callProxy(() =>
+            this.#entry.proxy.scanPage({
+                txId: this.#txId,
+                store,
+                range,
+                cursorId: normalized.cursor,
+                maxRows: normalized.maxRows,
+                maxBytes: normalized.maxBytes
+            })
+        );
+        this.#ensureOpen();
+        if (normalized.cursor !== undefined) this.#scanCursors.delete(normalized.cursor);
+        if (page.cursorId !== undefined && !this.#closed) this.#scanCursors.add(page.cursorId);
+        return publicScanPage(page);
+    }
+    scanIter(store: string, range: Range = {}, options: Omit<ScanPageOptions, 'cursor'> = {}): AsyncIterable<ScanItem> {
+        return iterateScanPages(this, store, range, options);
+    }
+    async closeScanCursor(cursor: ScanCursor): Promise<void> {
+        normalizeScanCursor(cursor);
+        if (!this.#scanCursors.delete(cursor) || this.#entry.invalidated) return;
+        await callProxy(() => this.#entry.proxy.closeCursor(cursor));
+    }
     async getByIndex(store: string, indexName: string, key: Uint8Array): Promise<Uint8Array | null> {
         this.#ensureOpen();
         assertPublicStoreName(store);
         return callProxy(() => this.#entry.proxy.getByIndex(this.#txId, store, indexName, key));
     }
-    async *scanByIndex(store: string, indexName: string, range: Range = {}): AsyncIterable<[Uint8Array, Uint8Array]> {
+    async *scanByIndex(
+        store: string,
+        indexName: string,
+        range: Range = {},
+        options: IndexScanOptions = {}
+    ): AsyncIterable<[Uint8Array, Uint8Array]> {
         this.#ensureOpen();
         assertPublicStoreName(store);
+        const { maxRows: pageRows, maxBytes } = normalizeScanPageOptions(options);
         let remaining = range.limit ?? Number.POSITIVE_INFINITY;
         let cursor: Uint8Array | null = null;
         while (remaining > 0) {
             this.#ensureOpen();
-            const pageLimit = Math.min(remaining, INDEX_SCAN_PAGE_ROWS);
+            const pageLimit = Math.min(remaining, pageRows, INDEX_SCAN_PAGE_ROWS);
             const resumeAfter: Uint8Array | null = cursor;
             const page: IndexScanPage = await callProxy(() =>
-                this.#entry.proxy.scanByIndexPage(this.#txId, store, indexName, range, resumeAfter, pageLimit)
+                this.#entry.proxy.scanByIndexPage(this.#txId, store, indexName, range, resumeAfter, pageLimit, maxBytes)
             );
             for (const row of page.rows) {
                 yield [row.key, row.value];
@@ -216,6 +259,7 @@ class TransactionImpl implements Transaction {
             return;
         }
         this.#closed = true;
+        this.#scanCursors.clear();
         this.#onClose();
     }
 }
@@ -225,6 +269,8 @@ class DBImpl implements DB {
     #closePromise: Promise<void> | null = null;
     #transactions = new Set<TransactionImpl>();
     #pendingBegins = new Set<Promise<TransactionImpl>>();
+    #scanCursors = new Set<ScanCursor>();
+    #pendingScanPages = new Set<Promise<WorkerScanPage>>();
     #transactionGeneration = 0;
     #subscriptions: SubscriptionHub;
     #unsubscribeTxInvalidated: (() => void) | null = null;
@@ -352,6 +398,46 @@ class DBImpl implements DB {
         assertPublicStoreName(store);
         return this.#autocommit('readonly', 'scan', [store, range]);
     }
+    async scanPage(store: string, range: Range = {}, options: ScanPageOptions = {}): Promise<ScanPage> {
+        this.#ensureOpen();
+        assertPublicStoreName(store);
+        const normalized = normalizeScanPageOptions(options);
+        if (normalized.cursor !== undefined && !this.#scanCursors.has(normalized.cursor)) {
+            throw new TypeError('scan cursor does not belong to this database handle');
+        }
+        const generation = this.#transactionGeneration;
+        const pending = callProxy(() =>
+            this.#entry.proxy.scanPage({
+                store,
+                range,
+                cursorId: normalized.cursor,
+                maxRows: normalized.maxRows,
+                maxBytes: normalized.maxBytes
+            })
+        );
+        this.#pendingScanPages.add(pending);
+        try {
+            const page = await pending;
+            if (normalized.cursor !== undefined) this.#scanCursors.delete(normalized.cursor);
+            if (page.cursorId !== undefined) this.#scanCursors.add(page.cursorId);
+            this.#ensureOpen();
+            if (generation !== this.#transactionGeneration) {
+                if (page.cursorId !== undefined) await this.closeScanCursor(page.cursorId);
+                throw new TransactionClosedError();
+            }
+            return publicScanPage(page);
+        } finally {
+            this.#pendingScanPages.delete(pending);
+        }
+    }
+    scanIter(store: string, range: Range = {}, options: Omit<ScanPageOptions, 'cursor'> = {}): AsyncIterable<ScanItem> {
+        return iterateScanPages(this, store, range, options);
+    }
+    async closeScanCursor(cursor: ScanCursor): Promise<void> {
+        normalizeScanCursor(cursor);
+        if (!this.#scanCursors.delete(cursor) || this.#entry.invalidated) return;
+        await callProxy(() => this.#entry.proxy.closeCursor(cursor));
+    }
     /** The transaction boundary stays in the worker, so one round trip is enough. */
     async #autocommit<M extends AutocommitCommand>(
         mode: TxMode,
@@ -469,7 +555,14 @@ class DBImpl implements DB {
     }
     async #finishClose(): Promise<void> {
         await Promise.allSettled(Array.from(this.#pendingBegins));
+        await Promise.allSettled(Array.from(this.#pendingScanPages));
         let rollbackError: Error | null = null;
+        const cursorResults = await Promise.allSettled(
+            Array.from(this.#scanCursors, (cursor) => this.closeScanCursor(cursor))
+        );
+        for (const result of cursorResults) {
+            if (result.status === 'rejected' && rollbackError === null) rollbackError = normalizeError(result.reason);
+        }
         const txs = Array.from(this.#transactions);
         if (txs.length > 0) {
             const results = await Promise.allSettled(txs.map((tx) => tx.rollbackIfOpen()));
@@ -496,6 +589,7 @@ class DBImpl implements DB {
     }
     #forceCloseTransactions() {
         this.#transactionGeneration += 1;
+        this.#scanCursors.clear();
         for (const tx of Array.from(this.#transactions)) {
             tx.forceClose();
         }
@@ -579,11 +673,25 @@ class MigrationTransactionImpl implements Transaction {
     async scan(store: string, range: Range = {}): Promise<ScanItem[]> {
         return this.#inner.scan(store, range);
     }
+    scanPage(store: string, range: Range = {}, options: ScanPageOptions = {}): Promise<ScanPage> {
+        return this.#inner.scanPage(store, range, options);
+    }
+    scanIter(store: string, range: Range = {}, options: Omit<ScanPageOptions, 'cursor'> = {}): AsyncIterable<ScanItem> {
+        return this.#inner.scanIter(store, range, options);
+    }
+    closeScanCursor(cursor: ScanCursor): Promise<void> {
+        return this.#inner.closeScanCursor(cursor);
+    }
     async getByIndex(store: string, indexName: string, key: Uint8Array): Promise<Uint8Array | null> {
         return this.#inner.getByIndex(store, indexName, key);
     }
-    scanByIndex(store: string, indexName: string, range: Range = {}): AsyncIterable<[Uint8Array, Uint8Array]> {
-        return this.#inner.scanByIndex(store, indexName, range);
+    scanByIndex(
+        store: string,
+        indexName: string,
+        range: Range = {},
+        options: IndexScanOptions = {}
+    ): AsyncIterable<[Uint8Array, Uint8Array]> {
+        return this.#inner.scanByIndex(store, indexName, range, options);
     }
     async createStore(name: string, options: CreateStoreOptions = {}): Promise<void> {
         await this.#inner.createStore(name, options);
@@ -654,6 +762,15 @@ class MigrationDbImpl implements DB {
     async scan(store: string, range: Range = {}): Promise<ScanItem[]> {
         return this.#transaction.scan(store, range);
     }
+    scanPage(store: string, range: Range = {}, options: ScanPageOptions = {}): Promise<ScanPage> {
+        return this.#transaction.scanPage(store, range, options);
+    }
+    scanIter(store: string, range: Range = {}, options: Omit<ScanPageOptions, 'cursor'> = {}): AsyncIterable<ScanItem> {
+        return this.#transaction.scanIter(store, range, options);
+    }
+    closeScanCursor(cursor: ScanCursor): Promise<void> {
+        return this.#transaction.closeScanCursor(cursor);
+    }
     exportSnapshot(_options: ExportSnapshotOptions = {}): Promise<Uint8Array> {
         return Promise.reject(migrationUnsupportedMethod('db.exportSnapshot'));
     }
@@ -714,6 +831,53 @@ function migrationUnsupportedMethod(method: string): Error {
     );
     error.name = 'InvalidStateError';
     return error;
+}
+function publicScanPage(page: WorkerScanPage): ScanPage {
+    return { rows: page.rows, cursor: page.cursorId, done: page.done, bytes: page.bytes };
+}
+function normalizeScanCursor(value: unknown): ScanCursor {
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
+        throw new TypeError('scan cursor must be a positive safe integer');
+    }
+    return value;
+}
+function normalizeScanPageOptions(
+    options: unknown
+): Required<Omit<ScanPageOptions, 'cursor'>> & Pick<ScanPageOptions, 'cursor'> {
+    const input = normalizeOptionsObject<ScanPageOptions>(options, 'scan page options must be an object');
+    const maxRows = input.maxRows ?? SCAN_PAGE_ROWS;
+    const maxBytes = input.maxBytes ?? SCAN_PAGE_BYTES;
+    if (!Number.isSafeInteger(maxRows) || maxRows <= 0 || maxRows > 0xffff_ffff) {
+        throw new TypeError('scan page maxRows must be a positive 32-bit integer');
+    }
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 4 || maxBytes > 0xffff_ffff) {
+        throw new TypeError('scan page maxBytes must be a 32-bit integer of at least 4');
+    }
+    return { maxRows, maxBytes, cursor: input.cursor === undefined ? undefined : normalizeScanCursor(input.cursor) };
+}
+async function* iterateScanPages(
+    source: Pick<Transaction, 'scanPage' | 'closeScanCursor'>,
+    store: string,
+    range: Range,
+    options: Omit<ScanPageOptions, 'cursor'>
+): AsyncIterable<ScanItem> {
+    const bounds = { ...range };
+    for (const field of ['gt', 'gte', 'lt', 'lte'] as const) {
+        const bound = bounds[field];
+        if (bound instanceof Uint8Array) bounds[field] = bound.slice();
+    }
+    const pageOptions = normalizeScanPageOptions(options);
+    let cursor: ScanCursor | undefined;
+    try {
+        for (;;) {
+            const page = await source.scanPage(store, bounds, { ...pageOptions, cursor });
+            cursor = page.cursor;
+            for (const row of page.rows) yield row;
+            if (page.done) return;
+        }
+    } finally {
+        if (cursor !== undefined) await source.closeScanCursor(cursor);
+    }
 }
 function normalizeDatabaseName(value: unknown, method: 'openDB' | 'deleteDB' | 'unsafeDebugCrashWorker'): string {
     if (typeof value !== 'string' || value.length === 0) {
@@ -780,7 +944,8 @@ function normalizePutOptions(options: unknown): PutOptions {
 }
 function normalizeCompressionOptions<T extends CreateStoreOptions | ExportSnapshotOptions>(
     options: unknown,
-    message: string
+    message: string,
+    allowSnappy: boolean
 ): T {
     const { compression } = normalizeOptionsObject<{
         compression?: unknown;
@@ -788,18 +953,27 @@ function normalizeCompressionOptions<T extends CreateStoreOptions | ExportSnapsh
     if (compression === undefined) {
         return {} as T;
     }
-    if (compression !== false && compression !== 'gzip' && compression !== 'deflate') {
-        throw new TypeError('compression must be "gzip", "deflate", or false');
+    if (
+        compression !== false &&
+        compression !== 'gzip' &&
+        compression !== 'deflate' &&
+        !(allowSnappy && compression === 'snappy')
+    ) {
+        throw new TypeError(
+            allowSnappy
+                ? 'compression must be "gzip", "deflate", "snappy", or false'
+                : 'compression must be "gzip", "deflate", or false'
+        );
     }
     return { compression } as T;
 }
 
 function normalizeCreateStoreOptions(options: unknown): CreateStoreOptions {
-    return normalizeCompressionOptions(options, 'createStore options must be an object');
+    return normalizeCompressionOptions(options, 'createStore options must be an object', true);
 }
 
 function normalizeExportSnapshotOptions(options: unknown): ExportSnapshotOptions {
-    return normalizeCompressionOptions(options, 'exportSnapshot options must be an object');
+    return normalizeCompressionOptions(options, 'exportSnapshot options must be an object', false);
 }
 function normalizeTxId(value: unknown): TxId {
     return normalizeNonNegativeSafeInteger(value, 'txid must be a non-negative safe integer');

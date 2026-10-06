@@ -58,8 +58,10 @@ structure Cell where
   finish : Nat
   /-- Leaf key or internal minimum-key separator. -/
   key : Bytes
-  /-- Inline leaf value; internal cells leave it empty. -/
+  /-- Encoded leaf value or external descriptor; internal cells leave it empty. -/
   value : Bytes := []
+  /-- External contents are absent from the raw B-tree page image. -/
+  external : Bool := false
   /-- Internal child identifier; leaf cells leave it zero. -/
   child : Nat := 0
 
@@ -77,6 +79,23 @@ structure Page where
 /-- Reject a failed runtime condition with a deterministic diagnostic. -/
 def require (condition : Bool) (message : String) : Except String Unit :=
   if condition then .ok () else .error message
+
+/-- Validate format-2 extent metadata without interpreting PAY2 bytes as B-tree pages. -/
+def checkExternalDescriptor (firstPage totalLength : Nat) (value : Bytes) :
+    Except String Unit := do
+  require (value.length >= 8) "short external payload descriptor"
+  let bodyLength ← readLE value 0 4
+  require (bodyLength > 0 && bodyLength <= 8389951) "invalid external payload length"
+  require (firstPage > 0) "invalid external payload page id"
+  let pageCount := (32 + bodyLength + 4095) / 4096
+  let endPage := firstPage + pageCount
+  require (endPage <= 18446744073709551615) "external payload page range overflow"
+  -- The exclusive end must fit the u64 byte offset of its preceding page.
+  require (endPage <= 18446744073709551615 / 4096 + 1)
+    "external payload byte range overflow"
+  let prefixLength := (value.drop 8).length
+  require (bodyLength + prefixLength <= 8389951) "external payload logical length overflow"
+  require (bodyLength + prefixLength == totalLength) "external payload logical length mismatch"
 
 /-- Parse raw page bytes without Rust-decoded fields. Checksums are not assumed or validated. -/
 def decodePage (raw : RawPage) : Except String Page := do
@@ -102,14 +121,17 @@ def decodePage (raw : RawPage) : Except String Page := do
     let keyLength ← readLE bytes start 2
     let cell ← if kind == 1 then do
       let valueKind ← readLE bytes (start + 2) 1
-      require (valueKind == 1) "unsupported overflow value"
+      require (valueKind == 1 || valueKind == 3) "unsupported overflow value"
       let totalLength ← readLE bytes (start + 4) 4
       let overflow ← readLE bytes (start + 8) 8
       let valueLength ← readLE bytes (start + 16) 4
-      require (totalLength == valueLength && overflow == 0) "inline value metadata"
       let key ← readBytes bytes (start + 20) keyLength
       let value ← readBytes bytes (start + 20 + keyLength) valueLength
-      pure { start, finish := start + 20 + keyLength + valueLength, key, value : Cell }
+      if valueKind == 1 then
+        require (totalLength == valueLength && overflow == 0) "inline value metadata"
+      else
+        checkExternalDescriptor overflow totalLength value
+      pure { start, finish := start + 20 + keyLength + valueLength, key, value, external := valueKind == 3 : Cell }
     else do
       let child ← readLE bytes (start + 4) 8
       require (child != 0) "internal child is zero"
@@ -131,6 +153,8 @@ def decodeTree : Nat → List RawPage → Nat → List Nat → Except String (Tr
       let page ← (decodePage raw).mapError (s!"page {id}: {·}")
       let mut seen := id :: visited
       if page.kind == 1 then
+        require (page.cells.all (fun cell => !cell.external))
+          "external payload contents are outside this checker"
         return (.leaf id (page.cells.map (fun cell => (cell.key, cell.value))), seen)
       else
         let mut children : List (Bytes × Tree) := []

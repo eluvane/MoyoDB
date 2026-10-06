@@ -2,7 +2,7 @@ import MoyoDbProofs.Main
 
 /-- Committed wire-format constants exported for cross-language checks. -/
 def derivedConstantsJson : String := r#"{
-  "format_version": 1,
+  "format_version": 2,
   "superblock_magic": "STKDB001",
   "wal_magic": "WAL1",
   "page_magic": "PAG1",
@@ -21,7 +21,13 @@ def derivedConstantsJson : String := r#"{
   },
   "value_kinds": {
     "inline": 1,
-    "overflow": 2
+    "overflow": 2,
+    "external": 3
+  },
+  "external_payload": {
+    "magic": "PAY2",
+    "header_size": 32,
+    "descriptor_size": 8
   },
   "record_tags": {
     "page_image": 1,
@@ -30,7 +36,8 @@ def derivedConstantsJson : String := r#"{
   "limits": {
     "store_name_bytes": 255,
     "key_bytes": 1024,
-    "value_bytes": 8388608
+    "value_bytes": 8388608,
+    "stored_value_bytes": 8389951
   },
   "failpoints": [
     "after_wal_flush",

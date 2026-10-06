@@ -1,12 +1,13 @@
 export { exposeWorkerApi } from './worker-server';
 import {
     packedOptionalValues,
+    packedScanRows,
     unpackPackedBatchOpKeys,
     unpackPackedBatchOps,
     unpackPackedBinaryList,
     unpackPackedBinaryPairKeys,
-    unpackPackedBinaryPairs,
     unpackPackedOptionalValues,
+    unpackPackedScanRows,
     type PackedBatchOpKey,
     type PackedOptionalValuesV1
 } from './worker-protocol';
@@ -15,9 +16,12 @@ import {
     compressionFromStoreFlags,
     decodeStoreValueRecord,
     encodeStoreValueRecord,
+    prepareFastStoreValueRecord,
+    writePreparedStoreValueRecord,
     wrapSnapshotWithCompression,
     unwrapSnapshotCompression,
-    type CompressionOption
+    type CompressionOption,
+    type PreparedStoreValueRecord
 } from './compression';
 import { utf8Encode } from './codec';
 import { clampTimerDelayMs, isRecord } from './internal';
@@ -43,7 +47,14 @@ import {
     type DecodedIndexEntryKey,
     type NormalizedIndexDef
 } from './indexing';
-import type { AutocommitCommand, IndexScanPage, WorkerApi, WorkerOpenRequest } from './worker-api';
+import type {
+    AutocommitCommand,
+    IndexScanPage,
+    WorkerApi,
+    WorkerOpenRequest,
+    WorkerScanPage,
+    WorkerScanPageRequest
+} from './worker-api';
 import type {
     BatchOp,
     ChangeFeed,
@@ -72,6 +83,17 @@ type WasmBatchOutcome =
           kind: 'delete';
           deleted: boolean;
       };
+type IndexedPutOp = { store: string; kind: 'delete' | 'put'; key: Uint8Array };
+type PreparedPutValue = PreparedStoreValueRecord | Uint8Array;
+type NativeValueState = {
+    live: boolean;
+    expired: boolean;
+    revisionKnown: boolean;
+    revisionEpoch: bigint;
+    revisionOrdinal: bigint;
+    expiresAt: bigint;
+    maxValueBytes: number;
+};
 type WasmChangeRecord = Omit<ChangeFeed['changes'][number], 'txId'> & {
     txId: number | bigint;
 };
@@ -139,6 +161,8 @@ type WasmEngine = {
     get_many(txId: WasmU64, store: string, keys: Array<Uint8Array>): Array<Uint8Array | null>;
     /** Little-endian u32 count | count x u32 length (u32::MAX = missing) | bytes. */
     get_many_packed(txId: WasmU64, store: string, keys: Uint8Array): Uint8Array;
+    get_many_value_sizes?(txId: WasmU64, store: string, keys: Uint8Array): Uint32Array;
+    get_many_value_states?(txId: WasmU64, store: string, keys: Uint8Array): Uint8Array;
     /** Checks existence without loading the value body; TTL headers may be read. */
     has(txId: WasmU64, store: string, key: Uint8Array): boolean;
     /** Optional for SDK compatibility with older bindings. */
@@ -148,6 +172,22 @@ type WasmEngine = {
     put_many(txId: WasmU64, store: string, entries: Array<[Uint8Array, Uint8Array]>, options?: unknown): boolean[];
     /** One byte per entry: 1 when a live value existed before the write. */
     put_many_packed(txId: WasmU64, store: string, entries: Uint8Array, options?: unknown): Uint8Array;
+    put_many_indexed_packed(
+        txId: WasmU64,
+        store: string,
+        entries: Uint8Array,
+        indexOps: IndexedPutOp[][],
+        options?: unknown
+    ): Uint8Array;
+    put_index_entry_checked?(
+        txId: WasmU64,
+        primaryStore: string,
+        indexStore: string,
+        primaryKey: Uint8Array,
+        indexKey: Uint8Array,
+        revisionEpoch: WasmU64,
+        revisionOrdinal: WasmU64
+    ): void;
     delete(txId: WasmU64, store: string, key: Uint8Array): boolean;
     delete_many(txId: WasmU64, store: string, keys: Array<Uint8Array>): boolean[];
     /** One byte per key: 1 when a live value was deleted. */
@@ -156,6 +196,17 @@ type WasmEngine = {
     /** One byte per op: baselineExists for puts, deleted for deletes. */
     apply_batch_packed(txId: WasmU64, store: string, ops: Uint8Array): Uint8Array;
     scan(txId: WasmU64, store: string, range: unknown): unknown;
+    open_scan_cursor(txId: WasmU64, store: string, range: unknown, keysOnly: boolean): number;
+    scan_cursor_next(
+        cursorId: number,
+        maxRows: number,
+        maxBytes: number
+    ): {
+        packet: Uint8Array;
+        rowCount: number;
+        exhausted: boolean;
+    };
+    close_scan_cursor(cursorId: number): void;
     changes_since(txId: WasmU64, options?: unknown): unknown;
     get_schema_version(): WasmU64;
     export_snapshot(): Uint8Array;
@@ -261,7 +312,11 @@ type MaintenanceOperation = 'compact' | 'rebuild';
 const EMPTY_RANGE: Range = {};
 const EMPTY_VALUE = new Uint8Array(0);
 const MAX_ENGINE_KEY_BYTES = 1024;
+const MAX_PACKED_BYTES = 0xffff_ffff;
+const INDEX_PUT_BATCH_ROWS = 64;
+const INDEX_PUT_BATCH_BYTES = 4 * 1024 * 1024;
 const INDEX_SCAN_PAGE_ROWS = 256;
+const INDEX_SCAN_PAGE_BYTES = 8 * 1024 * 1024 + 18 + MAX_ENGINE_KEY_BYTES + 12;
 const INDEX_SCAN_RAW_CHUNK_ROWS = 512;
 const RECONCILE_DOCUMENT_CACHE_BYTES = 4 * 1024 * 1024;
 const RECONCILE_DOCUMENT_CACHE_ROWS = 4096;
@@ -429,6 +484,26 @@ function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
     }
     return true;
 }
+function copyRange(range: Range): Range {
+    const copy = toWasmRange(range);
+    for (const bound of ['gt', 'gte', 'lt', 'lte'] as const) {
+        const value = copy[bound];
+        if (value !== undefined) {
+            copy[bound] = value.slice();
+        }
+    }
+    return copy;
+}
+function rangesEqual(left: Range, right: Range): boolean {
+    for (const bound of ['gt', 'gte', 'lt', 'lte'] as const) {
+        const a = left[bound];
+        const b = right[bound];
+        if (a === undefined ? b !== undefined : b === undefined || !bytesEqual(a, b)) {
+            return false;
+        }
+    }
+    return left.reverse === right.reverse && left.limit === right.limit;
+}
 
 function normalizeWasmBytes(value: Uint8Array | ArrayBuffer | ArrayLike<number>): Uint8Array {
     if (value instanceof Uint8Array) {
@@ -592,6 +667,11 @@ export class DbWorker implements WorkerApi {
     private persistenceBridge: WorkerPersistenceBridge;
     private txChanges = new Map<number, TrackedTxnChanges>();
     private txModes = new Map<number, TxMode>();
+    private primaryCursors = new Map<
+        number,
+        { engineId: number; txId: number; ownsTx: boolean; store: string; range: Range; callerTxId?: number }
+    >();
+    private nextPrimaryCursorId = 1;
     /**
      * Shared committed schema at begin. Reconciliation replaces the array;
      * it never mutates the shared schema.
@@ -829,7 +909,7 @@ export class DbWorker implements WorkerApi {
         return result;
     }
     createStore(txId: number, name: string, options: CreateStoreOptions = {}): Promise<void> {
-        const compression = options.compression ?? false;
+        const compression = isInternalStoreName(name) ? false : (options.compression ?? 'snappy');
         this.txEnsuredRawStores.get(txId)?.delete(name);
         this.withEngine((engine) => engine.create_store(toWasmU64(txId), name, { compression }));
         this.recordStoreCompressionCreate(txId, name, compression);
@@ -908,57 +988,7 @@ export class DbWorker implements WorkerApi {
             this.recordPutChange(txId, store, key, baselineExists);
             return;
         }
-        // The previous document is needed to remove its old index keys.
-        const oldValue = await this.readStoreValue(txId, store, key);
-        const oldKeyFor = oldValue === null ? null : createIndexKeyExtractor(oldValue);
-        const newKeyFor = createIndexKeyExtractor(value);
-        const plans = defs.map((def) => {
-            const oldLogicalKey = oldKeyFor === null ? null : oldKeyFor(def);
-            const newLogicalKey = newKeyFor(def);
-            return {
-                def,
-                oldLogicalKey,
-                newLogicalKey,
-                newPhysicalKey: null as Uint8Array | null
-            };
-        });
-        this.ensureInternalStoresForDefinitions(txId, defs);
-        for (const plan of plans) {
-            if (plan.newLogicalKey === null) {
-                continue;
-            }
-            plan.newPhysicalKey = this.buildIndexEntryKey(plan.def, plan.newLogicalKey, key);
-            if (plan.oldLogicalKey !== null && bytesEqual(plan.oldLogicalKey, plan.newLogicalKey)) {
-                continue;
-            }
-            await this.assertUniqueIndexAvailability(txId, plan.def, plan.newLogicalKey, key);
-        }
-        const storedValue = await this.encodeStoreValueForWrite(txId, store, value);
-        const baselineExists = this.withEngine((engine) =>
-            engine.put(toWasmU64(txId), store, key, storedValue, toWasmPutOptions(options))
-        );
-        for (const plan of plans) {
-            if (plan.oldLogicalKey === null) {
-                continue;
-            }
-            if (plan.newLogicalKey !== null && bytesEqual(plan.oldLogicalKey, plan.newLogicalKey)) {
-                continue;
-            }
-            this.deleteIndexEntryIfPresent(txId, plan.def, plan.oldLogicalKey, key);
-        }
-        for (const plan of plans) {
-            if (plan.newLogicalKey === null) {
-                continue;
-            }
-            if (plan.oldLogicalKey !== null && bytesEqual(plan.oldLogicalKey, plan.newLogicalKey)) {
-                continue;
-            }
-            if (plan.newPhysicalKey === null) {
-                throw remoteError('InternalError', 'missing index entry key');
-            }
-            this.putIndexEntry(txId, plan.def, plan.newPhysicalKey, EMPTY_VALUE);
-        }
-        this.recordPutChange(txId, store, key, baselineExists);
+        await this.putIndexedMany(txId, store, [key, value], defs, options);
     }
     async putMany(
         txId: number,
@@ -991,9 +1021,12 @@ export class DbWorker implements WorkerApi {
             this.recordPutChanges(txId, store, entries, baselines);
             return;
         }
-        for (const [key, value] of entries) {
-            await this.put(txId, store, key, value, options);
+        const items = new Array<Uint8Array>(entries.length * 2);
+        for (let index = 0; index < entries.length; index += 1) {
+            items[index * 2] = entries[index][0];
+            items[index * 2 + 1] = entries[index][1];
         }
+        await this.putIndexedMany(txId, store, items, defs, options);
     }
     async putManyPacked(
         txId: number,
@@ -1002,18 +1035,32 @@ export class DbWorker implements WorkerApi {
         options: PutOptions = {}
     ): Promise<void> {
         const defs = this.indexesForStoreInTx(txId, store);
-        if (defs.length !== 0 || this.storeCompressionForTx(txId, store) !== false) {
-            await this.putMany(txId, store, unpackPackedBinaryPairs(packedEntries), options);
+        if (defs.length !== 0) {
+            const items = unpackPackedBinaryList(packedEntries);
+            if (items.length % 2 !== 0) {
+                throw remoteError('WorkerProtocolError', 'packed putMany payload has an odd item count');
+            }
+            await this.putIndexedMany(txId, store, items, defs, options);
             return;
         }
-        const keys = unpackPackedBinaryPairKeys(packedEntries);
+        const compression = this.storeCompressionForTx(txId, store);
+        const items = compression === false ? null : unpackPackedBinaryList(packedEntries);
+        if (items !== null && items.length % 2 !== 0) {
+            throw remoteError('WorkerProtocolError', 'packed putMany payload has an odd item count');
+        }
+        const keys =
+            items === null
+                ? unpackPackedBinaryPairKeys(packedEntries)
+                : items.filter((_item, index) => index % 2 === 0);
         if (keys.length === 0) {
             return;
         }
+        const storedEntries =
+            items === null ? packedEntries : await this.encodePackedEntriesForWrite(txId, store, items, keys);
         let baselines: Uint8Array;
         try {
             baselines = this.withEngine((engine) =>
-                engine.put_many_packed(toWasmU64(txId), store, packedEntries, toWasmPutOptions(options))
+                engine.put_many_packed(toWasmU64(txId), store, storedEntries, toWasmPutOptions(options))
             );
         } catch (error) {
             const partial = partialBooleanOutcomes(error);
@@ -1178,6 +1225,107 @@ export class DbWorker implements WorkerApi {
     async scan(txId: number, store: string, range: Range): Promise<ScanItem[]> {
         return this.readStoreScan(txId, store, range);
     }
+    async scanPage(request: WorkerScanPageRequest): Promise<WorkerScanPage> {
+        if (
+            !Number.isSafeInteger(request.maxRows) ||
+            request.maxRows <= 0 ||
+            request.maxRows > MAX_PACKED_BYTES ||
+            !Number.isSafeInteger(request.maxBytes) ||
+            request.maxBytes < 4 ||
+            request.maxBytes > MAX_PACKED_BYTES
+        ) {
+            throw remoteError(
+                'InvalidRangeError',
+                'scan page budgets must be positive u32 integers; maxBytes must be at least 4'
+            );
+        }
+        let cursorId = request.cursorId;
+        let cursor = cursorId === undefined ? undefined : this.primaryCursors.get(cursorId);
+        if (cursorId !== undefined) {
+            if (!cursor) {
+                throw remoteError('TransactionClosedError', 'scan cursor is closed');
+            }
+            if (
+                cursor.store !== request.store ||
+                cursor.callerTxId !== request.txId ||
+                !rangesEqual(cursor.range, request.range ?? EMPTY_RANGE)
+            ) {
+                throw remoteError('InvalidRangeError', 'scan continuation does not match the cursor');
+            }
+        } else {
+            const ownsTx = request.txId === undefined;
+            const txId = request.txId ?? (await this.begin('readonly'));
+            const range = copyRange(request.range ?? EMPTY_RANGE);
+            let engineId: number;
+            try {
+                engineId = this.withEngine((engine) =>
+                    engine.open_scan_cursor(toWasmU64(txId), request.store, toWasmRange(range), false)
+                );
+            } catch (error) {
+                if (ownsTx) {
+                    try {
+                        await this.rollback(txId);
+                    } catch {}
+                }
+                throw error;
+            }
+            cursorId = this.nextPrimaryCursorId++;
+            cursor = { engineId, txId, ownsTx, store: request.store, range, callerTxId: request.txId };
+            this.primaryCursors.set(cursorId, cursor);
+        }
+        try {
+            const page = this.withEngine((engine) =>
+                engine.scan_cursor_next(cursor.engineId, request.maxRows, request.maxBytes)
+            );
+            const packet = normalizeWasmBytes(page.packet);
+            const rowCount =
+                packet.byteLength < 4 ? -1 : new DataView(packet.buffer, packet.byteOffset, 4).getUint32(0, true);
+            if (rowCount !== page.rowCount || rowCount > request.maxRows || packet.byteLength > request.maxBytes) {
+                throw remoteError('CorruptionError', 'scan cursor returned an invalid page budget or count');
+            }
+            const compressed = this.storeCompressionForTx(cursor.txId, cursor.store) !== false;
+            const rows = compressed ? unpackPackedScanRows(packet) : null;
+            let bytes = packet.byteLength;
+            if (rows !== null) {
+                bytes = 4;
+                for (const row of rows) {
+                    row.value = await this.decodeStoreValue(cursor.txId, cursor.store, row.value);
+                    bytes += 8 + row.key.byteLength + row.value.byteLength;
+                    if (bytes > request.maxBytes) {
+                        throw remoteError('ValueTooLargeError', 'decoded scan page exceeds maxBytes');
+                    }
+                }
+            }
+            if (page.exhausted) {
+                await this.closeCursor(cursorId!);
+            }
+            return {
+                rows: rows ?? (packedScanRows(packet) as unknown as ScanItem[]),
+                done: page.exhausted,
+                bytes,
+                ...(page.exhausted ? {} : { cursorId })
+            };
+        } catch (error) {
+            try {
+                await this.closeCursor(cursorId!);
+            } catch {}
+            throw error;
+        }
+    }
+    async closeCursor(cursorId: number): Promise<void> {
+        const cursor = this.primaryCursors.get(cursorId);
+        if (!cursor) {
+            return;
+        }
+        this.primaryCursors.delete(cursorId);
+        try {
+            this.withEngine((engine) => engine.close_scan_cursor(cursor.engineId));
+        } finally {
+            if (cursor.ownsTx) {
+                await this.rollback(cursor.txId);
+            }
+        }
+    }
     async getByIndex(txId: number, store: string, indexName: string, key: Uint8Array): Promise<Uint8Array | null> {
         const def = this.resolveIndexDefinition(txId, store, indexName);
         const page = await this.loadVisibleIndexPage(txId, def, { gte: key, lte: key }, null, 1);
@@ -1211,13 +1359,17 @@ export class DbWorker implements WorkerApi {
         indexName: string,
         range: Range,
         cursor: Uint8Array | null,
-        limit: number
+        limit: number,
+        maxBytes: number = INDEX_SCAN_PAGE_BYTES
     ): Promise<IndexScanPage> {
         if (!Number.isSafeInteger(limit) || limit <= 0) {
             throw remoteError('InvalidRangeError', 'index scan page limit must be a positive integer');
         }
+        if (!Number.isSafeInteger(maxBytes) || maxBytes < 4 || maxBytes > MAX_PACKED_BYTES) {
+            throw remoteError('InvalidRangeError', 'index scan page maxBytes must be a u32 integer of at least 4');
+        }
         const def = this.resolveIndexDefinition(txId, store, indexName);
-        return this.loadVisibleIndexPage(txId, def, range, cursor, limit);
+        return this.loadVisibleIndexPage(txId, def, range, cursor, limit, maxBytes);
     }
     getIndexes(txId?: number): Promise<IndexDef[]> {
         return Promise.resolve(
@@ -1638,6 +1790,14 @@ export class DbWorker implements WorkerApi {
         };
     }
     private cleanupTxState(txId: number): void {
+        for (const [cursorId, cursor] of this.primaryCursors) {
+            if (cursor.txId === txId) {
+                this.primaryCursors.delete(cursorId);
+                try {
+                    this.engine?.close_scan_cursor(cursor.engineId);
+                } catch {}
+            }
+        }
         this.txChanges.delete(txId);
         this.txModes.delete(txId);
         this.txIndexSchemas.delete(txId);
@@ -1889,6 +2049,186 @@ export class DbWorker implements WorkerApi {
         }
         return storedEntries;
     }
+    private async encodePackedEntriesForWrite(
+        txId: number,
+        store: string,
+        items: Uint8Array[],
+        keys: Uint8Array[]
+    ): Promise<Uint8Array> {
+        const records = new Array<PreparedPutValue>(items.length / 2);
+        for (let index = 0; index < records.length; index += 1) {
+            const value = this.preparePutValue(txId, store, items[index * 2 + 1]);
+            records[index] = value instanceof Promise ? await value : value;
+        }
+        return this.packPreparedPutEntries(keys, records);
+    }
+    private preparePutValue(txId: number, store: string, value: Uint8Array): PreparedPutValue | Promise<Uint8Array> {
+        const compression = this.storeCompressionForTx(txId, store);
+        return compression === 'snappy' || compression === false
+            ? prepareFastStoreValueRecord(value, compression)
+            : encodeStoreValueRecord(value, compression);
+    }
+    private packPreparedPutEntries(keys: Uint8Array[], records: PreparedPutValue[]): Uint8Array {
+        let total = 4 + keys.length * 8;
+        for (let index = 0; index < keys.length; index += 1) {
+            total += keys[index].byteLength + records[index].byteLength;
+            if (total > MAX_PACKED_BYTES) {
+                throw remoteError('WorkerProtocolError', 'compressed packed putMany exceeds the u32 byte limit');
+            }
+        }
+        const bytes = new Uint8Array(total);
+        const view = new DataView(bytes.buffer);
+        view.setUint32(0, keys.length * 2, true);
+        let offset = 4 + keys.length * 8;
+        for (let index = 0; index < records.length; index += 1) {
+            const key = keys[index];
+            const record = records[index];
+            view.setUint32(4 + index * 8, key.byteLength, true);
+            view.setUint32(8 + index * 8, record.byteLength, true);
+            bytes.set(key, offset);
+            offset += key.byteLength;
+            if (record instanceof Uint8Array) {
+                bytes.set(record, offset);
+                offset += record.byteLength;
+            } else {
+                offset = writePreparedStoreValueRecord(record, bytes, offset);
+            }
+        }
+        return bytes;
+    }
+    private async putIndexedMany(
+        txId: number,
+        store: string,
+        items: Uint8Array[],
+        defs: NormalizedIndexDef[],
+        options: PutOptions
+    ): Promise<void> {
+        let keys: Uint8Array[] = [];
+        let values: PreparedPutValue[] = [];
+        let indexOps: IndexedPutOp[][] = [];
+        let bytes = 4;
+        const pendingPrimaries = new Set<string>();
+        const pendingUniqueKeys = new Set<string>();
+        const flush = (): void => {
+            if (keys.length === 0) {
+                return;
+            }
+            const batchKeys = keys;
+            const batchValues = values;
+            const batchOps = indexOps;
+            // Detach the plan so a failed flush cannot be retried by the error handler.
+            keys = [];
+            values = [];
+            indexOps = [];
+            bytes = 4;
+            pendingPrimaries.clear();
+            pendingUniqueKeys.clear();
+            const packet = this.packPreparedPutEntries(batchKeys, batchValues);
+            let baselines: Uint8Array;
+            try {
+                baselines = this.withEngine((engine) =>
+                    engine.put_many_indexed_packed(toWasmU64(txId), store, packet, batchOps, toWasmPutOptions(options))
+                );
+            } catch (error) {
+                const partial = partialBooleanOutcomes(error);
+                if (partial.length > 0) {
+                    this.recordPutKeyChanges(txId, store, batchKeys, partial);
+                }
+                throw error;
+            }
+            if (baselines.length !== batchKeys.length) {
+                throw remoteError(
+                    'InternalError',
+                    `put_many_indexed_packed outcome count mismatch: ${baselines.length} != ${batchKeys.length}`
+                );
+            }
+            this.recordPutKeyChanges(txId, store, batchKeys, baselines);
+        };
+        for (let index = 0; index < items.length / 2; index += 1) {
+            const key = items[index * 2];
+            const value = items[index * 2 + 1];
+            const primaryToken = bytesToHex(key);
+            if (pendingPrimaries.has(primaryToken)) {
+                flush();
+            }
+            try {
+                const oldValue = await this.readStoreValue(txId, store, key);
+                const oldKeyFor = oldValue === null ? null : createIndexKeyExtractor(oldValue);
+                const newKeyFor = createIndexKeyExtractor(value);
+                const plans = defs.map((def) => ({
+                    def,
+                    oldLogicalKey: oldKeyFor === null ? null : oldKeyFor(def),
+                    newLogicalKey: newKeyFor(def),
+                    newPhysicalKey: null as Uint8Array | null
+                }));
+                if (
+                    plans.some(
+                        (plan) =>
+                            plan.def.unique &&
+                            plan.newLogicalKey !== null &&
+                            pendingUniqueKeys.has(`${plan.def.internalStore}:${bytesToHex(plan.newLogicalKey)}`)
+                    )
+                ) {
+                    // Reused unique keys must observe all earlier primary and index writes.
+                    flush();
+                    index -= 1;
+                    continue;
+                }
+                this.ensureInternalStoresForDefinitions(txId, defs);
+                for (const plan of plans) {
+                    if (plan.newLogicalKey === null) {
+                        continue;
+                    }
+                    plan.newPhysicalKey = this.buildIndexEntryKey(plan.def, plan.newLogicalKey, key);
+                    if (plan.oldLogicalKey === null || !bytesEqual(plan.oldLogicalKey, plan.newLogicalKey)) {
+                        await this.assertUniqueIndexAvailability(txId, plan.def, plan.newLogicalKey, key);
+                    }
+                }
+                const preparedValue = this.preparePutValue(txId, store, value);
+                const storedValue = preparedValue instanceof Promise ? await preparedValue : preparedValue;
+                const ops: IndexedPutOp[] = [];
+                for (const plan of plans) {
+                    if (
+                        plan.oldLogicalKey !== null &&
+                        (plan.newLogicalKey === null || !bytesEqual(plan.oldLogicalKey, plan.newLogicalKey))
+                    ) {
+                        ops.push({
+                            store: plan.def.internalStore,
+                            kind: 'delete',
+                            key: encodeIndexEntryKey(plan.oldLogicalKey, key)
+                        });
+                    }
+                }
+                for (const plan of plans) {
+                    if (plan.newPhysicalKey !== null) {
+                        ops.push({ store: plan.def.internalStore, kind: 'put', key: plan.newPhysicalKey });
+                    }
+                    if (plan.def.unique) {
+                        for (const logicalKey of [plan.oldLogicalKey, plan.newLogicalKey]) {
+                            if (logicalKey !== null) {
+                                pendingUniqueKeys.add(`${plan.def.internalStore}:${bytesToHex(logicalKey)}`);
+                            }
+                        }
+                    }
+                }
+                keys.push(key);
+                values.push(storedValue);
+                indexOps.push(ops);
+                bytes += 8 + key.byteLength + storedValue.byteLength;
+                for (const op of ops) {
+                    bytes += op.key.byteLength;
+                }
+                pendingPrimaries.add(primaryToken);
+            } catch (error) {
+                flush();
+                throw error;
+            }
+            if (options.ttl !== undefined || keys.length >= INDEX_PUT_BATCH_ROWS || bytes >= INDEX_PUT_BATCH_BYTES) {
+                flush();
+            }
+        }
+        flush();
+    }
     private async encodeBatchOpsForWrite(txId: number, store: string, ops: Array<BatchOp>): Promise<Array<BatchOp>> {
         if (isInternalStoreName(store)) {
             return ops;
@@ -2100,11 +2440,158 @@ export class DbWorker implements WorkerApi {
         }
         return rows;
     }
+    private readIndexKeyScan(txId: number, store: string, range: Range): ScanItem[] {
+        if (
+            typeof this.engine?.open_scan_cursor !== 'function' ||
+            typeof this.engine?.scan_cursor_next !== 'function' ||
+            typeof this.engine?.close_scan_cursor !== 'function'
+        ) {
+            return this.readRawScan(txId, store, range);
+        }
+        const maxRows = range.limit ?? INDEX_SCAN_RAW_CHUNK_ROWS;
+        const maxBytes = 4 + maxRows * (8 + MAX_ENGINE_KEY_BYTES);
+        const cursorId = this.withEngine((engine) =>
+            engine.open_scan_cursor(toWasmU64(txId), store, toWasmRange(range), true)
+        );
+        try {
+            const page = this.withEngine((engine) => engine.scan_cursor_next(cursorId, maxRows, maxBytes));
+            const packet = normalizeWasmBytes(page.packet);
+            const rows = unpackPackedScanRows(packet);
+            if (
+                rows.length !== page.rowCount ||
+                rows.length > maxRows ||
+                packet.byteLength > maxBytes ||
+                rows.some((row) => row.value.byteLength !== 0)
+            ) {
+                throw remoteError('CorruptionError', 'index key cursor returned an invalid page');
+            }
+            return rows;
+        } finally {
+            this.withEngine((engine) => engine.close_scan_cursor(cursorId));
+        }
+    }
     private putRawValue(txId: number, store: string, key: Uint8Array, value: Uint8Array): void {
         this.withEngine((engine) => engine.put(toWasmU64(txId), store, key, value));
     }
     private putIndexEntry(txId: number, def: NormalizedIndexDef, physicalKey: Uint8Array, value: Uint8Array): void {
+        if (typeof this.engine?.put_index_entry_checked === 'function') {
+            const primaryKey = decodeIndexEntryKey(physicalKey).primaryKey;
+            const state = this.readNativeValueState(txId, def.store, primaryKey);
+            if (state?.revisionKnown) {
+                this.withEngine((engine) =>
+                    engine.put_index_entry_checked!(
+                        toWasmU64(txId),
+                        def.store,
+                        def.internalStore,
+                        primaryKey,
+                        physicalKey,
+                        state.revisionEpoch,
+                        state.revisionOrdinal
+                    )
+                );
+                return;
+            }
+        }
         this.putRawValue(txId, def.internalStore, physicalKey, value);
+    }
+    private readNativeValueState(txId: number, store: string, key: Uint8Array): NativeValueState | null {
+        if (typeof this.engine?.get_many_value_states !== 'function') {
+            return null;
+        }
+        try {
+            const keys = new Uint8Array(8 + key.byteLength);
+            const keyView = new DataView(keys.buffer);
+            keyView.setUint32(0, 1, true);
+            keyView.setUint32(4, key.byteLength, true);
+            keys.set(key, 8);
+            const packet = normalizeWasmBytes(
+                this.withEngine((engine) => engine.get_many_value_states!(toWasmU64(txId), store, keys))
+            );
+            return this.decodeNativeValueStates(packet, 1)?.[0] ?? null;
+        } catch {
+            return null;
+        }
+    }
+    private packNativeKeys(keys: Uint8Array[]): Uint8Array {
+        let total = 4 + keys.length * 4;
+        for (const key of keys) {
+            total += key.byteLength;
+        }
+        const packet = new Uint8Array(total);
+        const view = new DataView(packet.buffer);
+        view.setUint32(0, keys.length, true);
+        let offset = 4 + keys.length * 4;
+        for (let index = 0; index < keys.length; index += 1) {
+            const key = keys[index];
+            view.setUint32(4 + index * 4, key.byteLength, true);
+            packet.set(key, offset);
+            offset += key.byteLength;
+        }
+        return packet;
+    }
+    private decodeNativeValueStates(packet: Uint8Array, count: number): NativeValueState[] | null {
+        if (packet.byteLength !== 4 + count * 32) {
+            return null;
+        }
+        const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength);
+        if (view.getUint32(0, true) !== count) {
+            return null;
+        }
+        const states = new Array<NativeValueState>(count);
+        for (let index = 0; index < count; index += 1) {
+            const offset = 4 + index * 32;
+            const flags = view.getUint32(offset, true);
+            const revisionEpoch = view.getBigUint64(offset + 12, true);
+            const revisionOrdinal = view.getBigUint64(offset + 20, true);
+            if (
+                (flags & ~7) !== 0 ||
+                (flags & 3) === 3 ||
+                ((flags & 4) !== 0 && ((flags & 3) === 0 || revisionEpoch === 0n || revisionOrdinal === 0n))
+            ) {
+                return null;
+            }
+            states[index] = {
+                live: (flags & 1) !== 0,
+                expired: (flags & 2) !== 0,
+                revisionKnown: (flags & 4) !== 0,
+                expiresAt: view.getBigUint64(offset + 4, true),
+                revisionEpoch,
+                revisionOrdinal,
+                maxValueBytes: view.getUint32(offset + 28, true)
+            };
+        }
+        return states;
+    }
+    private inspectIndexedValue(
+        txId: number,
+        def: NormalizedIndexDef,
+        physicalKey: Uint8Array,
+        primaryKey: Uint8Array
+    ): 'missing' | 'trusted' | 'unknown' {
+        const primary = this.readNativeValueState(txId, def.store, primaryKey);
+        if (primary === null) {
+            return 'unknown';
+        }
+        if (!primary.live) {
+            if (primary.expired && this.txModes.get(txId) === 'readwrite') {
+                const live = this.withEngine((engine) => engine.has(toWasmU64(txId), def.store, primaryKey));
+                if (live) {
+                    return 'unknown';
+                }
+            }
+            return 'missing';
+        }
+        if (!primary.revisionKnown) {
+            return 'unknown';
+        }
+        const index = this.readNativeValueState(txId, def.internalStore, physicalKey);
+        // Native managed writes copy the primary revision. Raw writes receive a new revision.
+        return index?.live &&
+            index.revisionKnown &&
+            index.revisionEpoch === primary.revisionEpoch &&
+            index.revisionOrdinal === primary.revisionOrdinal
+            ? 'trusted'
+            : 'unknown';
     }
     private deleteIndexEntryIfPresent(
         txId: number,
@@ -2144,12 +2631,23 @@ export class DbWorker implements WorkerApi {
             }
             // Stop at the first live conflict. Grow bounded chunks only while
             // skipping stale rows so unrelated tail errors stay unobserved.
-            const rows = this.readRawScan(txId, def.internalStore, range);
+            const rows = this.readIndexKeyScan(txId, def.internalStore, range);
             for (const row of rows) {
                 cursor = row.key;
                 const decoded = decodeIndexEntryKey(row.key);
                 if (bytesEqual(decoded.primaryKey, primaryKey)) {
                     continue;
+                }
+                const state = this.inspectIndexedValue(txId, def, row.key, decoded.primaryKey);
+                if (state === 'missing') {
+                    this.cleanupStaleIndexRow(txId, def, row.key);
+                    continue;
+                }
+                if (state === 'trusted') {
+                    throw remoteError(
+                        'UniqueIndexConstraintError',
+                        `unique index constraint violation on ${def.store}.${def.name}`
+                    );
                 }
                 // Keep TTL cleanup and document errors in index row order.
                 const value = await this.readStoreValue(txId, def.store, decoded.primaryKey);
@@ -2183,13 +2681,15 @@ export class DbWorker implements WorkerApi {
         def: NormalizedIndexDef,
         range: Range,
         cursor: Uint8Array | null,
-        limit: number
+        limit: number,
+        maxBytes: number = INDEX_SCAN_PAGE_BYTES
     ): Promise<IndexScanPage> {
         const { limit: _ignored, ...withoutLimit } = range;
         const physical = indexRangeToPhysicalRange(withoutLimit);
         const reverse = physical.reverse === true;
         let resumeAfter = cursor;
         const visible: ScanItem[] = [];
+        let outputBytes = 4;
         // Start with the requested row count. Grow wholly stale chunks
         // geometrically to avoid one scan per expired row at small limits.
         let staleChunkFloor = 1;
@@ -2207,7 +2707,7 @@ export class DbWorker implements WorkerApi {
             }
             let rawRows: ScanItem[];
             try {
-                rawRows = this.readRawScan(txId, def.internalStore, chunkRange);
+                rawRows = this.readIndexKeyScan(txId, def.internalStore, chunkRange);
             } catch (error) {
                 if (isNamedError(error, 'StoreNotFoundError')) {
                     return { rows: [], cursor: null };
@@ -2221,26 +2721,48 @@ export class DbWorker implements WorkerApi {
             for (let index = 0; index < rawRows.length; index += 1) {
                 if (index === batchEnd) {
                     batchStart = index;
-                    // Stale chunks may exceed demand. Bound primary reads by
-                    // the remaining output count to avoid unused values and errors.
-                    batchEnd = Math.min(rawRows.length, index + limit - visible.length);
-                    batch = this.readIndexPrimaryValues(txId, def, rawRows, batchStart, batchEnd);
+                    batch = this.readIndexPrimaryValues(
+                        txId,
+                        def,
+                        rawRows,
+                        index,
+                        Math.min(rawRows.length, index + limit - visible.length),
+                        maxBytes - outputBytes
+                    );
+                    batchEnd = index + (batch?.entries.length ?? 1);
                 }
                 const row = rawRows[index];
-                resumeAfter = row.key;
                 const resolved = batch
                     ? await this.resolveVisibleIndexedValue(
                           txId,
                           def,
                           row.key,
                           batch.entries[index - batchStart],
-                          batch.values[index - batchStart]
+                          batch.values[index - batchStart],
+                          batch.trusted[index - batchStart]
                       )
                     : await this.resolveVisibleIndexedRow(txId, def, row.key);
+                if (batch !== null) {
+                    batch.values[index - batchStart] = null;
+                }
                 if (!resolved) {
+                    resumeAfter = row.key;
                     continue;
                 }
+                const nextBytes = outputBytes + 8 + resolved.key.byteLength + resolved.value.byteLength;
+                if (nextBytes > maxBytes) {
+                    if (visible.length === 0) {
+                        throw remoteError('ValueTooLargeError', 'indexed scan row exceeds maxBytes');
+                    }
+                    if (resumeAfter === null) {
+                        throw remoteError('InternalError', 'indexed scan lost its continuation key');
+                    }
+                    // The next page must retry this live row.
+                    return { rows: visible, cursor: resumeAfter.slice() };
+                }
                 visible.push(resolved);
+                outputBytes = nextBytes;
+                resumeAfter = row.key;
                 if (visible.length >= limit) {
                     return { rows: visible, cursor: row.key.slice() };
                 }
@@ -2257,35 +2779,122 @@ export class DbWorker implements WorkerApi {
         def: NormalizedIndexDef,
         rows: ScanItem[],
         start: number,
-        end: number
-    ): { entries: DecodedIndexEntryKey[]; values: Array<Uint8Array | null> } | null {
-        // Write transactions may stage TTL expiry, so use reads in index row order.
-        if (this.txModes.get(txId) !== 'readonly' || end - start <= 1) {
+        end: number,
+        remainingBytes: number
+    ): { entries: DecodedIndexEntryKey[]; values: Array<Uint8Array | null>; trusted: boolean[] } | null {
+        if (
+            this.txModes.get(txId) !== 'readonly' ||
+            end - start <= 1 ||
+            (typeof this.engine?.get_many_value_sizes !== 'function' &&
+                typeof this.engine?.get_many_value_states !== 'function')
+        ) {
             return null;
         }
         let entries: DecodedIndexEntryKey[];
         let values: Array<Uint8Array | null>;
+        let trusted: boolean[];
+        let loaded: Array<Uint8Array | null>;
+        let selectedIndices: number[];
         try {
             entries = rows.slice(start, end).map((row) => decodeIndexEntryKey(row.key));
-            values = this.withEngine((engine) =>
-                engine.get_many(
-                    toWasmU64(txId),
-                    def.store,
-                    entries.map((entry) => entry.primaryKey)
-                )
-            );
+            const packedKeys = this.packNativeKeys(entries.map((entry) => entry.primaryKey));
+            let primaryStates: NativeValueState[] | null = null;
+            let indexStates: NativeValueState[] | null = null;
+            let sizes: Uint32Array;
+            if (typeof this.engine?.get_many_value_states === 'function') {
+                primaryStates = this.decodeNativeValueStates(
+                    normalizeWasmBytes(
+                        this.withEngine((engine) =>
+                            engine.get_many_value_states!(toWasmU64(txId), def.store, packedKeys)
+                        )
+                    ),
+                    entries.length
+                );
+                if (primaryStates === null) {
+                    return null;
+                }
+                sizes = Uint32Array.from(primaryStates, (state) =>
+                    state.live ? state.maxValueBytes : MAX_PACKED_BYTES
+                );
+                if (primaryStates.some((state) => state.live && state.revisionKnown)) {
+                    const indexKeys = this.packNativeKeys(rows.slice(start, end).map((row) => row.key));
+                    indexStates = this.decodeNativeValueStates(
+                        normalizeWasmBytes(
+                            this.withEngine((engine) =>
+                                engine.get_many_value_states!(toWasmU64(txId), def.internalStore, indexKeys)
+                            )
+                        ),
+                        entries.length
+                    );
+                    if (indexStates === null) {
+                        return null;
+                    }
+                }
+            } else {
+                sizes = this.withEngine((engine) =>
+                    engine.get_many_value_sizes!(toWasmU64(txId), def.store, packedKeys)
+                );
+            }
+            if (sizes.length !== entries.length) {
+                return null;
+            }
+            let selected = 0;
+            for (const entry of entries) {
+                const size = sizes[selected];
+                if (!Number.isSafeInteger(size) || size < 0 || size > MAX_PACKED_BYTES) {
+                    return null;
+                }
+                const required = size === MAX_PACKED_BYTES ? 0 : 8 + entry.primaryKey.byteLength + size;
+                if (required > remainingBytes) {
+                    break;
+                }
+                remainingBytes -= required;
+                selected += 1;
+            }
+            if (selected <= 1) {
+                return null;
+            }
+            // Native sizes bound body reads. Each document still requires index validation.
+            entries.length = selected;
+            trusted = new Array<boolean>(selected).fill(false);
+            const selectedKeys: Uint8Array[] = [];
+            selectedIndices = [];
+            values = new Array<Uint8Array | null>(selected).fill(null);
+            for (let index = 0; index < selected; index += 1) {
+                const primary = primaryStates?.[index];
+                if (primary === undefined || primary.live) {
+                    selectedKeys.push(entries[index].primaryKey);
+                    selectedIndices.push(index);
+                }
+                const proof = indexStates?.[index];
+                trusted[index] = Boolean(
+                    primary?.live &&
+                    primary.revisionKnown &&
+                    proof?.live &&
+                    proof.revisionKnown &&
+                    primary.revisionEpoch === proof.revisionEpoch &&
+                    primary.revisionOrdinal === proof.revisionOrdinal
+                );
+            }
+            loaded =
+                selectedKeys.length === 0
+                    ? []
+                    : this.withEngine((engine) => engine.get_many(toWasmU64(txId), def.store, selectedKeys));
         } catch {
-            // Readonly batch reads stage no writes. Retry in row order so an
-            // earlier document error precedes a later read or malformed-key error.
+            // Row order preserves an earlier document error if a later preflight or body read fails.
             return null;
         }
-        if (values.length !== entries.length) {
+        if (loaded.length !== selectedIndices.length) {
             throw remoteError(
                 'InternalError',
-                `get_many outcome count mismatch: ${values.length} != ${entries.length}`
+                `get_many outcome count mismatch: ${loaded.length} != ${selectedIndices.length}`
             );
         }
-        return { entries, values };
+        for (let index = 0; index < loaded.length; index += 1) {
+            values[selectedIndices[index]] = loaded[index];
+            loaded[index] = null;
+        }
+        return { entries, values, trusted };
     }
     private async resolveVisibleIndexedRow(
         txId: number,
@@ -2293,25 +2902,33 @@ export class DbWorker implements WorkerApi {
         physicalKey: Uint8Array
     ): Promise<ScanItem | null> {
         const decoded = decodeIndexEntryKey(physicalKey);
+        const state = this.inspectIndexedValue(txId, def, physicalKey, decoded.primaryKey);
+        if (state === 'missing') {
+            this.cleanupStaleIndexRow(txId, def, physicalKey);
+            return null;
+        }
         const value = this.readRawValue(txId, def.store, decoded.primaryKey);
-        return this.resolveVisibleIndexedValue(txId, def, physicalKey, decoded, value);
+        return this.resolveVisibleIndexedValue(txId, def, physicalKey, decoded, value, state === 'trusted');
     }
     private async resolveVisibleIndexedValue(
         txId: number,
         def: NormalizedIndexDef,
         physicalKey: Uint8Array,
         decoded: DecodedIndexEntryKey,
-        rawValue: Uint8Array | null
+        rawValue: Uint8Array | null,
+        trusted: boolean = false
     ): Promise<ScanItem | null> {
         if (rawValue === null) {
             this.cleanupStaleIndexRow(txId, def, physicalKey);
             return null;
         }
         const value = await this.decodeStoreValue(txId, def.store, normalizeWasmBytes(rawValue));
-        const currentLogicalKey = extractLogicalIndexKey(def, value);
-        if (currentLogicalKey === null || !bytesEqual(currentLogicalKey, decoded.logicalKey)) {
-            this.cleanupStaleIndexRow(txId, def, physicalKey);
-            return null;
+        if (!trusted) {
+            const currentLogicalKey = extractLogicalIndexKey(def, value);
+            if (currentLogicalKey === null || !bytesEqual(currentLogicalKey, decoded.logicalKey)) {
+                this.cleanupStaleIndexRow(txId, def, physicalKey);
+                return null;
+            }
         }
         return {
             key: decoded.primaryKey,
@@ -2373,6 +2990,7 @@ export class DbWorker implements WorkerApi {
         }
     }
     private clearTxCaches(): void {
+        this.primaryCursors.clear();
         this.txChanges.clear();
         this.txModes.clear();
         this.txIndexSchemas.clear();

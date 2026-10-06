@@ -85,7 +85,9 @@ function installEnvironment(exposeWorkerApi, protocol) {
     class MockWorker extends Surface {
         requests = new Map();
         transactions = new Map();
+        cursors = new Map();
         nextTx = 1;
+        nextCursor = 1;
         terminated = false;
         constructor() {
             super();
@@ -120,10 +122,19 @@ function installEnvironment(exposeWorkerApi, protocol) {
                     if (owners.has(dbName)) throw namedError('DatabaseBusyError');
                     this.dbName = dbName;
                     owners.set(dbName, this);
-                    if (!databases.has(dbName)) databases.set(dbName, { version: 0, stores: new Set() });
+                    if (!databases.has(dbName))
+                        databases.set(dbName, {
+                            version: 0,
+                            stores: new Set(),
+                            rows: Array.from({ length: 100 }, (_, index) => ({
+                                key: Uint8Array.of(index + 1),
+                                value: new Uint8Array(100).fill(index + 1)
+                            }))
+                        });
                     this.database = databases.get(dbName);
                 },
                 close: async () => {
+                    this.cursors.clear();
                     this.transactions.clear();
                     if (owners.get(this.dbName) === this) owners.delete(this.dbName);
                 },
@@ -144,7 +155,8 @@ function installEnvironment(exposeWorkerApi, protocol) {
                         mode,
                         stores: new Set(this.database.stores),
                         snapshotStores: new Set(this.database.stores),
-                        version: this.database.version
+                        version: this.database.version,
+                        rows: this.database.rows.slice()
                     });
                     return id;
                 },
@@ -158,6 +170,55 @@ function installEnvironment(exposeWorkerApi, protocol) {
                 rollback: async (id) => {
                     requireTx(id);
                     this.transactions.delete(id);
+                    for (const [cursor, state] of this.cursors) if (state.txId === id) this.cursors.delete(cursor);
+                },
+                scanPage: async (request) => {
+                    let cursorId = request.cursorId;
+                    let state = this.cursors.get(cursorId);
+                    if (cursorId !== undefined && !state) throw namedError('TransactionClosedError');
+                    if (!state) {
+                        const txId = request.txId ?? (await api.begin('readonly'));
+                        state = { txId, ownsTx: request.txId === undefined, offset: 0, rows: requireTx(txId).rows };
+                        cursorId = this.nextCursor++;
+                        this.cursors.set(cursorId, state);
+                    }
+                    const rows = [];
+                    let bytes = 4;
+                    while (state.offset < state.rows.length && rows.length < request.maxRows) {
+                        const row = state.rows[state.offset];
+                        const size = 8 + row.key.byteLength + row.value.byteLength;
+                        if (bytes + size > request.maxBytes) {
+                            if (!rows.length) {
+                                await api.closeCursor(cursorId);
+                                throw namedError('ValueTooLargeError');
+                            }
+                            break;
+                        }
+                        rows.push(row);
+                        bytes += size;
+                        state.offset += 1;
+                    }
+                    const done = state.offset === state.rows.length;
+                    if (done) await api.closeCursor(cursorId);
+                    return { rows, cursorId: done ? undefined : cursorId, done, bytes };
+                },
+                closeCursor: async (id) => {
+                    const state = this.cursors.get(id);
+                    this.cursors.delete(id);
+                    if (state?.ownsTx) this.transactions.delete(state.txId);
+                },
+                scanByIndexPage: async (id, _store, _index, _range, cursor, limit, maxBytes) => {
+                    const available = requireTx(id).rows.filter((row) => !cursor || row.key[0] > cursor[0]);
+                    const rows = [];
+                    let bytes = 4;
+                    for (const row of available) {
+                        const size = 8 + row.key.byteLength + row.value.byteLength;
+                        if (rows.length === limit || bytes + size > maxBytes) break;
+                        rows.push(row);
+                        bytes += size;
+                    }
+                    if (!rows.length && available.length) throw namedError('ValueTooLargeError');
+                    return { rows, cursor: rows.length === available.length ? null : rows.at(-1).key };
                 },
                 get: async (id) => {
                     requireTx(id);
@@ -194,7 +255,7 @@ function installEnvironment(exposeWorkerApi, protocol) {
             const data = structuredClone(message, { transfer });
             for (const request of data.requests ?? [data]) {
                 this.requests.set(request.id, request.command);
-                calls.push({ worker: this, command: request.command });
+                calls.push({ worker: this, command: request.command, args: request.args });
             }
             queueMicrotask(() => this.scope.emit('message', data));
         }
@@ -264,6 +325,115 @@ try {
     const tests = [];
     const test = (name, run) => tests.push({ name, run });
     const open = (name, options = {}) => sdk.openDB(name, { requestPersistence: false, ...options });
+    test('primary scan pages keep one snapshot and obey row and byte budgets', async (env) => {
+        const db = await open('cursor-snapshot');
+        const first = await db.scanPage('kv', {}, { maxRows: 2, maxBytes: 128 });
+        assert.equal(first.rows.length, 1);
+        assert.equal(first.bytes, 113);
+        assert.equal(env.activeTransactions(), 1);
+        const worker = [...env.workers][0];
+        worker.database.rows = [];
+        const second = await db.scanPage('kv', {}, { cursor: first.cursor, maxRows: 2, maxBytes: 256 });
+        assert.deepEqual(
+            second.rows.map((row) => row.key[0]),
+            [2, 3]
+        );
+        await db.closeScanCursor(second.cursor);
+        assert.equal(env.activeTransactions(), 0);
+        assert.equal(worker.cursors.size, 0);
+        await db.close();
+    });
+    test('breaking primary iteration releases its snapshot without another page', async (env) => {
+        const db = await open('cursor-break');
+        for await (const row of db.scanIter('kv', {}, { maxRows: 1 })) {
+            assert.equal(row.key[0], 1);
+            break;
+        }
+        assert.equal(env.calls.filter((call) => call.command === 'scanPage').length, 1);
+        assert.equal(env.calls.filter((call) => call.command === 'closeCursor').length, 1);
+        assert.equal(env.activeTransactions(), 0);
+        await db.close();
+    });
+    test('a primary cursor belongs to its database handle or transaction', async (env) => {
+        const first = await open('cursor-owner');
+        const second = await open('cursor-owner');
+        const page = await first.scanPage('kv', {}, { maxRows: 1 });
+        const before = env.calls.length;
+        await assert.rejects(second.scanPage('kv', {}, { cursor: page.cursor }), /does not belong/);
+        assert.equal(env.calls.length, before);
+        await first.close();
+        assert.equal(env.activeTransactions(), 0);
+        const tx = await second.begin('readonly');
+        const txPage = await tx.scanPage('kv', {}, { maxRows: 1 });
+        await tx.rollback();
+        await assert.rejects(tx.scanPage('kv', {}, { cursor: txPage.cursor }), { name: 'TransactionClosedError' });
+        assert.equal(env.activeTransactions(), 0);
+        await second.close();
+    });
+    test('close consumes an in-flight primary scan reply on a shared handle', async (env) => {
+        const first = await open('pending-scan');
+        const second = await open('pending-scan');
+        const gate = env.holdResponse('scanPage');
+        const pending = first.scanPage('kv', {}, { maxRows: 1 });
+        const settled = Promise.allSettled([pending]);
+        await gate.entered;
+        const closing = first.close();
+        gate.release();
+        await closing;
+        const [result] = await settled;
+        assert.equal(result.status, 'rejected');
+        assert.equal(result.reason.name, 'DatabaseClosedError');
+        assert.equal(env.activeTransactions(), 0);
+        assert.equal([...env.workers][0].cursors.size, 0);
+        await second.close();
+    });
+    test('an oversized first primary row closes its snapshot', async (env) => {
+        const db = await open('cursor-oversize');
+        await assert.rejects(db.scanPage('kv', {}, { maxRows: 1, maxBytes: 100 }), { name: 'ValueTooLargeError' });
+        assert.equal(env.activeTransactions(), 0);
+        await db.close();
+    });
+    test('default primary page accepts the largest supported payload and key', async (env) => {
+        const db = await open('cursor-largest');
+        [...env.workers][0].database.rows = [{ key: new Uint8Array(1024), value: new Uint8Array(8 * 1024 * 1024) }];
+        const page = await db.scanPage('kv');
+        assert.equal(page.rows.length, 1);
+        assert.equal(page.bytes, 8 * 1024 * 1024 + 1024 + 12);
+        assert.equal(page.done, true);
+        assert.equal(page.cursor, undefined);
+        assert.equal(env.calls.findLast((call) => call.command === 'scanPage').args[0].maxBytes, page.bytes + 18);
+        assert.equal(env.activeTransactions(), 0);
+        const before = env.calls.length;
+        await assert.rejects(db.scanPage('kv', {}, { maxRows: 0 }), /maxRows/);
+        await assert.rejects(db.scanPage('kv', {}, { maxBytes: 3 }), /maxBytes/);
+        assert.equal(env.calls.length, before);
+        await db.close();
+    });
+    test('secondary iteration forwards row and decoded byte budgets on every page', async (env) => {
+        const db = await open('index-cursor-budget');
+        const tx = await db.begin('readonly');
+        const keys = [];
+        for await (const [key] of tx.scanByIndex('kv', 'by_value', { limit: 3 }, { maxRows: 10, maxBytes: 128 }))
+            keys.push(key[0]);
+        assert.deepEqual(keys, [1, 2, 3]);
+        const calls = env.calls.filter((call) => call.command === 'scanByIndexPage');
+        assert.equal(calls.length, 3);
+        assert.ok(calls.every((call) => call.args[6] === 128));
+        assert.deepEqual(
+            calls.map((call) => call.args[5]),
+            [3, 2, 1]
+        );
+        await assert.rejects(
+            async () => {
+                for await (const row of tx.scanByIndex('kv', 'by_value', {}, { maxBytes: 100 })) {
+                    assert.fail(`oversized indexed row returned ${row.key.length} key bytes`);
+                }
+            },
+            { name: 'ValueTooLargeError' }
+        );
+        await tx.rollback();
+        await db.close();
+    });
     test('concurrent same-name opens share one owner and independent handles', async (env) => {
         const results = await Promise.allSettled([open('shared-open'), open('shared-open')]);
         assert.ok(

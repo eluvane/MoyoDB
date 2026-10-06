@@ -1,4 +1,5 @@
 import { test as base, expect, type BrowserContext } from '@playwright/test';
+import { createHash } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -194,10 +195,12 @@ function normalizeOptionalCount(value: string | undefined, name: string): number
 }
 
 function safeFileSegment(value: string): string {
-    return (
+    const segment =
         value
             .toLowerCase()
             .replace(/[^a-z0-9.-]+/g, '-')
-            .replace(/^-|-$/g, '') || 'unknown'
-    );
+            .replace(/^-|-$/g, '') || 'unknown';
+    if (segment.length <= 100) return segment;
+    const digest = createHash('sha256').update(value).digest('hex').slice(0, 12);
+    return `${segment.slice(0, 87)}-${digest}`;
 }

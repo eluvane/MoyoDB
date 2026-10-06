@@ -1,4 +1,7 @@
-use crate::bytes::{read_u16_le, read_u32_le, validate_key, validate_store_name};
+use crate::bytes::{
+    read_u16_le, read_u32_le, validate_key, validate_store_name, MAX_KEY_BYTES,
+    MAX_STORE_NAME_BYTES,
+};
 use crate::catalog::CatalogMap;
 use crate::error::{EngineError, Result};
 use crate::value::STORE_FLAG_SYSTEM_RAW_VALUES;
@@ -14,6 +17,8 @@ pub const CHANGELOG_STORE_FLAGS: u64 = STORE_FLAG_SYSTEM_RAW_VALUES;
 
 const CHANGE_RECORD_MAGIC: [u8; 4] = *b"CHG1";
 const CHANGE_RECORD_HEADER_SIZE: usize = 14;
+pub(crate) const MAX_CHANGE_RECORD_PREFIX_SIZE: usize =
+    CHANGE_RECORD_HEADER_SIZE + MAX_STORE_NAME_BYTES + MAX_KEY_BYTES;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -75,6 +80,14 @@ pub(crate) struct ChangeRecordRef<'a> {
     key: &'a [u8],
     kind: ChangeKind,
     value: Option<&'a [u8]>,
+}
+
+pub(crate) struct ChangeRecordPrefixRef<'a> {
+    pub(crate) store: &'a str,
+    pub(crate) key: &'a [u8],
+    pub(crate) kind: ChangeKind,
+    pub(crate) value_prefix: &'a [u8],
+    pub(crate) value_len: usize,
 }
 
 impl ChangeRecordRef<'_> {
@@ -239,11 +252,28 @@ pub fn decode_change_record_payload(txid: TxId, payload: &[u8]) -> Result<Change
 
 /// Validates the complete payload before callers inspect the borrowed fields.
 pub(crate) fn decode_change_record_payload_ref(payload: &[u8]) -> Result<ChangeRecordRef<'_>> {
-    if payload.len() < CHANGE_RECORD_HEADER_SIZE {
-        return Err(EngineError::Corruption(format!(
+    let record = decode_change_record_prefix_ref(payload, payload.len())?.ok_or_else(|| {
+        EngineError::Corruption(format!(
             "change log payload too short: expected at least {CHANGE_RECORD_HEADER_SIZE} bytes, got {}",
             payload.len()
-        )));
+        ))
+    })?;
+    Ok(ChangeRecordRef {
+        store: record.store,
+        key: record.key,
+        kind: record.kind,
+        value: (record.kind == ChangeKind::Put).then_some(record.value_prefix),
+    })
+}
+
+/// Returns None until the prefix contains the header, store name, and key.
+/// The declared total length includes the body.
+pub(crate) fn decode_change_record_prefix_ref(
+    payload: &[u8],
+    total_len: usize,
+) -> Result<Option<ChangeRecordPrefixRef<'_>>> {
+    if payload.len() < CHANGE_RECORD_HEADER_SIZE {
+        return Ok(None);
     }
     if payload[..4] != CHANGE_RECORD_MAGIC {
         return Err(EngineError::Corruption(
@@ -274,11 +304,24 @@ pub(crate) fn decode_change_record_payload_ref(payload: &[u8]) -> Result<ChangeR
         .checked_add(value_len)
         .ok_or_else(|| EngineError::Corruption("change log value length overflow".into()))?;
 
-    if payload.len() != value_end {
+    if total_len != value_end {
         return Err(EngineError::Corruption(format!(
             "change log payload length mismatch: expected {value_end} bytes, got {}",
-            payload.len()
+            total_len
         )));
+    }
+    if store_len > MAX_STORE_NAME_BYTES || key_len > MAX_KEY_BYTES {
+        return Err(EngineError::Corruption(
+            "change log prefix exceeds its length limits".into(),
+        ));
+    }
+    if payload.len() < key_end {
+        return Ok(None);
+    }
+    if payload.len() > value_end {
+        return Err(EngineError::Corruption(
+            "change log prefix exceeds its payload length".into(),
+        ));
     }
 
     let store = std::str::from_utf8(&payload[header_end..store_end])
@@ -288,8 +331,8 @@ pub(crate) fn decode_change_record_payload_ref(payload: &[u8]) -> Result<ChangeR
     let key = &payload[store_end..key_end];
     validate_key(key)?;
 
-    let value = match kind {
-        ChangeKind::Put => Some(&payload[key_end..value_end]),
+    match kind {
+        ChangeKind::Put => {}
         ChangeKind::Delete | ChangeKind::Clear | ChangeKind::Drop => {
             if value_len != 0 {
                 return Err(EngineError::Corruption(
@@ -301,14 +344,14 @@ pub(crate) fn decode_change_record_payload_ref(payload: &[u8]) -> Result<ChangeR
                     "store-level change record unexpectedly stored a key".into(),
                 ));
             }
-            None
         }
-    };
+    }
 
-    Ok(ChangeRecordRef {
+    Ok(Some(ChangeRecordPrefixRef {
         store,
         key,
         kind,
-        value,
-    })
+        value_prefix: &payload[key_end..],
+        value_len,
+    }))
 }

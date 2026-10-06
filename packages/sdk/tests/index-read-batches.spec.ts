@@ -1,5 +1,114 @@
 import { expect, test } from '@playwright/test';
 import { prepareMoyoDbPage, uniqueDbName } from './support';
+import type * as RegistryModule from '../src/registry';
+
+test('secondary pages bound decoded bytes and resume before an unreturned large candidate', async ({ page }) => {
+    await prepareMoyoDbPage(page);
+    const result = await page.evaluate(async (name) => {
+        const sdk = window.moyodb;
+        const db = await sdk.openDB(name, {
+            requestPersistence: false,
+            version: 1,
+            indexes: [{ store: 'docs', name: 'byGroup', keyPath: 'group' }],
+            migrate: async ({ db }) => {
+                await db.createStore('docs', { compression: 'snappy' });
+            }
+        });
+        const modulePath = '/src/registry.ts';
+        const registry = (await import(modulePath)) as typeof RegistryModule;
+        const entry = await registry.acquireDbWorker(name, { requestPersistence: false });
+        try {
+            const seed = await db.begin('readwrite');
+            await seed.putMany(
+                'docs',
+                Array.from({ length: 20 }, (_, id) => [
+                    sdk.utf8Encode(String(id).padStart(3, '0')),
+                    sdk.jsonEncode({ id, group: 'G', body: 'x'.repeat(4096) })
+                ])
+            );
+            await seed.commit();
+            const tx = await db.begin('readonly');
+            try {
+                const txId = (tx as unknown as { internalId(): number }).internalId();
+                const ids: number[] = [];
+                const sizes: number[] = [];
+                let cursor: Uint8Array | null = null;
+                for (;;) {
+                    const page = await entry.proxy.scanByIndexPage(txId, 'docs', 'byGroup', {}, cursor, 256, 6000);
+                    sizes.push(page.rows.reduce((size, row) => size + 8 + row.key.length + row.value.length, 4));
+                    ids.push(...page.rows.map((row) => sdk.jsonDecode<{ id: number }>(row.value).id));
+                    cursor = page.cursor;
+                    if (cursor === null) break;
+                }
+                const reverse: number[] = [];
+                for await (const [, value] of tx.scanByIndex(
+                    'docs',
+                    'byGroup',
+                    { reverse: true, limit: 3 },
+                    { maxRows: 256, maxBytes: 6000 }
+                )) {
+                    reverse.push(sdk.jsonDecode<{ id: number }>(value).id);
+                }
+                let oversized = '';
+                try {
+                    for await (const row of tx.scanByIndex('docs', 'byGroup', {}, { maxBytes: 100 })) {
+                        throw new Error(`oversized indexed row returned ${row[0].length} key bytes`);
+                    }
+                } catch (error) {
+                    oversized = (error as Error).name;
+                }
+                return { ids, sizes, reverse, oversized };
+            } finally {
+                await tx.rollback();
+            }
+        } finally {
+            await registry.releaseDbWorker(entry);
+            await db.destroy();
+        }
+    }, uniqueDbName('index-byte-budget'));
+    expect(result.ids).toEqual(Array.from({ length: 20 }, (_, id) => id));
+    expect(result.sizes.every((bytes) => bytes <= 6000)).toBe(true);
+    expect(result.sizes.length).toBe(20);
+    expect(result.reverse).toEqual([19, 18, 17]);
+    expect(result.oversized).toBe('ValueTooLargeError');
+});
+
+test('indexed SQL LIMIT one stops before a later malformed persisted row', async ({ page }) => {
+    await prepareMoyoDbPage(page);
+    const result = await page.evaluate(async (name) => {
+        const sdk = window.moyodb;
+        const indexes = [{ store: 'docs', name: 'byGroup', keyPath: 'group_name' }];
+        const db = await sdk.openDB(name, { version: 1, indexes, migrate: () => {} });
+        const sql = sdk.createSqlClient(db, { indexes });
+        try {
+            await sql.execute(
+                'CREATE TABLE docs (id INTEGER PRIMARY KEY, group_name TEXT NOT NULL, body TEXT NOT NULL)'
+            );
+            await sql.execute('INSERT INTO docs VALUES (?, ?, ?), (?, ?, ?)', [1, 'G', 'first', 2, 'G', 'second']);
+            const stored = await db.scan('docs');
+            await db.put(
+                'docs',
+                stored[1].key,
+                sdk.jsonEncode({ id: 2, group_name: 'G', body: 'second', extra: true })
+            );
+            const first = await sql.execute("SELECT id FROM docs WHERE group_name = 'G' LIMIT 1");
+            let laterError = '';
+            try {
+                await sql.execute("SELECT id FROM docs WHERE group_name = 'G' LIMIT 2");
+            } catch (error) {
+                laterError = (error as Error).name;
+            }
+            return { first, laterError, active: (await db.stats()).active_txns };
+        } finally {
+            await db.destroy();
+        }
+    }, uniqueDbName('sql-index-limit-one'));
+    expect(result.first.rows).toEqual([{ id: 1 }]);
+    expect(result.first.plan?.access).toBe('index-lookup');
+    expect(result.first.plan?.sort).toBe('none');
+    expect(result.laterError).toBe('SerializationError');
+    expect(result.active).toBe(0);
+});
 
 test('paged compressed index reads preserve duplicate order, TTL filtering and old snapshots', async ({ page }) => {
     await prepareMoyoDbPage(page);

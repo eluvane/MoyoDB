@@ -755,21 +755,62 @@ fn native_interop_helper() {
     )
     .unwrap();
     match mode.as_str() {
-        "create" => commit_row(&mut engine, true, b"interop", b"shared-file-format"),
+        "create" => {
+            commit_row(&mut engine, true, b"interop", b"shared-file-format");
+            commit_row(
+                &mut engine,
+                false,
+                b"interop-large",
+                &vec![0x5a; INTEROP_LARGE_LEN],
+            );
+        }
         "read" | "append" => {
             let tx = engine.begin_tx(TxMode::Readonly).unwrap();
             assert_eq!(
                 engine.get(tx, "kv", b"interop").unwrap(),
                 Some(b"shared-file-format".to_vec())
             );
+            assert!(
+                engine.get(tx, "kv", b"interop-large").unwrap().as_deref()
+                    == Some(vec![0x5a; INTEROP_LARGE_LEN].as_slice())
+            );
             engine.rollback_tx(tx).unwrap();
             if mode == "append" {
                 commit_row(&mut engine, false, b"native-append", b"shared-file-format");
+                commit_row(
+                    &mut engine,
+                    false,
+                    b"native-large",
+                    &vec![0xa5; INTEROP_LARGE_LEN],
+                );
             }
         }
         _ => panic!("invalid MOYODB_INTEROP_MODE"),
     }
     engine.close().unwrap();
+}
+
+const INTEROP_LARGE_LEN: usize = 64 * 1024 + 1;
+
+fn assert_external_interop_row(engine: &Engine<NativeFileBackend>, main: &[u8], key: &[u8]) {
+    use moyodb_engine::layout::{page_offset, ValueKind, PAGE_SIZE};
+    use moyodb_engine::page::decode_page;
+    use moyodb_engine::payload::decode_payload_descriptor;
+
+    let root = page_offset(engine.catalog()["kv"].store_root_page_id) as usize;
+    let page = decode_page(&main[root..root + PAGE_SIZE]).unwrap();
+    let cell = page.leaf_cells.iter().find(|cell| cell.key == key).unwrap();
+    assert_eq!(cell.value_kind, ValueKind::External);
+    let reference = decode_payload_descriptor(
+        cell.overflow_head_page_id,
+        cell.total_value_len,
+        &cell.value,
+    )
+    .unwrap()
+    .0;
+    assert_eq!(reference.body_len as usize, INTEROP_LARGE_LEN);
+    let offset = page_offset(reference.first_page_id) as usize;
+    assert_eq!(&main[offset..offset + 4], b"PAY2");
 }
 
 #[test]
@@ -795,21 +836,67 @@ fn node_native_file_format_roundtrip_through_active_generation() {
     let name = "node-native-generation";
     run("interop-create-compacted", name);
     assert!(directory.db_path(name).join("root-manifest.bin").is_file());
-    let mut native = open_engine(&directory, name, false);
+    let files = NativeFileBackend::open_db(directory.path(), name, false).unwrap();
+    let main = files
+        .main
+        .read_at(0, files.main.len().unwrap() as usize)
+        .unwrap();
+    let mut native = Engine::open(
+        name,
+        files,
+        OpenConfig {
+            create_if_missing: false,
+            ..OpenConfig::default()
+        },
+    )
+    .unwrap();
     let tx = native.begin_tx(TxMode::Readonly).unwrap();
     assert_eq!(
         native.get(tx, "kv", b"interop").unwrap(),
         Some(b"shared-file-format".to_vec())
     );
+    assert!(
+        native.get(tx, "kv", b"interop-large").unwrap().as_deref()
+            == Some(vec![0x5a; INTEROP_LARGE_LEN].as_slice())
+    );
     native.rollback_tx(tx).unwrap();
+    assert_external_interop_row(&native, &main, b"interop-large");
     commit_row(&mut native, false, b"native-append", b"shared-file-format");
+    commit_row(
+        &mut native,
+        false,
+        b"native-large",
+        &vec![0xa5; INTEROP_LARGE_LEN],
+    );
     assert!(native.stats().unwrap().wal_len > 0);
     native.close().unwrap();
     run("interop-read-native-append", name);
+    let files = NativeFileBackend::open_db(directory.path(), name, false).unwrap();
+    let main = files
+        .main
+        .read_at(0, files.main.len().unwrap() as usize)
+        .unwrap();
+    let mut native = Engine::open(
+        name,
+        files,
+        OpenConfig {
+            create_if_missing: false,
+            ..OpenConfig::default()
+        },
+    )
+    .unwrap();
+    assert_external_interop_row(&native, &main, b"native-large");
+    native.close().unwrap();
 
     let name = "native-node-created";
     let mut native = open_engine(&directory, name, true);
     commit_row(&mut native, true, b"interop", b"shared-file-format");
+    commit_row(
+        &mut native,
+        false,
+        b"interop-large",
+        &vec![0x5a; INTEROP_LARGE_LEN],
+    );
     native.close().unwrap();
     run("interop-read", name);
 }

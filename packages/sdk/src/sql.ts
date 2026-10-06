@@ -197,12 +197,13 @@ async function executeStatement(
     const limit = statement.kind === 'select' ? resolveCount(statement.limit, parameters, 'LIMIT') : null;
     const offset = statement.kind === 'select' ? (resolveCount(statement.offset, parameters, 'OFFSET') ?? 0) : 0;
     if (explain) return { rows: [], rowsAffected: 0, plan: plan.public };
-    const candidates = limit === 0 ? [] : await readRows(tx, schema, plan);
-    const rows = candidates.filter(
-        ({ row }) => !statement.where || evaluateWhere(row, statement.where, parameters) === true
-    );
+    const maxMatches =
+        statement.kind === 'select' && plan.public.sort === 'none' && limit !== null
+            ? Math.min(Number.MAX_SAFE_INTEGER, offset + limit)
+            : undefined;
+    const rows = limit === 0 ? [] : await readRows(tx, schema, plan, statement.where, parameters, maxMatches);
     if (statement.kind === 'select') {
-        if (orderBy.length) rows.sort((left, right) => compareRows(left, right, orderBy));
+        if (plan.public.sort === 'memory') rows.sort((left, right) => compareRows(left, right, orderBy));
         const selected = rows.slice(offset, limit === null ? undefined : offset + limit);
         return {
             rows: selected.map(({ row }) =>
@@ -566,18 +567,36 @@ function planAccess(
                 : equalityOnly
                   ? 'primary-key-lookup'
                   : 'primary-key-range';
+            const ordered = traversalOrder(schema, candidate.column, candidate.index, orderBy, key);
+            if (ordered && orderBy[0]?.direction === 'desc') range.reverse = true;
             return {
                 public: {
                     table: schema.table,
                     access,
                     column: candidate.column.name,
                     ...(candidate.index ? { index: candidate.index.name } : {}),
-                    sort: orderBy.length ? 'memory' : 'none',
+                    sort: ordered ? 'none' : 'memory',
                     reason: `use ${candidate.index ? `index ${candidate.index.name}` : 'primary key'} for ${equalityOnly ? 'equality' : 'range'}; apply remaining predicates after lookup`
                 },
                 key,
                 range,
                 empty: !key && emptyRange(range)
+            };
+        }
+    }
+    if (orderBy.length) {
+        for (const candidate of candidates) {
+            if (!traversalOrder(schema, candidate.column, candidate.index, orderBy)) continue;
+            return {
+                public: {
+                    table: schema.table,
+                    access: candidate.index ? 'index-range' : 'table-scan',
+                    column: candidate.column.name,
+                    ...(candidate.index ? { index: candidate.index.name } : {}),
+                    sort: 'none',
+                    reason: `use ${candidate.index ? `index ${candidate.index.name}` : 'primary key'} traversal order`
+                },
+                range: { reverse: orderBy[0].direction === 'desc' }
             };
         }
     }
@@ -589,6 +608,24 @@ function planAccess(
             reason: 'no supported primary key or index bound; filter table rows'
         }
     };
+}
+
+function traversalOrder(
+    schema: TableSchema,
+    column: SqlColumnDefinition,
+    index: NormalizedIndexDef | undefined,
+    orders: SqlOrderBy[],
+    key?: Uint8Array
+): boolean {
+    if (!orders.length || (key && !index)) return true;
+    if (orders[0].column !== column.name) return false;
+    if (!index) return orders.length === 1;
+    // INTEGER indexes mix numeric keys and decimal strings for large values.
+    if (column.type === 'INTEGER' && !key) return false;
+    // SQL ties use primary ASC. Reverse index traversal reverses those ties.
+    if (orders.length === 1) return orders[0].direction === 'asc' || (index.unique && !column.nullable);
+    const primary = primaryColumn(schema);
+    return orders.length === 2 && orders[1].column === primary?.name && orders[1].direction === orders[0].direction;
 }
 
 function planKey(
@@ -651,23 +688,56 @@ function emptyRange(range: Range): boolean {
     return compared > 0 || (compared === 0 && (Boolean(range.gt) || Boolean(range.lt)));
 }
 
-async function readRows(tx: Transaction, schema: TableSchema, plan: AccessPlan): Promise<StoredRow[]> {
+async function readRows(
+    tx: Transaction,
+    schema: TableSchema,
+    plan: AccessPlan,
+    where: SqlExpression | null,
+    parameters: SqlValue[],
+    maxMatches?: number
+): Promise<StoredRow[]> {
     if (plan.empty) return [];
-    let items: ScanItem[];
+    const rows: StoredRow[] = [];
+    const accept = (item: ScanItem): boolean => {
+        if (item.key.length === 1 && item.key[0] === TABLE_OWNER_KEY[0]) return false;
+        const row = decodeRow(schema, item);
+        if (!where || evaluateWhere(row.row, where, parameters) === true) rows.push(row);
+        return maxMatches !== undefined && rows.length >= maxMatches;
+    };
     if (plan.public.index) {
-        items = [];
-        const range = plan.key ? { gte: plan.key, lte: plan.key } : plan.range;
-        for await (const [key, value] of tx.scanByIndex(schema.table, plan.public.index, range))
-            items.push({ key, value });
+        const range = plan.key ? { ...plan.range, gte: plan.key, lte: plan.key } : plan.range;
+        for await (const [key, value] of tx.scanByIndex(schema.table, plan.public.index, range, {
+            maxRows: Math.min(256, maxMatches ?? 256)
+        })) {
+            if (accept({ key, value })) break;
+        }
     } else if (plan.key) {
         const value = await tx.get(schema.table, plan.key);
-        items = value ? [{ key: plan.key, value }] : [];
+        if (value) accept({ key: plan.key, value });
+    } else if (typeof tx.scanPage === 'function' && typeof tx.closeScanCursor === 'function') {
+        let cursor: number | undefined;
+        try {
+            for (;;) {
+                const page = await tx.scanPage(schema.table, plan.range, {
+                    cursor,
+                    maxRows: Math.min(256, maxMatches === undefined ? 256 : maxMatches - rows.length)
+                });
+                cursor = page.cursor;
+                for (const item of page.rows) {
+                    if (accept(item)) return rows;
+                }
+                if (page.done) break;
+            }
+        } finally {
+            if (cursor !== undefined) await tx.closeScanCursor(cursor);
+        }
     } else {
-        items = await tx.scan(schema.table, plan.range);
+        // Custom databases that implement the earlier Transaction API have no cursor methods.
+        for (const item of await tx.scan(schema.table, plan.range)) {
+            if (accept(item)) break;
+        }
     }
-    return items
-        .filter(({ key }) => key.length !== 1 || key[0] !== TABLE_OWNER_KEY[0])
-        .map((item) => decodeRow(schema, item));
+    return rows;
 }
 
 function compareRows(left: StoredRow, right: StoredRow, orders: SqlOrderBy[]): number {

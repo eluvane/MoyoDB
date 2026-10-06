@@ -1,8 +1,9 @@
 use moyodb_engine::bytes::{MAX_KEY_BYTES, MAX_STORE_NAME_BYTES};
 use moyodb_engine::change_feed::{encode_change_log_key, SYSTEM_CHANGELOG_STORE_NAME};
-use moyodb_engine::layout::{page_offset, PageKind, PAGE_HEADER_SIZE, PAGE_SIZE};
+use moyodb_engine::layout::{page_offset, PageKind, ValueKind, PAGE_HEADER_SIZE, PAGE_SIZE};
 use moyodb_engine::page::{decode_page, max_overflow_chunk_len};
 use moyodb_engine::pager::Pager;
+use moyodb_engine::payload::{decode_payload_descriptor, PAYLOAD_HEADER_SIZE};
 use moyodb_engine::storage::memory::{MemoryBackend, MemoryBundle};
 use moyodb_engine::{
     ChangeFeedOptions, ChangeFeedPolicy, ChangeKind, Engine, EngineError, Failpoint, OpenConfig,
@@ -133,7 +134,7 @@ fn last_overflow_page(main: &MemoryBackend, root: u64, key: &[u8]) -> Result<(u6
 #[test]
 fn paired_page_checksums_still_cover_headers_payloads_and_padding() -> Result<()> {
     let (bundle, mut engine, seed) = seeded("paired-value-corruption", "docs")?;
-    let value = bytes(64 * 1024, 0x79_033);
+    let value = bytes(16 * 1024, 0x79_033);
     let tx = engine.begin_tx(TxMode::Readwrite)?;
     engine.put(tx, "docs", b"key", &value)?;
     let committed = engine.commit_tx(tx)?;
@@ -180,11 +181,74 @@ fn paired_page_checksums_still_cover_headers_payloads_and_padding() -> Result<()
 }
 
 #[test]
+fn shared_external_body_corruption_rejects_primary_and_feed_reads() -> Result<()> {
+    let (bundle, mut engine, seed) = seeded("external-value-corruption", "docs")?;
+    let value = bytes(1024 * 1024, 0x79_033);
+    let tx = engine.begin_tx(TxMode::Readwrite)?;
+    engine.put(tx, "docs", b"key", &value)?;
+    let committed = engine.commit_tx(tx)?;
+    engine.checkpoint()?;
+    let mut pager = Pager::new(bundle.main.clone(), 4);
+    let mut references = Vec::new();
+    for (store, key) in [
+        ("docs", b"key".to_vec()),
+        (
+            SYSTEM_CHANGELOG_STORE_NAME,
+            encode_change_log_key(committed, 0),
+        ),
+    ] {
+        let page = decode_page(&pager.read_page(engine.catalog()[store].store_root_page_id)?)?;
+        let cell = page.leaf_cells.iter().find(|cell| cell.key == key).unwrap();
+        assert_eq!(cell.value_kind, ValueKind::External);
+        references.push(
+            decode_payload_descriptor(
+                cell.overflow_head_page_id,
+                cell.total_value_len,
+                &cell.value,
+            )?
+            .0,
+        );
+    }
+    assert_eq!(references[0], references[1]);
+    let reference = references[0];
+    let original = bundle.main.durable_snapshot().unwrap();
+    for offset in [
+        8,
+        16,
+        24,
+        PAYLOAD_HEADER_SIZE,
+        PAYLOAD_HEADER_SIZE + value.len() / 2,
+        PAYLOAD_HEADER_SIZE + value.len() - 1,
+    ] {
+        let mut corrupted = original.clone();
+        corrupted[page_offset(reference.first_page_id) as usize + offset] ^= 0x80;
+        for is_feed in [false, true] {
+            let files = MemoryBundle {
+                manifest: MemoryBackend::from_durable(bundle.manifest.durable_snapshot().unwrap()),
+                main: MemoryBackend::from_durable(corrupted.clone()),
+                wal: MemoryBackend::from_durable(bundle.wal.durable_snapshot().unwrap()),
+            };
+            let mut reopened = Engine::open("external-value-corruption", files.files(), config())?;
+            let error = if is_feed {
+                reopened
+                    .changes_since(seed, ChangeFeedOptions::default())
+                    .unwrap_err()
+            } else {
+                let reader = reopened.begin_tx(TxMode::Readonly)?;
+                reopened.get(reader, "docs", b"key").unwrap_err()
+            };
+            assert!(matches!(error, EngineError::Corruption(_)), "{error}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn overwrites_keep_snapshot_values_and_feed_history_independent() -> Result<()> {
     let (bundle, mut engine, seed) = seeded("paired-value-snapshots", "docs")?;
     let key = b"key";
-    let old = bytes(2 * max_overflow_chunk_len() - 16, 0x71_225);
-    let new = bytes(3 * max_overflow_chunk_len() - 19, 0x45_179);
+    let old = bytes(64 * 1024 - 16, 0x71_225);
+    let new = bytes(96 * 1024 - 19, 0x45_179);
     let tx = engine.begin_tx(TxMode::Readwrite)?;
     engine.put(tx, "docs", key, &old)?;
     let first = engine.commit_tx(tx)?;

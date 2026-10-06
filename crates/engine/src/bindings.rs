@@ -363,6 +363,102 @@ mod typed_feed_binding_tests {
     }
 }
 
+#[cfg(any(target_arch = "wasm32", test))]
+struct ScanBookmark {
+    tx_id: u64,
+    store: String,
+    range: crate::btree::RangeSpec,
+    keys_only: bool,
+    exhausted: bool,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl ScanBookmark {
+    fn advance(&mut self, page: &crate::output::PackedScanPage) {
+        self.exhausted |= page.exhausted;
+        if let Some(limit) = self.range.limit.as_mut() {
+            *limit = limit.saturating_sub(page.row_count);
+            self.exhausted |= *limit == 0;
+        }
+        let Some(key) = page.last_key.as_ref() else {
+            return;
+        };
+        if self.range.reverse {
+            self.exhausted |= self
+                .range
+                .lower_bound()
+                .is_some_and(|(lower, _)| key.as_slice() <= lower);
+            if !self.exhausted {
+                self.range.lt = Some(key.clone());
+                self.range.lte = None;
+            }
+        } else {
+            self.exhausted |= self
+                .range
+                .upper_bound()
+                .is_some_and(|(upper, _)| key.as_slice() >= upper);
+            if !self.exhausted {
+                self.range.gt = Some(key.clone());
+                self.range.gte = None;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod scan_bookmark_tests {
+    use super::ScanBookmark;
+    use crate::btree::RangeSpec;
+    use crate::output::PackedScanPage;
+
+    #[test]
+    fn bookmark_resumes_exclusively_and_stops_at_the_inclusive_bound() {
+        for reverse in [false, true] {
+            let mut cursor = ScanBookmark {
+                tx_id: 7,
+                store: "s".into(),
+                range: RangeSpec {
+                    gte: Some(vec![1]),
+                    lte: Some(vec![9]),
+                    reverse,
+                    limit: Some(10),
+                    ..RangeSpec::default()
+                },
+                keys_only: true,
+                exhausted: false,
+            };
+            assert_eq!(
+                (cursor.tx_id, cursor.store.as_str(), cursor.keys_only),
+                (7, "s", true)
+            );
+            cursor.advance(&PackedScanPage {
+                packet: vec![],
+                row_count: 2,
+                last_key: Some(vec![5]),
+                exhausted: false,
+            });
+            assert_eq!(cursor.range.limit, Some(8));
+            assert!(!cursor.exhausted);
+            if reverse {
+                assert_eq!(cursor.range.lt, Some(vec![5]));
+                assert!(cursor.range.lte.is_none());
+            } else {
+                assert_eq!(cursor.range.gt, Some(vec![5]));
+                assert!(cursor.range.gte.is_none());
+            }
+            let end_key = if reverse { 1 } else { 9 };
+            cursor.advance(&PackedScanPage {
+                packet: vec![],
+                row_count: 1,
+                last_key: Some(vec![end_key]),
+                exhausted: false,
+            });
+            assert!(cursor.exhausted);
+            assert!(cursor.range.validate().is_ok());
+        }
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 mod wasm {
     use super::WasmChangeFeed;
@@ -374,16 +470,15 @@ mod wasm {
     use crate::storage::backend::database_name_from_utf16;
     use crate::storage::backend::FileSet;
     use crate::storage::opfs::OpfsBackend;
-    use crate::txn::{BatchOp, BatchOpOutcome, BatchOpRef, TxMode};
+    use crate::txn::{BatchOp, BatchOpOutcome, BatchOpRef, IndexOpRef, TxMode};
     use crate::value::StoreCompression;
     use js_sys::{Array, JsString, Object, Reflect, Uint8Array};
     use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
     use wasm_bindgen::prelude::*;
 
     const PACKED_BATCH_OP_DELETE: u8 = 0;
     const PACKED_BATCH_OP_PUT: u8 = 1;
-    /// Length marker for a missing value in packed `getMany` output.
-    const PACKED_MISSING_VALUE: u32 = u32::MAX;
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
     #[serde(default)]
@@ -472,6 +567,30 @@ mod wasm {
         }
     }
 
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "kind", rename_all = "lowercase")]
+    enum WasmIndexOp {
+        Put {
+            store: String,
+            #[serde(with = "serde_bytes")]
+            key: Vec<u8>,
+        },
+        Delete {
+            store: String,
+            #[serde(with = "serde_bytes")]
+            key: Vec<u8>,
+        },
+    }
+
+    impl WasmIndexOp {
+        fn as_ref(&self) -> IndexOpRef<'_> {
+            match self {
+                Self::Put { store, key } => IndexOpRef::Put { store, key },
+                Self::Delete { store, key } => IndexOpRef::Delete { store, key },
+            }
+        }
+    }
+
     #[derive(Debug, Clone, Serialize)]
     #[serde(tag = "kind", rename_all = "lowercase")]
     enum WasmBatchOpOutcome {
@@ -527,6 +646,8 @@ mod wasm {
     #[derive(Default)]
     pub struct WasmEngine {
         inner: Option<Engine<OpfsBackend>>,
+        scan_cursors: HashMap<u32, super::ScanBookmark>,
+        next_scan_cursor: u32,
     }
 
     fn js_database_name(name: &JsString) -> std::result::Result<String, JsValue> {
@@ -685,6 +806,7 @@ mod wasm {
         /// handle even on error so a retry cannot reuse a partially closed engine.
         #[wasm_bindgen]
         pub fn close(&mut self) -> std::result::Result<(), JsValue> {
+            self.scan_cursors.clear();
             match self.inner.take() {
                 Some(mut engine) => engine.close().map_err(js_error),
                 None => Ok(()),
@@ -695,6 +817,7 @@ mod wasm {
         /// about to be replaced or whose memory is not trusted.
         #[wasm_bindgen]
         pub fn abandon(&mut self) -> std::result::Result<(), JsValue> {
+            self.scan_cursors.clear();
             match self.inner.take() {
                 Some(mut engine) => engine.abandon().map_err(js_error),
                 None => Ok(()),
@@ -759,12 +882,16 @@ mod wasm {
 
         #[wasm_bindgen]
         pub fn commit_tx(&mut self, tx_id: u64) -> std::result::Result<u64, JsValue> {
-            self.inner_mut()?.commit_tx(tx_id).map_err(js_error)
+            let committed = self.inner_mut()?.commit_tx(tx_id).map_err(js_error)?;
+            self.scan_cursors.retain(|_, cursor| cursor.tx_id != tx_id);
+            Ok(committed)
         }
 
         #[wasm_bindgen]
         pub fn rollback_tx(&mut self, tx_id: u64) -> std::result::Result<(), JsValue> {
-            self.inner_mut()?.rollback_tx(tx_id).map_err(js_error)
+            self.inner_mut()?.rollback_tx(tx_id).map_err(js_error)?;
+            self.scan_cursors.retain(|_, cursor| cursor.tx_id != tx_id);
+            Ok(())
         }
 
         #[wasm_bindgen]
@@ -855,6 +982,72 @@ mod wasm {
             Ok(uint8_array_options_to_js_array(values).into())
         }
 
+        /// Returns max(encoded, decoded) lengths. u32::MAX marks missing or expired values.
+        #[wasm_bindgen]
+        pub fn get_many_value_sizes(
+            &mut self,
+            tx_id: u64,
+            store: String,
+            keys: &[u8],
+        ) -> std::result::Result<Vec<u32>, JsValue> {
+            let keys = parse_packed_binary_list(keys, "packed getMany sizes")?;
+            let sizes = self
+                .inner_mut()?
+                .get_many_value_sizes(tx_id, &store, &keys)
+                .map_err(js_error)?;
+            sizes
+                .into_iter()
+                .map(|length| match length {
+                    None => Ok(u32::MAX),
+                    Some(length) => u32::try_from(length)
+                        .ok()
+                        .filter(|length| *length != u32::MAX)
+                        .ok_or_else(|| js_error(EngineError::ValueTooLarge(length))),
+                })
+                .collect()
+        }
+
+        /// Returns count followed by 32-byte rows: flags, expiry, epoch, ordinal, max length.
+        #[wasm_bindgen]
+        pub fn get_many_value_states(
+            &mut self,
+            tx_id: u64,
+            store: String,
+            keys: &[u8],
+        ) -> std::result::Result<Vec<u8>, JsValue> {
+            let keys = parse_packed_binary_list(keys, "packed getMany states")?;
+            let states = self
+                .inner_mut()?
+                .get_many_value_states(tx_id, &store, &keys)
+                .map_err(js_error)?;
+            crate::output::pack_value_states(&states).map_err(js_error)
+        }
+
+        #[wasm_bindgen]
+        #[allow(clippy::too_many_arguments)]
+        pub fn put_index_entry_checked(
+            &mut self,
+            tx_id: u64,
+            primary_store: String,
+            index_store: String,
+            primary_key: &[u8],
+            index_key: &[u8],
+            expected_epoch: u64,
+            expected_ordinal: u64,
+        ) -> std::result::Result<(), JsValue> {
+            self.inner_mut()?
+                .put_index_entry_checked(
+                    tx_id,
+                    &primary_store,
+                    &index_store,
+                    primary_key,
+                    index_key,
+                    expected_epoch,
+                    expected_ordinal,
+                )
+                .map_err(js_error)
+        }
+
         /// Returns packed values as
         /// `u32 count | count x u32 length (u32::MAX = missing) | bytes`.
         /// All integers are little-endian.
@@ -866,11 +1059,9 @@ mod wasm {
             keys: &[u8],
         ) -> std::result::Result<Vec<u8>, JsValue> {
             let keys = parse_packed_binary_list(keys, "packed getMany")?;
-            let values = self
-                .inner_mut()?
-                .get_many(tx_id, &store, &keys)
-                .map_err(js_error)?;
-            pack_optional_values(&values)
+            self.inner_mut()?
+                .get_many_packed(tx_id, &store, &keys)
+                .map_err(js_error)
         }
 
         #[wasm_bindgen]
@@ -946,6 +1137,45 @@ mod wasm {
             self.inner_mut()?
                 .delete(tx_id, &store, key)
                 .map_err(js_error)
+        }
+
+        /// Returns one baseline byte per completed row. A failed row can have
+        /// staged writes and is excluded from the error's partial outcomes.
+        #[wasm_bindgen]
+        pub fn put_many_indexed_packed(
+            &mut self,
+            tx_id: u64,
+            store: String,
+            entries: &[u8],
+            index_ops: JsValue,
+            options: JsValue,
+        ) -> std::result::Result<Vec<u8>, JsValue> {
+            let entries = parse_packed_binary_pairs(entries)?;
+            let index_ops: Vec<Vec<WasmIndexOp>> =
+                serde_wasm_bindgen::from_value(index_ops).map_err(js_error_from_display)?;
+            if index_ops.len() != entries.len() {
+                return Err(js_error_from_display("indexed put row count mismatch"));
+            }
+            let index_refs: Vec<Vec<IndexOpRef<'_>>> = index_ops
+                .iter()
+                .map(|row| row.iter().map(WasmIndexOp::as_ref).collect())
+                .collect();
+            let options: WasmPutOptions = parse_optional_options(options)?;
+            let report = self.inner_mut()?.put_many_indexed_report(
+                tx_id,
+                &store,
+                &entries,
+                &index_refs,
+                options.ttl,
+            );
+            match report.error {
+                Some(error) => Err(js_error_with_partial(error, &report.completed)),
+                None => Ok(report
+                    .completed
+                    .iter()
+                    .map(|flag| u8::from(*flag))
+                    .collect()),
+            }
         }
 
         #[wasm_bindgen]
@@ -1042,6 +1272,98 @@ mod wasm {
                 .map_err(js_error)?;
             let pairs: Vec<WasmKvPair> = pairs.into_iter().map(Into::into).collect();
             js_value_from_serializable(&pairs)
+        }
+
+        #[wasm_bindgen]
+        pub fn open_scan_cursor(
+            &mut self,
+            tx_id: u64,
+            store: String,
+            range: JsValue,
+            keys_only: bool,
+        ) -> std::result::Result<u32, JsValue> {
+            let range: RangeSpec =
+                serde_wasm_bindgen::from_value(range).map_err(js_error_from_display)?;
+            range.validate().map_err(js_error)?;
+            self.inner_mut()?
+                .has_many::<&[u8]>(tx_id, &store, &[])
+                .map_err(js_error)?;
+            let id = self.next_scan_cursor.checked_add(1).ok_or_else(|| {
+                js_error(EngineError::Internal("scan cursor id exhausted".into()))
+            })?;
+            self.next_scan_cursor = id;
+            self.scan_cursors.insert(
+                id,
+                super::ScanBookmark {
+                    tx_id,
+                    store,
+                    exhausted: range.limit == Some(0),
+                    range,
+                    keys_only,
+                },
+            );
+            Ok(id)
+        }
+
+        #[wasm_bindgen]
+        pub fn scan_cursor_next(
+            &mut self,
+            cursor_id: u32,
+            max_rows: u32,
+            max_bytes: u32,
+        ) -> std::result::Result<JsValue, JsValue> {
+            if max_rows == 0 || max_bytes < 4 {
+                return Err(js_error(EngineError::InvalidRange(
+                    "scan budgets must include a row and the 4-byte header".into(),
+                )));
+            }
+            let mut cursor = self
+                .scan_cursors
+                .remove(&cursor_id)
+                .ok_or_else(|| js_error(EngineError::TransactionClosed))?;
+            let result = (|| {
+                let page = if cursor.exhausted {
+                    crate::output::PackedScanPage {
+                        packet: vec![0; 4],
+                        row_count: 0,
+                        last_key: None,
+                        exhausted: true,
+                    }
+                } else {
+                    self.inner_mut()?
+                        .scan_packed_page(
+                            cursor.tx_id,
+                            &cursor.store,
+                            &cursor.range,
+                            max_rows as usize,
+                            max_bytes as usize,
+                            cursor.keys_only,
+                        )
+                        .map_err(js_error)?
+                };
+                cursor.advance(&page);
+                let result = Object::new();
+                set_js_property(
+                    &result,
+                    "packet",
+                    &Uint8Array::from(page.packet.as_slice()).into(),
+                );
+                set_js_property(
+                    &result,
+                    "rowCount",
+                    &JsValue::from_f64(page.row_count as f64),
+                );
+                set_js_property(&result, "exhausted", &JsValue::from_bool(cursor.exhausted));
+                Ok(result.into())
+            })();
+            self.scan_cursors.insert(cursor_id, cursor);
+            result
+        }
+
+        #[wasm_bindgen]
+        pub fn close_scan_cursor(&mut self, cursor_id: u32) -> std::result::Result<(), JsValue> {
+            self.scan_cursors.remove(&cursor_id);
+            Ok(())
         }
 
         #[wasm_bindgen]
@@ -1328,29 +1650,6 @@ mod wasm {
             ));
         }
         Ok(ops)
-    }
-
-    fn pack_optional_values(values: &[Option<Vec<u8>>]) -> std::result::Result<Vec<u8>, JsValue> {
-        let what = "packed getMany output";
-        let count = u32::try_from(values.len())
-            .map_err(|_| js_error_from_display(format!("{what} has too many values")))?;
-        let payload_len: usize = values.iter().flatten().map(Vec::len).sum();
-        let mut out = Vec::with_capacity(4 + values.len() * 4 + payload_len);
-        out.extend_from_slice(&count.to_le_bytes());
-        for value in values {
-            let len = match value {
-                Some(bytes) => u32::try_from(bytes.len())
-                    .ok()
-                    .filter(|len| *len != PACKED_MISSING_VALUE)
-                    .ok_or_else(|| js_error_from_display(format!("{what} value too large")))?,
-                None => PACKED_MISSING_VALUE,
-            };
-            out.extend_from_slice(&len.to_le_bytes());
-        }
-        for bytes in values.iter().flatten() {
-            out.extend_from_slice(bytes);
-        }
-        Ok(out)
     }
 
     fn read_u32_le(bytes: &[u8], offset: usize, what: &str) -> std::result::Result<usize, JsValue> {

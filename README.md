@@ -19,12 +19,18 @@ Rust/WASM transactional database for browsers, Node.js, and native Rust applicat
 
 It provides ordered keys, typed records, SQL queries, indexes, snapshots, TTL, and recovery checks. Browser storage uses OPFS; Node.js and native Rust storage use local files. The SDK runs storage operations in a worker.
 
-The SDK preserves the Release 1.0.1 API and stored encodings within the 1.x series. Incompatible storage changes require a distinct format version and an explicit migration path. Golden fixtures verify storage format 1 and snapshot versions 1–3; unknown formats fail before modifying durable data.
+Version 1.3.0 creates fresh databases with storage format 2. Format 1 databases are rejected before their files are changed; no in-place migration is provided. Self-contained snapshot versions 1–3 can be imported into a fresh format 2 database. The Release 1.0.1 public API, key and index encodings remain covered by historical fixtures. Unknown storage formats fail before modifying durable data.
+
+Large values use immutable contiguous `PAY2` extents in the main file. Leaf cells with value kind `External` (3) store a descriptor and an optional prefix. Payload bodies are flushed before their references enter the WAL. B-tree page and WAL record layouts retain `PAG1` and `WAL1`; the manifest's format version distinguishes the new storage contract.
+
+Fresh user and index stores use a 32-byte `BDREV001` value header with expiry and a native record revision. Managed index writes retain the primary record's revision. Matching live revisions let index validation use metadata without reading the document. Raw changes, legacy values and revision mismatches retain document validation. Snapshot export omits physical revisions; import assigns new ones, and compaction preserves them.
+
+New SDK stores use Snappy compression by default for values of at least 1,024 bytes. The compressed record is kept only when it saves at least 10% of the stored bytes. For values of at least 64 KiB, three small samples first check whether compression is likely to save space. This may leave some compressible values raw. Set `compression: false` when creating a store to retain raw values; `gzip` and `deflate` remain available. The maximum decoded value is 8 MiB.
 
 ## Quick start
 
 ```bash
-npm install @moyodb/sdk@1.2.0
+npm install @moyodb/sdk@1.3.0
 ```
 
 ```ts
@@ -64,6 +70,27 @@ Pages from the same origin share a storage owner through SharedWorker. Each clie
 
 Read and write transactions can overlap. Readers retain their snapshots. Commits publish sequentially; a writer whose snapshot is stale closes with `TransactionConflictError` before writing its changes. Start a new transaction to retry. Schema upgrades have one migration owner.
 
+```ts
+for await (const row of db.scanIter('kv')) {
+  console.log(row);
+  break;
+}
+
+let cursor: number | undefined;
+try {
+  do {
+    const page = await db.scanPage('kv', {}, { cursor, maxRows: 256, maxBytes: 64 * 1024 });
+    cursor = page.cursor;
+    console.log(page.rows);
+    if (page.done) break;
+  } while (cursor !== undefined);
+} finally {
+  if (cursor !== undefined) await db.closeScanCursor(cursor);
+}
+```
+
+Paged scans retain one snapshot until exhaustion or explicit cursor close. Breaking out of `scanIter` closes its cursor. Primary and index pages limit both row count and byte size, including decoded values. A first row larger than the byte budget rejects the page.
+
 ## Typed records
 
 ```ts
@@ -98,7 +125,7 @@ The planner reads the transaction's actual index catalog and chooses primary-key
 ## Verification
 
 \- Lean checks run with all built-in/extra linters, Heron, JunkLinter and the full Batteries set; every finding fails CI. Run `npm run lint:lean` locally.\
-\- `proofs/moyodb_proofs` models abstract KV/WAL/transaction semantics and independently checks real inline B-tree pages. The B-tree checker has kernel-checked certificates for structure, contents and routing for every byte-string key; CI compares real Rust mutations, lookup/scan and retained COW roots with Lean-computed states and rejects two production mutation witnesses. This proves properties of the Lean checker and checks concrete Rust executions; the Rust engine, checksums, overflow, OPFS I/O, flush ordering and power loss remain outside those proofs.\
+\- `proofs/moyodb_proofs` models abstract KV/WAL/transaction semantics and independently checks real inline B-tree pages. The B-tree checker has kernel-checked certificates for structure, contents and routing for every byte-string key; CI compares real Rust mutations, lookup/scan and retained COW roots with Lean-computed states and rejects two production mutation witnesses. Format 2 external descriptors receive structural length and extent-address validation, with kernel-checked boundary examples. Their logical contents are rejected by the content checker because `PAY2` bodies are absent from its input. This proves properties of the Lean checker and checks concrete Rust executions; the Rust engine, checksums, overflow and external payload bodies, OPFS I/O, flush ordering and power loss remain outside those proofs.\
 \- The traces exported to `proofs/artifacts` are replayed against the Rust engine by `crates/engine/tests/proof_artifacts.rs` as conformance scenarios.\
 \- Crash behavior is covered by tests: `crates/engine/tests/crash_matrix.rs`, `crates/engine/tests/fault_injection.rs` (failed and short writes plus torn flushes at every WAL, main-file, and superblock operation during commit, checkpoint, and recovery), and `crates/engine/js/opfs_shim.test.mjs` for control-file publication.
 

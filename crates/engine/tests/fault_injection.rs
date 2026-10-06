@@ -563,8 +563,9 @@ fn large_checkpoint_case(config: &OpenConfig, fault: Fault, target: u64) -> bool
         .expect("create checkpoint fixture store");
     engine.commit_tx(tx).expect("commit empty store");
     engine.checkpoint().expect("checkpoint empty store");
-    let values: Rows = (0..8)
-        .map(|index| (key(index), vec![index as u8; 512 * 1024]))
+    // Keep bodies in overflow pages so the checkpoint spans several write batches.
+    let values: Rows = (0..256)
+        .map(|index| (key(index), vec![index as u8; 16 * 1024]))
         .collect();
     let tx = engine
         .begin_tx(TxMode::Readwrite)

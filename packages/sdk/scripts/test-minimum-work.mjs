@@ -48,12 +48,14 @@ export function exposeWorkerApi(api) { runtime = api; }
     );
     const protocolNames = [
         'packedOptionalValues',
+        'packedScanRows',
         'unpackPackedBatchOpKeys',
         'unpackPackedBatchOps',
         'unpackPackedBinaryList',
         'unpackPackedBinaryPairKeys',
         'unpackPackedBinaryPairs',
-        'unpackPackedOptionalValues'
+        'unpackPackedOptionalValues',
+        'unpackPackedScanRows'
     ];
     await writeFile(
         join(output, 'worker-protocol.mjs'),
@@ -71,6 +73,14 @@ export function compressionFromStoreFlags(flags) {
 export async function encodeStoreValueRecord(value, compression) {
     if (compression !== false) throw new Error('compression codec is outside this fixture');
     return value;
+}
+export function prepareFastStoreValueRecord(value, compression) {
+    if (compression !== false) throw new Error('compression codec is outside this fixture');
+    return { payload: value, byteLength: value.byteLength };
+}
+export function writePreparedStoreValueRecord(record, target, offset) {
+    target.set(record.payload, offset);
+    return offset + record.byteLength;
 }
 export function decodeStoreValueRecord() { throw new Error('compression codec is outside this fixture'); }
 export function wrapSnapshotWithCompression() { throw new Error('snapshot codec is outside this fixture'); }

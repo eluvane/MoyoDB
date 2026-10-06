@@ -194,7 +194,16 @@ try {
         'persistent contexts must use the project browser launch options'
     );
     await mkdir(output, { recursive: true });
-    for (const name of ['worker', 'worker-protocol', 'indexing', 'codec', 'errors', 'internal', 'compression']) {
+    for (const name of [
+        'worker',
+        'worker-protocol',
+        'indexing',
+        'codec',
+        'errors',
+        'internal',
+        'compression',
+        'snappy'
+    ]) {
         const input = await readFile(join(source, `${name}.ts`), 'utf8');
         const transpiled = ts.transpileModule(input, {
             fileName: `${name}.ts`,

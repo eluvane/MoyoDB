@@ -1,5 +1,5 @@
 //! Commit planning borrows immutable payloads and owns only their prefixes
-//! and optional chunk checksums.
+//! and optional chunk checksums or an external body reference.
 
 #[cfg(test)]
 mod tests;
@@ -7,17 +7,18 @@ mod tests;
 use crate::checksum::paired_payload_checksums;
 use crate::error::Result;
 use crate::page::{max_overflow_chunk_len, should_overflow_value};
-use crate::value::StoredValue;
+use crate::payload::PayloadRef;
+use crate::value::{StoredValue, VALUE_REVISION_ENVELOPE_HEADER_SIZE};
 
 enum Prefix {
-    Envelope([u8; 16]),
+    Envelope([u8; VALUE_REVISION_ENVELOPE_HEADER_SIZE], usize),
     Bytes(Vec<u8>),
 }
 
 impl Prefix {
     fn as_slice(&self) -> &[u8] {
         match self {
-            Self::Envelope(bytes) => bytes,
+            Self::Envelope(bytes, length) => &bytes[..*length],
             Self::Bytes(bytes) => bytes,
         }
     }
@@ -27,18 +28,20 @@ pub(crate) struct PreparedValue<'a> {
     prefix: Prefix,
     payload: &'a [u8],
     chunk_checksums: Vec<u32>,
+    external: Option<PayloadRef>,
 }
 
 impl<'a> PreparedValue<'a> {
     pub(crate) fn stored(value: &'a StoredValue, flags: u64) -> Result<Self> {
         let prefix = match value.encode_prefix(flags)? {
-            Some(prefix) => Prefix::Envelope(prefix),
+            Some((prefix, length)) => Prefix::Envelope(prefix, length),
             None => Prefix::Bytes(Vec::new()),
         };
         Ok(Self {
             prefix,
             payload: &value.value,
             chunk_checksums: Vec::new(),
+            external: None,
         })
     }
 
@@ -47,12 +50,16 @@ impl<'a> PreparedValue<'a> {
             prefix: Prefix::Bytes(prefix),
             payload,
             chunk_checksums: Vec::new(),
+            external: None,
         }
     }
 
     /// Hashes both prefixed views in one payload pass only when they borrow
     /// the same slice. Checksums remain local to these immutable values.
     pub(crate) fn share_payload_checksums(&mut self, other: &mut Self) {
+        if self.external.is_some() || other.external.is_some() {
+            return;
+        }
         #[cfg(test)]
         if work::generic_only() {
             return;
@@ -71,12 +78,20 @@ impl<'a> PreparedValue<'a> {
         (self.chunk_checksums, other.chunk_checksums) =
             paired_payload_checksums(first_prefix, second_prefix, self.payload);
     }
+
+    pub(crate) fn set_external_reference(&mut self, reference: PayloadRef) {
+        self.external = Some(reference);
+        self.chunk_checksums.clear();
+    }
 }
 
 /// Lets tree algorithms borrow slices or prepared values without copying
 /// values into a common representation.
 pub(crate) trait ValueSource {
     fn parts(&self) -> ValueParts<'_>;
+    fn external_reference(&self) -> Option<PayloadRef> {
+        None
+    }
 }
 
 impl ValueSource for [u8] {
@@ -90,6 +105,10 @@ impl ValueSource for [u8] {
 }
 
 impl ValueSource for PreparedValue<'_> {
+    fn external_reference(&self) -> Option<PayloadRef> {
+        self.external
+    }
+
     fn parts(&self) -> ValueParts<'_> {
         ValueParts {
             prefix: self.prefix.as_slice(),
@@ -106,6 +125,14 @@ pub(crate) struct ValueParts<'a> {
 }
 
 impl<'a> ValueParts<'a> {
+    pub(crate) fn prefix(&self) -> &'a [u8] {
+        self.prefix
+    }
+
+    pub(crate) fn payload(&self) -> &'a [u8] {
+        self.payload
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.prefix.len() + self.payload.len()
     }

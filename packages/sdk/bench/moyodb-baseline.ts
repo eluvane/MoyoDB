@@ -1,5 +1,5 @@
-import { openDB, type DB, type ScanItem } from '../src/index';
-import type { SampleContext, WorkloadRunner, WorkloadSpec } from './types';
+import { openDB, type DB, type ScanItem, type Transaction } from '../src/index';
+import type { BenchSampleMetrics, SampleContext, WorkloadRunner, WorkloadSpec } from './types';
 import {
     assertChecksum,
     ContentChecksum,
@@ -21,6 +21,7 @@ import {
     scanWindow,
     STORE_NAME,
     valueBytes,
+    workloadPolicy,
     verificationKind,
     writeVerificationIndices
 } from './workloads';
@@ -28,6 +29,8 @@ import {
 type Entry = [Uint8Array, Uint8Array];
 
 type PreparedMoyoSample = {
+    workload: WorkloadSpec;
+    metrics: Partial<BenchSampleMetrics>;
     db?: DB;
     entries?: Entry[][];
     readIndices?: number[];
@@ -45,7 +48,11 @@ export const moyoDbBaseline: WorkloadRunner = {
     engine: 'moyodb',
     async prepare(ctx: SampleContext): Promise<(() => Promise<void>) | void> {
         await requireMoyoDbCapabilitiesForWorkload(ctx.workload);
-        const prepared: PreparedMoyoSample = { cleanupNames: [ctx.dbName] };
+        const prepared: PreparedMoyoSample = {
+            workload: ctx.workload,
+            metrics: { explicitCommitMs: null, explicitCommitCount: 0, closeMs: null },
+            cleanupNames: [ctx.dbName]
+        };
 
         if (isWorkerIpcDiagnosticWorkload(ctx.workload.name)) {
             prepared.worker = createEchoWorker();
@@ -115,8 +122,8 @@ export const moyoDbBaseline: WorkloadRunner = {
             ctx.workload.name === 'small_tx_1000_commits'
         ) {
             await deleteDBIfExists(ctx.dbName);
-            prepared.db = await openEmptyDb(ctx.dbName);
-            await prepared.db.createStore(STORE_NAME);
+            prepared.db = await openEmptyDb(ctx.dbName, ctx.workload);
+            await prepared.db.createStore(STORE_NAME, { compression: workloadPolicy(ctx.workload).compression });
             prepared.entries = buildEntryBatches(
                 ctx.workload,
                 ctx.workload.recordCount,
@@ -128,8 +135,8 @@ export const moyoDbBaseline: WorkloadRunner = {
 
         if (isPreloadedReadWorkload(ctx.workload.name)) {
             await deleteDBIfExists(ctx.dbName);
-            prepared.db = await openEmptyDb(ctx.dbName);
-            await prepared.db.createStore(STORE_NAME);
+            prepared.db = await openEmptyDb(ctx.dbName, ctx.workload);
+            await prepared.db.createStore(STORE_NAME, { compression: workloadPolicy(ctx.workload).compression });
             const entries = buildEntryBatches(ctx.workload, ctx.workload.recordCount, effectiveBatchSize(ctx.workload));
             await bulkInsertPrepared(prepared.db, entries, shouldUseSingleTransactionPreload(ctx.workload));
             if (isRandomGetWorkload(ctx.workload.name)) {
@@ -142,9 +149,9 @@ export const moyoDbBaseline: WorkloadRunner = {
 
         if (ctx.workload.name === 'cold_open_after_100k') {
             await deleteDBIfExists(ctx.dbName);
-            const db = await openEmptyDb(ctx.dbName);
+            const db = await openEmptyDb(ctx.dbName, ctx.workload);
             try {
-                await db.createStore(STORE_NAME);
+                await db.createStore(STORE_NAME, { compression: workloadPolicy(ctx.workload).compression });
                 const entries = buildEntryBatches(
                     ctx.workload,
                     ctx.workload.recordCount,
@@ -160,9 +167,13 @@ export const moyoDbBaseline: WorkloadRunner = {
 
         if (ctx.workload.name === 'worker_roundtrip_overhead') {
             await deleteDBIfExists(ctx.dbName);
-            prepared.db = await openEmptyDb(ctx.dbName);
-            await prepared.db.createStore(STORE_NAME);
-            await prepared.db.put(STORE_NAME, keyBytes(0, ctx.workload.keySize), valueBytes(0, ctx.workload.valueSize));
+            prepared.db = await openEmptyDb(ctx.dbName, ctx.workload);
+            await prepared.db.createStore(STORE_NAME, { compression: workloadPolicy(ctx.workload).compression });
+            await prepared.db.put(
+                STORE_NAME,
+                keyBytes(0, ctx.workload.keySize),
+                valueBytes(0, ctx.workload.valueSize, workloadPolicy(ctx.workload).dataset.profile)
+            );
             preparedSamples.set(ctx.dbName, prepared);
             return () => cleanupPrepared(ctx.dbName);
         }
@@ -173,8 +184,8 @@ export const moyoDbBaseline: WorkloadRunner = {
             prepared.cleanupNames = [sourceName, targetName];
             await deleteDBIfExists(sourceName);
             await deleteDBIfExists(targetName);
-            prepared.db = await openEmptyDb(sourceName);
-            await prepared.db.createStore(STORE_NAME);
+            prepared.db = await openEmptyDb(sourceName, ctx.workload);
+            await prepared.db.createStore(STORE_NAME, { compression: workloadPolicy(ctx.workload).compression });
             prepared.entries = buildEntryBatches(
                 ctx.workload,
                 ctx.workload.recordCount,
@@ -235,6 +246,21 @@ export const moyoDbBaseline: WorkloadRunner = {
     },
     async cleanup(ctx: SampleContext): Promise<void> {
         await cleanupPrepared(ctx.dbName);
+    },
+    async metrics(ctx: SampleContext): Promise<Partial<BenchSampleMetrics>> {
+        const prepared = preparedSamples.get(ctx.dbName);
+        if (!prepared) return {};
+        if (prepared.db) {
+            const stats = await prepared.db.stats();
+            const storage = await prepared.db.storageInfo();
+            Object.assign(prepared.metrics, {
+                manifestBytes: stats.manifest_len,
+                mainBytes: stats.main_len,
+                walBytes: stats.wal_len,
+                databaseBytes: storage.dbSize
+            });
+        }
+        return prepared.metrics;
     }
 };
 
@@ -402,7 +428,7 @@ async function runMoyoDbWorkload(dbName: string, workload: WorkloadSpec, sampleI
         if (workload.name === 'small_tx_1000_commits') {
             await smallTxCommits(db, entries);
         } else {
-            await bulkInsertPrepared(db, entries, isSingleTransactionInsertWorkload(workload.name));
+            await bulkInsertPrepared(db, entries, isSingleTransactionInsertWorkload(workload.name), prepared.metrics);
         }
         return;
     }
@@ -432,19 +458,19 @@ async function runMoyoDbWorkload(dbName: string, workload: WorkloadSpec, sampleI
 
 async function openEmptyDbMeasured(name: string): Promise<void> {
     const prepared = requirePrepared(name);
-    const db = await openEmptyDb(name);
+    const db = await openEmptyDb(name, prepared.workload);
     prepared.db = db;
 }
 
-async function freshDb(name: string): Promise<DB> {
+async function freshDb(name: string, workload: WorkloadSpec): Promise<DB> {
     await deleteDBIfExists(name);
-    const db = await openEmptyDb(name);
-    await db.createStore(STORE_NAME);
+    const db = await openEmptyDb(name, workload);
+    await db.createStore(STORE_NAME, { compression: workloadPolicy(workload).compression });
     return db;
 }
 
-async function openEmptyDb(name: string): Promise<DB> {
-    return await openDB(name, { requestPersistence: false });
+async function openEmptyDb(name: string, workload: WorkloadSpec): Promise<DB> {
+    return await openDB(name, { requestPersistence: false, changeFeed: workloadPolicy(workload).changeFeed });
 }
 
 async function cleanupPrepared(name: string): Promise<void> {
@@ -466,8 +492,13 @@ async function cleanupPrepared(name: string): Promise<void> {
         prepared.worker = undefined;
     }
     if (prepared.db) {
-        await prepared.db.close().catch(() => undefined);
-        prepared.db = undefined;
+        const started = performance.now();
+        try {
+            await prepared.db.close();
+        } finally {
+            prepared.metrics.closeMs = performance.now() - started;
+            prepared.db = undefined;
+        }
     }
     for (const cleanupName of prepared.cleanupNames ?? [name]) {
         await deleteDBIfExists(cleanupName);
@@ -544,7 +575,10 @@ function buildEntryBatches(workload: WorkloadSpec, count: number, batchSize: num
         const end = Math.min(start + batchSize, count);
         const entries: Entry[] = [];
         for (let i = start; i < end; i += 1) {
-            entries.push([keyBytes(i, workload.keySize), valueBytes(i, workload.valueSize)]);
+            entries.push([
+                keyBytes(i, workload.keySize),
+                valueBytes(i, workload.valueSize, workloadPolicy(workload).dataset.profile)
+            ]);
         }
         batches.push(entries);
     }
@@ -554,19 +588,24 @@ function buildEntryBatches(workload: WorkloadSpec, count: number, batchSize: num
 function buildRoundtripPayloads(workload: WorkloadSpec): Uint8Array[] {
     const payloads: Uint8Array[] = [];
     for (let i = 0; i < workload.recordCount; i += 1) {
-        payloads.push(valueBytes(i, workload.valueSize));
+        payloads.push(valueBytes(i, workload.valueSize, workloadPolicy(workload).dataset.profile));
     }
     return payloads;
 }
 
-async function bulkInsertPrepared(db: DB, batches: Entry[][], singleTransaction: boolean): Promise<void> {
+async function bulkInsertPrepared(
+    db: DB,
+    batches: Entry[][],
+    singleTransaction: boolean,
+    metrics?: Partial<BenchSampleMetrics>
+): Promise<void> {
     if (singleTransaction) {
         const tx = await db.begin('readwrite');
         try {
             for (const entries of batches) {
                 await tx.putMany(STORE_NAME, entries);
             }
-            await tx.commit();
+            await measureCommit(tx, metrics);
         } catch (error) {
             await tx.rollback().catch(() => undefined);
             throw error;
@@ -578,11 +617,20 @@ async function bulkInsertPrepared(db: DB, batches: Entry[][], singleTransaction:
         const tx = await db.begin('readwrite');
         try {
             await tx.putMany(STORE_NAME, entries);
-            await tx.commit();
+            await measureCommit(tx, metrics);
         } catch (error) {
             await tx.rollback().catch(() => undefined);
             throw error;
         }
+    }
+}
+
+async function measureCommit(tx: Transaction, metrics?: Partial<BenchSampleMetrics>): Promise<void> {
+    const started = performance.now();
+    await tx.commit();
+    if (metrics) {
+        metrics.explicitCommitMs = (metrics.explicitCommitMs ?? 0) + performance.now() - started;
+        metrics.explicitCommitCount = (metrics.explicitCommitCount ?? 0) + 1;
     }
 }
 
@@ -612,7 +660,7 @@ async function sdkBulkPut(dbName: string): Promise<void> {
     const tx = await db.begin('readwrite');
     try {
         await tx.putMany(STORE_NAME, entries);
-        await tx.commit();
+        await measureCommit(tx, prepared.metrics);
     } catch (error) {
         await tx.rollback().catch(() => undefined);
         throw error;
@@ -679,7 +727,7 @@ function rowsChecksum(rows: readonly ScanItem[]): ContentChecksum {
 
 async function coldOpenAfterPrepared(dbName: string, workload: WorkloadSpec): Promise<void> {
     const prepared = requirePrepared(dbName);
-    const reopened = await openDB(dbName, { requestPersistence: false });
+    const reopened = await openEmptyDb(dbName, workload);
     prepared.db = reopened;
     const value = await reopened.get(STORE_NAME, keyBytes(Math.floor(workload.recordCount / 2), workload.keySize));
     if (!value) {
@@ -688,7 +736,7 @@ async function coldOpenAfterPrepared(dbName: string, workload: WorkloadSpec): Pr
 }
 
 async function recoveryAfterDirtyClose(dbName: string, workload: WorkloadSpec): Promise<void> {
-    const db = await freshDb(dbName);
+    const db = await freshDb(dbName, workload);
     try {
         const entries = buildEntryBatches(workload, workload.recordCount, effectiveBatchSize(workload));
         await bulkInsertPrepared(db, entries, false);
@@ -697,7 +745,7 @@ async function recoveryAfterDirtyClose(dbName: string, workload: WorkloadSpec): 
             await db.put(
                 STORE_NAME,
                 keyBytes(workload.recordCount + 1, workload.keySize),
-                valueBytes(1, workload.valueSize)
+                valueBytes(1, workload.valueSize, workloadPolicy(workload).dataset.profile)
             );
             throw new Error('expected failpoint to abort commit');
         } catch (error) {
@@ -709,7 +757,7 @@ async function recoveryAfterDirtyClose(dbName: string, workload: WorkloadSpec): 
         await db.close().catch(() => undefined);
     }
 
-    const recovered = await openDB(dbName, { requestPersistence: false });
+    const recovered = await openEmptyDb(dbName, workload);
     try {
         const base = await recovered.get(STORE_NAME, keyBytes(0, workload.keySize));
         const after = await recovered.get(STORE_NAME, keyBytes(workload.recordCount + 1, workload.keySize));
@@ -727,7 +775,7 @@ async function snapshotExportImport(dbName: string): Promise<void> {
     const source = requirePreparedDb(prepared, dbName);
     const targetName = `${dbName}-target`;
     const snapshot = await source.exportSnapshot();
-    const target = await openDB(targetName, { requestPersistence: false });
+    const target = await openEmptyDb(targetName, prepared.workload);
     try {
         await target.importSnapshot(snapshot);
         const rows = await target.scan(STORE_NAME, { limit: 1 });
@@ -761,7 +809,7 @@ function encodeDecodeDiagnostic(workload: WorkloadSpec): void {
     let checksum = 0;
     for (let i = 0; i < workload.recordCount; i += 1) {
         const key = keyBytes(i, workload.keySize);
-        const value = valueBytes(i, workload.valueSize);
+        const value = valueBytes(i, workload.valueSize, workloadPolicy(workload).dataset.profile);
         checksum ^= key[0];
         checksum ^= value[0];
     }

@@ -1,5 +1,6 @@
 import { expect, test, type BrowserContext, type Page } from '@playwright/test';
 import type { DB, Transaction } from '../src/types';
+import type * as RegistryModule from '../src/registry';
 import { prepareMoyoDbPage, uniqueDbName } from './support';
 
 interface SharedTestState {
@@ -10,12 +11,24 @@ interface SharedTestState {
     finishMigration?: () => void;
     opening?: Promise<DB>;
     migrations?: number;
+    cursor?: number;
 }
 
-async function prepareSharedPages(context: BrowserContext): Promise<[Page, Page]> {
+async function prepareSharedPages(context: BrowserContext, popup = false): Promise<[Page, Page]> {
     const first = await context.newPage();
-    const second = await context.newPage();
-    await Promise.all([prepareMoyoDbPage(first), prepareMoyoDbPage(second)]);
+    let second: Page;
+    if (popup) {
+        await prepareMoyoDbPage(first);
+        const opening = context.waitForEvent('page');
+        await first.evaluate(() => {
+            window.open(location.href);
+        });
+        second = await opening;
+        await prepareMoyoDbPage(second);
+    } else {
+        second = await context.newPage();
+        await Promise.all([prepareMoyoDbPage(first), prepareMoyoDbPage(second)]);
+    }
     test.skip(!(await first.evaluate(() => typeof SharedWorker === 'function')), 'SharedWorker is unavailable');
     return [first, second];
 }
@@ -25,6 +38,129 @@ async function openShared(page: Page, name: string): Promise<void> {
         const state = window as unknown as SharedTestState;
         state.db = await window.moyodb.openDB(dbName, { workerMode: 'shared', requestPersistence: false });
     }, name);
+}
+
+test('shared primary cursors map explicit transactions and remain isolated across clients', async ({ context }) => {
+    const [first, second] = await prepareSharedPages(context);
+    const name = uniqueDbName('shared-cursor-tx');
+    await openShared(first, name);
+    await first.evaluate(async () => {
+        const state = window as unknown as SharedTestState;
+        await state.db.createStore('kv');
+        const tx = await state.db.begin('readwrite');
+        await tx.putMany(
+            'kv',
+            ['a', 'b', 'c'].map((key) => [window.moyodb.utf8Encode(key), window.moyodb.utf8Encode(key)])
+        );
+        await tx.commit();
+    });
+    await openShared(second, name);
+    const rows = await Promise.all(
+        [first, second].map((page, index) =>
+            page.evaluate(async (writer) => {
+                const state = window as unknown as SharedTestState;
+                state.tx = await state.db.begin(writer ? 'readwrite' : 'readonly');
+                if (writer)
+                    await state.tx.put('kv', window.moyodb.utf8Encode('a'), window.moyodb.utf8Encode('changed'));
+                const page = await state.tx.scanPage('kv', {}, { maxRows: 1 });
+                state.cursor = page.cursor;
+                return window.moyodb.utf8Decode(page.rows[0].value);
+            }, index === 0)
+        )
+    );
+    expect(rows).toEqual(['changed', 'a']);
+    await first.evaluate(() => (window as unknown as SharedTestState).db.close());
+    expect(
+        await second.evaluate(async () => {
+            const state = window as unknown as SharedTestState;
+            const page = await state.tx!.scanPage('kv', {}, { cursor: state.cursor, maxRows: 1 });
+            await state.tx!.closeScanCursor(page.cursor!);
+            await state.tx!.rollback();
+            return { key: window.moyodb.utf8Decode(page.rows[0].key), active: (await state.db.stats()).active_txns };
+        })
+    ).toEqual({ key: 'b', active: 0 });
+    await second.evaluate(() => (window as unknown as SharedTestState).db.destroy());
+});
+
+for (const disconnect of ['navigation', 'window.close'] as const) {
+    test(`shared transport rejects a foreign cursor and releases an autonomous cursor on ${disconnect}`, async ({
+        context
+    }) => {
+        const [first, second] = await prepareSharedPages(context, disconnect === 'window.close');
+        const name = uniqueDbName('shared-cursor-owner');
+        await openShared(first, name);
+        await first.evaluate(async () => {
+            const state = window as unknown as SharedTestState;
+            await state.db.createStore('kv');
+            const tx = await state.db.begin('readwrite');
+            await tx.putMany(
+                'kv',
+                ['a', 'b', 'c'].map((key) => [window.moyodb.utf8Encode(key), window.moyodb.utf8Encode(key)])
+            );
+            await tx.commit();
+            const page = await state.db.scanPage('kv', {}, { maxRows: 1 });
+            state.cursor = page.cursor;
+        });
+        const foreignCursor = await first.evaluate(() => (window as unknown as SharedTestState).cursor!);
+        await openShared(second, name);
+        const rejected = await second.evaluate(
+            async ({ dbName, cursorId }) => {
+                const modulePath = '/src/registry.ts';
+                const { acquireDbWorker, releaseDbWorker } = (await import(modulePath)) as typeof RegistryModule;
+                const entry = await acquireDbWorker(dbName, { workerMode: 'shared', requestPersistence: false });
+                try {
+                    const names = [];
+                    for (const run of [
+                        () => entry.proxy.scanPage({ store: 'kv', cursorId, maxRows: 1, maxBytes: 4096 }),
+                        () => entry.proxy.closeCursor(cursorId)
+                    ]) {
+                        try {
+                            await run();
+                            names.push('NO_ERROR');
+                        } catch (error) {
+                            names.push((error as Error).name);
+                        }
+                    }
+                    return names;
+                } finally {
+                    await releaseDbWorker(entry);
+                }
+            },
+            { dbName: name, cursorId: foreignCursor }
+        );
+        expect(rejected).toEqual(['TransactionClosedError', 'TransactionClosedError']);
+        expect(
+            await first.evaluate(async () => {
+                const state = window as unknown as SharedTestState;
+                const page = await state.db.scanPage('kv', {}, { cursor: state.cursor, maxRows: 1 });
+                await state.db.closeScanCursor(page.cursor!);
+                return window.moyodb.utf8Decode(page.rows[0].key);
+            })
+        ).toBe('b');
+        await second.evaluate(async () => {
+            const state = window as unknown as SharedTestState;
+            state.cursor = (await state.db.scanPage('kv', {}, { maxRows: 1 })).cursor;
+        });
+        expect(
+            await first.evaluate(async () => (await (window as unknown as SharedTestState).db.stats()).active_txns)
+        ).toBe(1);
+        if (disconnect === 'navigation') {
+            await second.goto('about:blank');
+        } else {
+            const closed = second.waitForEvent('close');
+            const closing = Promise.allSettled([second.evaluate(() => window.close())]);
+            await closed;
+            const [result] = await closing;
+            if (result.status === 'rejected') expect((result.reason as Error).message).toContain('has been closed');
+        }
+        await expect
+            .poll(() =>
+                first.evaluate(async () => (await (window as unknown as SharedTestState).db.stats()).active_txns)
+            )
+            .toBe(0);
+        await first.evaluate(() => (window as unknown as SharedTestState).db.destroy());
+        if (!second.isClosed()) await second.close();
+    });
 }
 
 test('shared owner delivers changes across pages and survives a client close', async ({ context }) => {

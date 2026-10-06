@@ -81,6 +81,32 @@ export function renderMarkdownReport(report: BenchReport): string {
     for (const result of report.results) {
         lines.push(renderResultRow(result));
     }
+    lines.push('');
+    lines.push('## Dataset policies and separate phases');
+    lines.push('');
+    lines.push(
+        'Run time measures the workload callback; setup, verification, metrics collection and subsequent cleanup are excluded. Named recovery/snapshot callbacks can include lifecycle operations. Commit time is the sum of explicit tx.commit calls only; autocommit internals and backend I/O counts are unavailable through public APIs. Close includes drain/checkpoint work performed by the ordinary close API. Codec and change feed policies apply to MoyoDB; IndexedDB stores the same input bytes unchanged and has no MoyoDB change feed.'
+    );
+    lines.push('');
+    lines.push(
+        '| Engine | Workload | Dataset | Moyo codec | Moyo feed | Commit p50 ms | Close p50 ms | Cleanup p50 ms | DB bytes p50 | Main bytes p50 | WAL bytes p50 |'
+    );
+    lines.push(
+        '| ------ | -------- | ------- | ---------- | --------- | ------------- | ------------ | -------------- | ------------ | -------------- | ------------- |'
+    );
+    for (const result of report.results) {
+        if (result.status !== 'ok') continue;
+        const samples = result.sampleMetrics ?? [];
+        const median = (field: keyof (typeof samples)[number]): string =>
+            formatMetric(
+                computeStats(
+                    samples.flatMap((sample) => (typeof sample[field] === 'number' ? [sample[field] as number] : []))
+                )?.p50
+            );
+        lines.push(
+            `| ${result.engine} | ${result.workloadName} | ${result.policy?.dataset.profile ?? 'unknown'} | ${String(result.policy?.compression ?? 'unknown')} | ${String(result.policy?.changeFeed.enabled ?? 'unknown')} | ${median('explicitCommitMs')} | ${median('closeMs')} | ${median('cleanupMs')} | ${median('databaseBytes')} | ${median('mainBytes')} | ${median('walBytes')} |`
+        );
+    }
     const parity = renderContentParity(report.results);
     if (parity.length > 0) {
         lines.push('');

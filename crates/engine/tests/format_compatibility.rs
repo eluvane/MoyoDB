@@ -1,13 +1,13 @@
 use moyodb_engine::checksum::checksum_with_zeroed_region;
-use moyodb_engine::layout::{decode_superblock_slot, encode_superblock_slot, PageKind, PAGE_SIZE};
+use moyodb_engine::layout::{decode_superblock_slot, PageKind, FORMAT_VERSION, PAGE_SIZE};
 use moyodb_engine::page::{
     decode_page, encode_internal_page, encode_leaf_page, encode_overflow_page,
 };
 use moyodb_engine::snapshot::decode_snapshot;
 use moyodb_engine::wal::{append_transaction, scan_wal, scan_wal_index};
 use moyodb_engine::{
-    ChangeFeedOptions, ChangeFeedPolicy, ChangeKind, Engine, EngineError, MemoryBackend,
-    MemoryBundle, OpenConfig, ScanRange, TxMode,
+    ChangeFeedPolicy, Engine, EngineError, MemoryBackend, MemoryBundle, OpenConfig, ScanRange,
+    TxMode,
 };
 
 const DB_NAME: &str = "compatibility-release-1.0.1";
@@ -31,6 +31,42 @@ fn fixture_bundle(recovery: bool) -> MemoryBundle {
         manifest: MemoryBackend::from_durable(manifest.to_vec()),
         main: MemoryBackend::from_durable(main.to_vec()),
         wal: MemoryBackend::from_durable(wal.to_vec()),
+    }
+}
+
+fn current_bundle(recovery: bool) -> MemoryBundle {
+    let bundle = MemoryBundle::new();
+    let mut engine = Engine::open(
+        DB_NAME,
+        bundle.files(),
+        OpenConfig {
+            checkpoint_wal_bytes: u64::MAX,
+            checkpoint_dirty_pages: usize::MAX,
+            ..OpenConfig::default()
+        },
+    )
+    .unwrap();
+    let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
+    engine
+        .set_change_feed_policy(
+            tx,
+            ChangeFeedPolicy {
+                enabled: true,
+                retain_txids: Some(64),
+            },
+        )
+        .unwrap();
+    engine.commit_tx(tx).unwrap();
+    engine.import_snapshot(SNAPSHOT_V3).unwrap();
+    if !recovery {
+        engine.checkpoint().unwrap();
+    }
+    let [manifest, main, wal] = durable_images(&bundle);
+    engine.abandon().unwrap();
+    MemoryBundle {
+        manifest: MemoryBackend::from_durable(manifest),
+        main: MemoryBackend::from_durable(main),
+        wal: MemoryBackend::from_durable(wal),
     }
 }
 
@@ -132,13 +168,19 @@ fn future_wal_record(payload_len: usize) -> Vec<u8> {
 }
 
 #[test]
-fn release_1_0_1_checkpoint_reads_catalog_pages_overflow_and_ttl() {
+fn release_1_0_1_checkpoint_is_rejected_without_changing_storage() {
     let bundle = fixture_bundle(false);
-    let before = durable_images(&bundle);
-    let mut engine = open(&bundle);
-    assert_release_contents(&mut engine);
-    assert_eq!(engine.stats().unwrap().last_committed_txid, 2);
-    assert_eq!(engine.export_snapshot().unwrap(), SNAPSHOT_V3);
+    assert_failed_open_preserves_files(&bundle, "unsupported format version 1");
+}
+
+#[test]
+fn release_1_0_1_recovery_storage_is_rejected_before_wal_replay() {
+    let bundle = fixture_bundle(true);
+    assert_failed_open_preserves_files(&bundle, "unsupported format version 1");
+}
+
+#[test]
+fn page_and_wal_encoders_preserve_release_1_0_1_vectors() {
     let kinds: Vec<PageKind> = CHECKPOINT_MAIN
         .as_chunks::<4096>()
         .0
@@ -148,40 +190,6 @@ fn release_1_0_1_checkpoint_reads_catalog_pages_overflow_and_ttl() {
     assert!(kinds.contains(&PageKind::Leaf));
     assert!(kinds.contains(&PageKind::Internal));
     assert!(kinds.contains(&PageKind::Overflow));
-    assert_eq!(durable_images(&bundle), before);
-}
-
-#[test]
-fn release_1_0_1_wal_recovers_commits_and_change_history() {
-    let bundle = fixture_bundle(true);
-    let mut engine = open(&bundle);
-    assert_release_contents(&mut engine);
-    assert_eq!(engine.export_snapshot().unwrap(), SNAPSHOT_V3);
-    let feed = engine
-        .changes_since(1, ChangeFeedOptions::default())
-        .unwrap();
-    assert_eq!(feed.latest_tx_id, 2);
-    assert_eq!(feed.changes.len(), 49);
-    assert!(feed.changes.iter().all(|change| change.tx_id == 2
-        && change.store == "docs"
-        && change.kind == ChangeKind::Put));
-    assert_eq!(bundle.wal.durable_snapshot().unwrap(), CHECKPOINT_WAL);
-    let images = durable_images(&bundle);
-    let reopened = MemoryBundle {
-        manifest: MemoryBackend::from_durable(images[0].clone()),
-        main: MemoryBackend::from_durable(images[1].clone()),
-        wal: MemoryBackend::from_durable(images[2].clone()),
-    };
-    assert_release_contents(&mut open(&reopened));
-    assert_eq!(durable_images(&reopened), images);
-}
-
-#[test]
-fn v1_encoders_preserve_release_1_0_1_manifest_page_and_wal_bytes() {
-    for (index, bytes) in CHECKPOINT_MANIFEST.as_chunks::<4096>().0.iter().enumerate() {
-        let state = decode_superblock_slot(index, bytes).unwrap().unwrap();
-        assert_eq!(encode_superblock_slot(&state).as_slice(), bytes);
-    }
     for bytes in CHECKPOINT_MAIN.as_chunks::<4096>().0 {
         let page = decode_page(bytes).unwrap();
         let header = page.header;
@@ -232,16 +240,18 @@ fn v1_encoders_preserve_release_1_0_1_manifest_page_and_wal_bytes() {
 }
 
 #[test]
-fn release_1_0_1_storage_accepts_new_commits_and_recovers_them() {
+fn current_storage_accepts_snapshot_contents_and_recovers_new_commits() {
     for recovery in [false, true] {
-        let bundle = fixture_bundle(recovery);
+        let bundle = current_bundle(recovery);
         let mut engine = open(&bundle);
+        assert_release_contents(&mut engine);
+        let previous_txid = engine.stats().unwrap().last_committed_txid;
         let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
         engine.put(tx, "docs", b"alpha", b"updated").unwrap();
         engine.put(tx, "legacy", b"next", b"raw-write").unwrap();
         engine.delete(tx, "docs", &[0, 0xff]).unwrap();
         engine.create_store(tx, "new-store").unwrap();
-        assert_eq!(engine.commit_tx(tx).unwrap(), 3);
+        assert_eq!(engine.commit_tx(tx).unwrap(), previous_txid + 1);
         let mut reopened = Engine::open(
             DB_NAME,
             bundle.crash_recovered_files(),
@@ -259,10 +269,13 @@ fn release_1_0_1_storage_accepts_new_commits_and_recovers_them() {
         );
         assert_eq!(reopened.get(tx, "docs", &[0, 0xff]).unwrap(), None);
         assert_eq!(reopened.schema_version(), 7);
-        assert_eq!(reopened.catalog()["legacy"].flags, 0);
+        assert_eq!(
+            reopened.catalog()["legacy"].flags,
+            moyodb_engine::value::STORE_FLAG_VALUE_REVISION
+        );
         reopened.rollback_tx(tx).unwrap();
         let snapshot = decode_snapshot(&reopened.export_snapshot().unwrap()).unwrap();
-        assert_eq!(snapshot.source_last_committed_txid, 3);
+        assert_eq!(snapshot.source_last_committed_txid, previous_txid + 1);
         assert!(snapshot
             .stores
             .iter()
@@ -314,36 +327,41 @@ fn release_1_0_1_snapshot_versions_import_and_remain_writable() {
 #[test]
 fn future_manifest_version_never_falls_back_to_an_older_slot() {
     for slot in 0..2 {
-        let mut bytes = CHECKPOINT_MANIFEST.to_vec();
+        let mut bundle = current_bundle(false);
+        let mut bytes = bundle.manifest.durable_snapshot().unwrap();
         let slot_bytes = &mut bytes[slot * 4096..(slot + 1) * 4096];
-        slot_bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+        slot_bytes[8..12].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
         rewrite_checksum(slot_bytes, 64);
-        let mut bundle = fixture_bundle(false);
         bundle.manifest = MemoryBackend::from_durable(bytes);
-        assert_failed_open_preserves_files(&bundle, "unsupported format version 2");
+        assert_failed_open_preserves_files(
+            &bundle,
+            &format!("unsupported format version {}", FORMAT_VERSION + 1),
+        );
     }
 }
 
 #[test]
 fn future_page_magic_fails_without_changing_storage() {
-    let superblock = decode_superblock_slot(1, &CHECKPOINT_MANIFEST[4096..])
+    let mut bundle = current_bundle(false);
+    let manifest = bundle.manifest.durable_snapshot().unwrap();
+    let superblock = decode_superblock_slot(1, &manifest[4096..])
         .unwrap()
         .unwrap();
-    let mut bytes = CHECKPOINT_MAIN.to_vec();
+    let mut bytes = bundle.main.durable_snapshot().unwrap();
     let start = (superblock.catalog_root_page_id as usize - 1) * PAGE_SIZE;
     let page = &mut bytes[start..start + PAGE_SIZE];
     page[..4].copy_from_slice(b"PAG2");
     rewrite_checksum(page, 4);
-    let mut bundle = fixture_bundle(false);
     bundle.main = MemoryBackend::from_durable(bytes);
     assert_failed_open_preserves_files(&bundle, "page magic mismatch");
 }
 
 #[test]
 fn future_snapshot_version_rejects_import_without_changing_state() {
-    let bundle = fixture_bundle(false);
+    let bundle = current_bundle(false);
     let mut engine = open(&bundle);
     let before = durable_images(&bundle);
+    let previous_txid = engine.stats().unwrap().last_committed_txid;
     let mut bytes = SNAPSHOT_V3.to_vec();
     bytes[8..12].copy_from_slice(&4u32.to_le_bytes());
     rewrite_checksum(&mut bytes, 24);
@@ -351,23 +369,23 @@ fn future_snapshot_version_rejects_import_without_changing_state() {
     assert_eq!(error.code(), "CorruptionError");
     assert!(error.to_string().contains("unsupported snapshot version 4"));
     assert_release_contents(&mut engine);
-    assert_eq!(engine.stats().unwrap().last_committed_txid, 2);
+    assert_eq!(engine.stats().unwrap().last_committed_txid, previous_txid);
     assert_eq!(durable_images(&bundle), before);
 }
 
 #[test]
 fn future_wal_version_rejects_recovery_before_publishing_any_commit() {
-    let first_commit_end = scan_wal_index(&MemoryBackend::from_durable(RECOVERY_WAL.to_vec()))
-        .unwrap()[0]
-        .end_offset as usize;
+    let current = current_bundle(true);
+    let current_wal = current.wal.durable_snapshot().unwrap();
+    let first_commit_end = scan_wal_index(&current.wal).unwrap()[0].end_offset as usize;
     for offset in [0, first_commit_end] {
-        let mut bytes = RECOVERY_WAL.to_vec();
+        let mut bytes = current_wal.clone();
         let payload_len =
             u32::from_le_bytes(bytes[offset + 8..offset + 12].try_into().unwrap()) as usize;
         let record = &mut bytes[offset..offset + 16 + payload_len];
         record[..4].copy_from_slice(b"WAL2");
         rewrite_checksum(record, 12);
-        let mut bundle = fixture_bundle(true);
+        let mut bundle = current_bundle(true);
         bundle.wal = MemoryBackend::from_durable(bytes);
         assert_failed_open_preserves_files(&bundle, "unsupported WAL format version 2");
     }
@@ -376,16 +394,16 @@ fn future_wal_version_rejects_recovery_before_publishing_any_commit() {
 #[test]
 fn future_wal_unknown_tags_and_large_records_are_version_errors() {
     for payload_len in [0, 140_000] {
-        let mut bytes = RECOVERY_WAL.to_vec();
+        let mut bundle = current_bundle(true);
+        let mut bytes = bundle.wal.durable_snapshot().unwrap();
         bytes.extend_from_slice(&future_wal_record(payload_len));
-        let mut bundle = fixture_bundle(true);
         bundle.wal = MemoryBackend::from_durable(bytes);
         assert_failed_open_preserves_files(&bundle, "unsupported WAL format version 2");
     }
 }
 
 #[test]
-fn damaged_future_or_random_wal_tails_keep_the_committed_v1_prefix() {
+fn damaged_future_or_random_wal_tails_keep_the_current_committed_prefix() {
     let future = future_wal_record(80);
     let mut bad_checksum = future.clone();
     *bad_checksum.last_mut().unwrap() ^= 0xff;
@@ -398,19 +416,22 @@ fn damaged_future_or_random_wal_tails_keep_the_committed_v1_prefix() {
         bad_checksum,
         random_magic,
     ] {
-        let mut bytes = RECOVERY_WAL.to_vec();
+        let mut bundle = current_bundle(true);
+        let expected = decode_snapshot(SNAPSHOT_V3).unwrap();
+        let mut bytes = bundle.wal.durable_snapshot().unwrap();
         bytes.extend_from_slice(&tail);
-        let mut bundle = fixture_bundle(true);
         bundle.wal = MemoryBackend::from_durable(bytes);
         let mut engine = open(&bundle);
         assert_release_contents(&mut engine);
-        assert_eq!(engine.export_snapshot().unwrap(), SNAPSHOT_V3);
+        let recovered = decode_snapshot(&engine.export_snapshot().unwrap()).unwrap();
+        assert_eq!(recovered.schema_version, expected.schema_version);
+        assert_eq!(recovered.stores, expected.stores);
     }
 }
 
 #[test]
-fn fixture_identity_is_preserved() {
-    let bundle = fixture_bundle(false);
+fn current_database_identity_is_preserved() {
+    let bundle = current_bundle(false);
     let before = durable_images(&bundle);
     assert!(matches!(
         Engine::open("wrong-name", bundle.files(), OpenConfig::default()),

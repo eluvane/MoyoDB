@@ -129,3 +129,5 @@ Lean checks follow the project-local best-practices baseline supplied with this 
 `npm run lint:lean` runs the source scan, `lake lint --lint-all`, and `leanchecker`. The build, B-tree page gate, and artifact diff run in the Lean CI job.
 
 These gates establish that the Lean package builds without holes or custom axioms. They do not widen what its theorems cover: the package is an executable specification of an abstract model (association-list store, record-list WAL, write-batch transactions), and its traces are conformance scenarios for the Rust engine. Durability of the real engine is exercised by the crash-matrix and fault-injection tests, not by Lean.
+
+The physical page checker certifies inline B-tree contents and routing. Format 2 `External` cells receive structural descriptor, logical-length, and extent-address checks. Kernel-checked examples cover valid descriptors and malformed boundaries. `PAY2` extent bodies are not B-tree pages and are not supplied to this checker; it rejects external content certification. Body integrity, compression, storage flush ordering, and recovery remain Rust test obligations.
