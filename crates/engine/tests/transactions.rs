@@ -1,5 +1,6 @@
 mod common;
 
+use moyodb_engine::btree::KvPair;
 use moyodb_engine::engine::{Failpoint, ScanRange, TxMode};
 use moyodb_engine::{BatchOp, EngineError};
 use std::thread::sleep;
@@ -657,11 +658,84 @@ fn put_many_with_shared_ttl_expires_as_one_batch() {
 }
 
 #[test]
+fn sdk_internal_index_stores_survive_reopen_without_becoming_public() {
+    let (bundle, mut engine) = common::open_memory_engine("txn-sdk-index-stores");
+    let internal_stores = ["__browserdb:indexes", "__browserdb:index:users:byEmail"];
+    let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
+    engine.create_store(tx, "users").unwrap();
+    engine.put(tx, "users", b"u:1", b"Ada").unwrap();
+    for store in internal_stores {
+        engine.create_store(tx, store).unwrap();
+        engine.put(tx, store, b"email", b"u:1").unwrap();
+        assert_eq!(
+            engine.scan(tx, store, &ScanRange::default()).unwrap(),
+            vec![KvPair {
+                key: b"email".to_vec(),
+                value: b"u:1".to_vec(),
+            }]
+        );
+    }
+    engine.commit_tx(tx).unwrap();
+
+    let mut reopened = common::reopen_memory_engine("txn-sdk-index-stores", &bundle);
+    assert_eq!(reopened.store_names(), vec!["users"]);
+    assert_eq!(reopened.stats().unwrap().store_count, 1);
+    let feed = reopened.changes_since(0, Default::default()).unwrap();
+    assert_eq!(feed.changes.len(), 1);
+    assert_eq!(feed.changes[0].store, "users");
+    let ro = reopened.begin_tx(TxMode::Readonly).unwrap();
+    for store in internal_stores {
+        assert_eq!(
+            reopened.get(ro, store, b"email").unwrap(),
+            Some(b"u:1".to_vec())
+        );
+        assert!(reopened.has(ro, store, b"email").unwrap());
+        assert_eq!(
+            reopened.scan(ro, store, &ScanRange::default()).unwrap(),
+            vec![KvPair {
+                key: b"email".to_vec(),
+                value: b"u:1".to_vec(),
+            }]
+        );
+    }
+    reopened.rollback_tx(ro).unwrap();
+
+    let tx = reopened.begin_tx(TxMode::Readwrite).unwrap();
+    assert!(reopened.delete(tx, internal_stores[0], b"email").unwrap());
+    reopened.clear_store(tx, internal_stores[1]).unwrap();
+    for store in internal_stores {
+        reopened.drop_store(tx, store).unwrap();
+    }
+    reopened.commit_tx(tx).unwrap();
+    assert_eq!(
+        reopened
+            .changes_since(0, Default::default())
+            .unwrap()
+            .changes,
+        feed.changes
+    );
+}
+
+#[test]
 fn create_store_rejects_the_change_log_name() {
     let (_bundle, mut engine) = common::open_memory_engine("txn-reserved-changelog");
     let tx = engine.begin_tx(TxMode::Readwrite).unwrap();
     let err = engine.create_store(tx, "__browserdb:changes").unwrap_err();
     assert_eq!(err.code(), "ReservedStoreNameError");
+    assert_eq!(
+        engine
+            .get(tx, "__browserdb:changes", b"k")
+            .unwrap_err()
+            .code(),
+        "ReservedStoreNameError"
+    );
+    assert_eq!(
+        engine
+            .scan(tx, "__browserdb:changes", &ScanRange::default())
+            .unwrap_err()
+            .code(),
+        "ReservedStoreNameError"
+    );
     assert_eq!(
         engine
             .put(tx, "__browserdb:changes", b"k", b"v")

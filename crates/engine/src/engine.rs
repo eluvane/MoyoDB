@@ -80,7 +80,7 @@ pub type ScanRange = RangeSpec;
 const CHANGE_LOG_PRUNE_BATCH: usize = 1024;
 const EXTERNAL_PAYLOAD_THRESHOLD: usize = 32 * 1024;
 
-fn validate_store_name(name: &str) -> Result<()> {
+fn validate_engine_store_name(name: &str) -> Result<()> {
     validate_store_name_length(name)?;
     if name == PAYLOAD_REGISTRY_STORE_NAME || name == SYSTEM_CHANGELOG_STORE_NAME {
         return Err(EngineError::ReservedStoreName(name.into()));
@@ -852,10 +852,8 @@ impl<B: FileBackend> Engine<B> {
         name: &str,
         compression: StoreCompression,
     ) -> Result<()> {
-        validate_store_name(name)?;
-        // Other `__browserdb:` names are real stores. This one is the change
-        // log: an enabled feed appends to it on later commits.
-        if name.as_bytes().first() == Some(&0xff) || name == SYSTEM_CHANGELOG_STORE_NAME {
+        validate_engine_store_name(name)?;
+        if name.as_bytes().first() == Some(&0xff) {
             return Err(EngineError::ReservedStoreName(name.into()));
         }
         let mut tx = self.take_tx(tx_id)?;
@@ -880,7 +878,7 @@ impl<B: FileBackend> Engine<B> {
     }
 
     pub fn drop_store(&mut self, tx_id: u64, name: &str) -> Result<()> {
-        validate_store_name(name)?;
+        validate_engine_store_name(name)?;
         let mut tx = self.take_tx(tx_id)?;
         let result = (|| {
             let rw = tx.readwrite_mut()?;
@@ -908,7 +906,7 @@ impl<B: FileBackend> Engine<B> {
     }
 
     pub fn clear_store(&mut self, tx_id: u64, name: &str) -> Result<()> {
-        validate_store_name(name)?;
+        validate_engine_store_name(name)?;
         let mut tx = self.take_tx(tx_id)?;
         let result = (|| {
             let rw = tx.readwrite_mut()?;
@@ -926,7 +924,7 @@ impl<B: FileBackend> Engine<B> {
     }
 
     pub fn get(&mut self, tx_id: u64, store: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        validate_store_name(store)?;
+        validate_engine_store_name(store)?;
         validate_key(key)?;
         let now_ms = now_unix_ms()?;
         let mut tx = self.take_tx(tx_id)?;
@@ -957,7 +955,7 @@ impl<B: FileBackend> Engine<B> {
 
     /// Existence check that never reads a value beyond its TTL header.
     pub fn has(&mut self, tx_id: u64, store: &str, key: &[u8]) -> Result<bool> {
-        validate_store_name(store)?;
+        validate_engine_store_name(store)?;
         validate_key(key)?;
         let now_ms = now_unix_ms()?;
         let mut tx = self.take_tx(tx_id)?;
@@ -994,7 +992,7 @@ impl<B: FileBackend> Engine<B> {
         store: &str,
         keys: &[K],
     ) -> Result<Vec<bool>> {
-        validate_store_name(store)?;
+        validate_engine_store_name(store)?;
         for key in keys {
             validate_key(key.as_ref())?;
         }
@@ -1050,7 +1048,7 @@ impl<B: FileBackend> Engine<B> {
         store: &str,
         keys: &[K],
     ) -> Result<Vec<Option<Vec<u8>>>> {
-        validate_store_name(store)?;
+        validate_engine_store_name(store)?;
         for key in keys {
             validate_key(key.as_ref())?;
         }
@@ -1098,7 +1096,7 @@ impl<B: FileBackend> Engine<B> {
         store: &str,
         keys: &[K],
     ) -> Result<Vec<Option<usize>>> {
-        validate_store_name(store)?;
+        validate_engine_store_name(store)?;
         for key in keys {
             validate_key(key.as_ref())?;
         }
@@ -1150,7 +1148,7 @@ impl<B: FileBackend> Engine<B> {
         store: &str,
         keys: &[K],
     ) -> Result<Vec<Option<ValueState>>> {
-        validate_store_name(store)?;
+        validate_engine_store_name(store)?;
         for key in keys {
             validate_key(key.as_ref())?;
         }
@@ -1201,7 +1199,7 @@ impl<B: FileBackend> Engine<B> {
         store: &str,
         keys: &[K],
     ) -> Result<Vec<u8>> {
-        validate_store_name(store)?;
+        validate_engine_store_name(store)?;
         for key in keys {
             validate_key(key.as_ref())?;
         }
@@ -1338,8 +1336,8 @@ impl<B: FileBackend> Engine<B> {
         expected_epoch: u64,
         expected_ordinal: u64,
     ) -> Result<()> {
-        validate_store_name(primary_store)?;
-        validate_store_name(index_store)?;
+        validate_engine_store_name(primary_store)?;
+        validate_engine_store_name(index_store)?;
         validate_key(primary_key)?;
         validate_key(index_key)?;
         validate_index_entry_binding(index_store, index_key, primary_key)?;
@@ -1399,7 +1397,7 @@ impl<B: FileBackend> Engine<B> {
         value: &[u8],
         ttl_ms: Option<u64>,
     ) -> Result<bool> {
-        validate_store_name(store)?;
+        validate_engine_store_name(store)?;
         validate_key(key)?;
         validate_store_value_max_size(value)?;
         let operation_now_ms = now_unix_ms()?;
@@ -1439,7 +1437,7 @@ impl<B: FileBackend> Engine<B> {
         entries: &[(K, V)],
         ttl_ms: Option<u64>,
     ) -> BatchExecutionReport<bool> {
-        if let Err(error) = validate_user_store_name(store) {
+        if let Err(error) = validate_engine_store_name(store) {
             return BatchExecutionReport::failure(Vec::new(), error);
         }
         let operation_now_ms = match now_unix_ms() {
@@ -1516,7 +1514,7 @@ impl<B: FileBackend> Engine<B> {
         for ((key, value), row_ops) in entries.iter().zip(index_ops) {
             let (key, value) = (key.as_ref(), value.as_ref());
             let result = (|| {
-                validate_store_name(store)?;
+                validate_engine_store_name(store)?;
                 validate_key(key)?;
                 validate_store_value_max_size(value)?;
                 let now_ms = now_unix_ms()?;
@@ -1550,7 +1548,7 @@ impl<B: FileBackend> Engine<B> {
                             (*store, *key)
                         }
                     };
-                    validate_store_name(index_store)?;
+                    validate_engine_store_name(index_store)?;
                     validate_key(index_key)?;
                     let now_ms = now_unix_ms()?;
                     match op {
@@ -1632,7 +1630,7 @@ impl<B: FileBackend> Engine<B> {
     }
 
     pub fn delete(&mut self, tx_id: u64, store: &str, key: &[u8]) -> Result<bool> {
-        validate_store_name(store)?;
+        validate_engine_store_name(store)?;
         validate_key(key)?;
         let operation_now_ms = now_unix_ms()?;
         let mut tx = self.take_tx(tx_id)?;
@@ -1771,7 +1769,7 @@ impl<B: FileBackend> Engine<B> {
     }
 
     pub fn scan(&mut self, tx_id: u64, store: &str, range: &ScanRange) -> Result<Vec<KvPair>> {
-        validate_store_name(store)?;
+        validate_engine_store_name(store)?;
         range.validate()?;
         let now_ms = now_unix_ms()?;
         let mut tx = self.take_tx(tx_id)?;
@@ -1801,7 +1799,7 @@ impl<B: FileBackend> Engine<B> {
         max_bytes: usize,
         keys_only: bool,
     ) -> Result<PackedScanPage> {
-        validate_store_name(store)?;
+        validate_engine_store_name(store)?;
         range.validate()?;
         if max_rows == 0 {
             return Err(EngineError::InvalidRange(
@@ -2182,7 +2180,7 @@ impl<B: FileBackend> Engine<B> {
         }
         let mut skipped_stores = std::collections::BTreeSet::new();
         for name in skip_stores {
-            validate_store_name(name)?;
+            validate_engine_store_name(name)?;
             if !is_internal_store_name(name) {
                 return Err(EngineError::InvalidRange(format!(
                     "only internal stores may be skipped during compaction: {name}"
@@ -2620,7 +2618,7 @@ impl<B: FileBackend> Engine<B> {
     /// outside this helper: `put_many` must reject overflow before taking the tx.
     #[inline]
     fn begin_visible_batch(&mut self, tx_id: u64, store: &str) -> Result<(u64, TransactionState)> {
-        validate_user_store_name(store)?;
+        validate_engine_store_name(store)?;
         let now_ms = now_unix_ms()?;
         let tx = self.take_visible_readwrite_tx(tx_id, store)?;
         Ok((now_ms, tx))

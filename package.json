@@ -1,6 +1,6 @@
 {
   "name": "moyodb-repo",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "private": true,
   "description": "Repository-level quality gates for the MoyoDB mixed TypeScript/Rust/Lean workspace.",
   "license": "SEE LICENSE IN LICENSE",
