@@ -1,10 +1,10 @@
 {
   "schemaVersion": 1,
   "project": "MoyoDB",
-  "generatedAt": "2026-09-24T10:00:17.476Z",
+  "generatedAt": "2026-10-07T01:17:04.007Z",
   "mode": "full",
   "runtime": {
-    "node": "v24.5.0",
+    "node": "v24.21.0",
     "platform": "win32",
     "arch": "x64"
   },
@@ -29,14 +29,20 @@
     }
   ],
   "commands": [
-    "cargo bench --workspace",
+    "cargo bench --workspace --offline --locked (interrupted during the final BTree case)",
+    "cargo bench --bench btree --offline --locked -- btree_10m/btree_point_get_10m_random_hot",
+    "cargo bench --bench commit --offline --locked -- '^(commit_hot_|catalog_scaling/.*/(1|128)$)'",
+    "cargo bench --bench commit --offline --locked -- 'catalog_scaling/.*/1024$'",
+    "cargo bench --bench commit --offline --locked -- 'catalog_scaling/.*/8192$'",
+    "cargo bench --bench recovery --bench wal --offline --locked",
     "npm run bench:browser --workspace @moyodb/sdk",
     "npm run bench:report --workspace @moyodb/sdk"
   ],
   "notes": [
     "Native Rust Criterion timings and browser SDK/OPFS timings measure different layers and must not be compared as equivalent paths.",
     "Browser rows are normalized from packages/sdk/bench/results raw JSON; skipped rows are omitted from regression comparison metrics.",
-    "The Rust step is a benchmark compile gate by default; pass --run-rust when a local machine is intended to execute Criterion timings."
+    "The Rust step is a benchmark compile gate by default; pass --run-rust when a local machine is intended to execute Criterion timings.",
+    "All three commit benchmark commands were repeated after the store-name fix; unaffected BTree, WAL and recovery measurements were retained."
   ],
   "suites": [
     {
@@ -47,507 +53,1342 @@
           "id": "moyodb:noop_js_loop_1m",
           "label": "moyodb / noop_js_loop_1m",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 1000000,
+            "keySize": 0,
+            "valueSize": 0,
+            "batchSize": 0,
+            "transactionBoundaries": "pure JavaScript loop; no storage",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 320.5128204056664,
-            "avgLatencyMs": 3.1200000010430813,
-            "p50LatencyMs": 3.100000001490116,
-            "p95LatencyMs": 3.300000000745058,
-            "p99LatencyMs": 3.300000000745058
+            "opsPerSec": 314.4654088345025,
+            "avgLatencyMs": 3.1799999997019768,
+            "p50LatencyMs": 3.199999999254942,
+            "p95LatencyMs": 3.299999998882413,
+            "p99LatencyMs": 3.299999998882413
           }
         },
         {
           "id": "moyodb:noop_worker_roundtrip_10k",
           "label": "moyodb / noop_worker_roundtrip_10k",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 10000,
+            "keySize": 0,
+            "valueSize": 0,
+            "batchSize": 1,
+            "transactionBoundaries": "10,000 sequential postMessage echo roundtrips",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 5.467468562055768,
-            "avgLatencyMs": 182.9,
-            "p50LatencyMs": 181.19999999925494,
-            "p95LatencyMs": 193.40000000223517,
-            "p99LatencyMs": 193.40000000223517
+            "opsPerSec": 5.78368999421631,
+            "avgLatencyMs": 172.9,
+            "p50LatencyMs": 172,
+            "p95LatencyMs": 178.90000000037253,
+            "p99LatencyMs": 178.90000000037253
           }
         },
         {
           "id": "moyodb:worker_roundtrip_noop",
           "label": "moyodb / worker_roundtrip_noop",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 10000,
+            "keySize": 0,
+            "valueSize": 0,
+            "batchSize": 1,
+            "transactionBoundaries": "10,000 sequential Worker request envelopes with an empty payload",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 5.527304886128414,
-            "avgLatencyMs": 180.92000000029802,
-            "p50LatencyMs": 181.10000000149012,
-            "p95LatencyMs": 184.5,
-            "p99LatencyMs": 184.5
+            "opsPerSec": 5.326515393612577,
+            "avgLatencyMs": 187.74000000059604,
+            "p50LatencyMs": 187.59999999962747,
+            "p95LatencyMs": 189.5,
+            "p99LatencyMs": 189.5
           }
         },
         {
           "id": "moyodb:worker_roundtrip_small_payload",
           "label": "moyodb / worker_roundtrip_small_payload",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 10000,
+            "keySize": 0,
+            "valueSize": 32,
+            "batchSize": 1,
+            "transactionBoundaries": "10,000 sequential Worker roundtrips with a 32-byte Uint8Array payload",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 4.258218361426767,
-            "avgLatencyMs": 234.84000000059604,
-            "p50LatencyMs": 235.80000000074506,
-            "p95LatencyMs": 238.80000000074506,
-            "p99LatencyMs": 238.80000000074506
+            "opsPerSec": 4.5595476928626715,
+            "avgLatencyMs": 219.32000000029802,
+            "p50LatencyMs": 219.90000000037253,
+            "p95LatencyMs": 222.30000000074506,
+            "p99LatencyMs": 222.30000000074506
           }
         },
         {
           "id": "moyodb:worker_roundtrip_256b_payload",
           "label": "moyodb / worker_roundtrip_256b_payload",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 10000,
+            "keySize": 0,
+            "valueSize": 256,
+            "batchSize": 1,
+            "transactionBoundaries": "10,000 sequential Worker roundtrips with a 256-byte Uint8Array payload",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 4.114549045427144,
-            "avgLatencyMs": 243.03999999985098,
-            "p50LatencyMs": 236.89999999850988,
-            "p95LatencyMs": 261.0999999977648,
-            "p99LatencyMs": 261.0999999977648
+            "opsPerSec": 4.6133973057807305,
+            "avgLatencyMs": 216.75999999977648,
+            "p50LatencyMs": 214.40000000037253,
+            "p95LatencyMs": 226.2999999988824,
+            "p99LatencyMs": 226.2999999988824
           }
         },
         {
           "id": "moyodb:worker_roundtrip_64kb_payload",
           "label": "moyodb / worker_roundtrip_64kb_payload",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 100,
+            "keySize": 0,
+            "valueSize": 65536,
+            "batchSize": 1,
+            "transactionBoundaries": "100 sequential Worker roundtrips with a 64 KiB Uint8Array payload using structured clone",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 56.75368898882441,
-            "avgLatencyMs": 17.620000000298024,
-            "p50LatencyMs": 18.900000002235174,
-            "p95LatencyMs": 20.199999999254942,
-            "p99LatencyMs": 20.199999999254942
+            "opsPerSec": 70.22471910369558,
+            "avgLatencyMs": 14.23999999947846,
+            "p50LatencyMs": 13.099999999627471,
+            "p95LatencyMs": 17.299999998882413,
+            "p99LatencyMs": 17.299999998882413
           }
         },
         {
           "id": "moyodb:worker_binary_transfer_64kb",
           "label": "moyodb / worker_binary_transfer_64kb",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 100,
+            "keySize": 0,
+            "valueSize": 65536,
+            "batchSize": 1,
+            "transactionBoundaries": "100 sequential Worker roundtrips with a 64 KiB Uint8Array payload transferred both directions",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 164.47368421858832,
-            "avgLatencyMs": 6.079999999701977,
-            "p50LatencyMs": 5,
-            "p95LatencyMs": 10.300000000745058,
-            "p99LatencyMs": 10.300000000745058
+            "opsPerSec": 207.46887968729166,
+            "avgLatencyMs": 4.819999999552965,
+            "p50LatencyMs": 4.700000001117587,
+            "p95LatencyMs": 5.399999998509884,
+            "p99LatencyMs": 5.399999998509884
           }
         },
         {
           "id": "moyodb:noop_wasm_call_100k",
           "label": "moyodb / noop_wasm_call_100k",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 100000,
+            "keySize": 0,
+            "valueSize": 0,
+            "batchSize": 1,
+            "transactionBoundaries": "100,000 get_schema_version calls inside a worker-held WASM engine",
+            "warmupCount": 0,
+            "sampleCount": 3
+          },
           "metrics": {
-            "opsPerSec": 162.1621621948163,
-            "avgLatencyMs": 6.166666665424903,
-            "p50LatencyMs": 5.899999998509884,
-            "p95LatencyMs": 7.699999999254942,
-            "p99LatencyMs": 7.699999999254942
+            "opsPerSec": 200.0000000248353,
+            "avgLatencyMs": 4.999999999379118,
+            "p50LatencyMs": 5.099999999627471,
+            "p95LatencyMs": 5.199999999254942,
+            "p99LatencyMs": 5.199999999254942
           }
         },
         {
           "id": "moyodb:encode_decode_10k_256b",
           "label": "moyodb / encode_decode_10k_256b",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 10000,
+            "keySize": 16,
+            "valueSize": 256,
+            "batchSize": 1000,
+            "transactionBoundaries": "generate 10,000 deterministic 16-byte keys and 256-byte values",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 65.18904824052893,
-            "avgLatencyMs": 15.339999999850988,
-            "p50LatencyMs": 14.300000000745058,
-            "p95LatencyMs": 18.900000002235174,
-            "p99LatencyMs": 18.900000002235174
+            "opsPerSec": 73.96449704386573,
+            "avgLatencyMs": 13.519999999552965,
+            "p50LatencyMs": 12.5,
+            "p95LatencyMs": 16.699999999254942,
+            "p99LatencyMs": 16.699999999254942
           }
         },
         {
           "id": "moyodb:opfs_raw_write_100mb",
           "label": "moyodb / opfs_raw_write_100mb",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 104857600,
+            "keySize": 0,
+            "valueSize": 1048576,
+            "batchSize": 1048576,
+            "transactionBoundaries": "write 100 MiB through one worker-held SyncAccessHandle, one flush at end",
+            "warmupCount": 0,
+            "sampleCount": 3
+          },
           "metrics": {
-            "opsPerSec": 2.9714738510366896,
-            "avgLatencyMs": 336.53333333258826,
-            "p50LatencyMs": 336.3999999985099,
-            "p95LatencyMs": 337.69999999925494,
-            "p99LatencyMs": 337.69999999925494
+            "opsPerSec": 3.315283456727362,
+            "avgLatencyMs": 301.6333333340784,
+            "p50LatencyMs": 300.6000000014901,
+            "p95LatencyMs": 304.40000000037253,
+            "p99LatencyMs": 304.40000000037253
           }
         },
         {
           "id": "moyodb:opfs_raw_read_random_10k",
           "label": "moyodb / opfs_raw_read_random_10k",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 10000,
+            "keySize": 0,
+            "valueSize": 4096,
+            "batchSize": 4096,
+            "transactionBoundaries": "setup writes 100 MiB; measurement performs 10,000 random 4 KiB SyncAccessHandle reads",
+            "warmupCount": 0,
+            "sampleCount": 3
+          },
           "metrics": {
-            "opsPerSec": 0.8616232982938015,
-            "avgLatencyMs": 1160.6000000002484,
-            "p50LatencyMs": 1181,
-            "p95LatencyMs": 1219.800000000745,
-            "p99LatencyMs": 1219.800000000745
+            "opsPerSec": 1.0270455323512793,
+            "avgLatencyMs": 973.6666666672876,
+            "p50LatencyMs": 968.5,
+            "p95LatencyMs": 1001.4000000003725,
+            "p99LatencyMs": 1001.4000000003725
           }
         },
         {
           "id": "moyodb:sdk_put_1k_single_calls",
           "label": "moyodb / sdk_put_1k_single_calls",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 1000,
+            "keySize": 16,
+            "valueSize": 256,
+            "batchSize": 1,
+            "transactionBoundaries": "1,000 db.put calls; each call opens/scopes/commits one SDK transaction",
+            "warmupCount": 0,
+            "sampleCount": 1
+          },
           "metrics": {
-            "opsPerSec": 1.529051987767584,
-            "avgLatencyMs": 654,
-            "p50LatencyMs": 654,
-            "p95LatencyMs": 654,
-            "p99LatencyMs": 654
+            "opsPerSec": 3.248862897997501,
+            "avgLatencyMs": 307.7999999988824,
+            "p50LatencyMs": 307.7999999988824,
+            "p95LatencyMs": 307.7999999988824,
+            "p99LatencyMs": 307.7999999988824
           }
         },
         {
           "id": "moyodb:sdk_bulk_put_10k",
           "label": "moyodb / sdk_bulk_put_10k",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 10000,
+            "keySize": 16,
+            "valueSize": 256,
+            "batchSize": 10000,
+            "transactionBoundaries": "one SDK transaction, one tx.putMany call with 10,000 entries, one commit",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 14.096419509326163,
-            "avgLatencyMs": 70.94000000059604,
-            "p50LatencyMs": 68.10000000149012,
-            "p95LatencyMs": 78.40000000223517,
-            "p99LatencyMs": 78.40000000223517
+            "opsPerSec": 24.92522432706523,
+            "avgLatencyMs": 40.1199999999255,
+            "p50LatencyMs": 40.09999999962747,
+            "p95LatencyMs": 44.29999999888241,
+            "p99LatencyMs": 44.29999999888241
           }
         },
         {
           "id": "moyodb:engine_stage_put_10k_rollback",
           "label": "moyodb / engine_stage_put_10k_rollback",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 10000,
+            "keySize": 16,
+            "valueSize": 256,
+            "batchSize": 10000,
+            "transactionBoundaries": "one worker-local WASM put_many call with 10,000 entries followed by rollback; no commit flush",
+            "warmupCount": 0,
+            "sampleCount": 3
+          },
           "metrics": {
-            "opsPerSec": 101.69491526707942,
-            "avgLatencyMs": 9.83333333209157,
-            "p50LatencyMs": 10,
-            "p95LatencyMs": 10.199999999254942,
-            "p99LatencyMs": 10.199999999254942
+            "opsPerSec": 76.92307691572921,
+            "avgLatencyMs": 13.000000001241764,
+            "p50LatencyMs": 12.200000001117587,
+            "p95LatencyMs": 16.200000001117587,
+            "p99LatencyMs": 16.200000001117587
           }
         },
         {
           "id": "moyodb:engine_bulk_put_10k",
           "label": "moyodb / engine_bulk_put_10k",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 10000,
+            "keySize": 16,
+            "valueSize": 256,
+            "batchSize": 10000,
+            "transactionBoundaries": "one worker-local WASM engine transaction, one put_many call with 10,000 entries, one commit",
+            "warmupCount": 0,
+            "sampleCount": 3
+          },
           "metrics": {
-            "opsPerSec": 16.602102933448904,
-            "avgLatencyMs": 60.23333333184322,
-            "p50LatencyMs": 59.899999998509884,
-            "p95LatencyMs": 60.899999998509884,
-            "p99LatencyMs": 60.899999998509884
+            "opsPerSec": 29.469548133918806,
+            "avgLatencyMs": 33.93333333296081,
+            "p50LatencyMs": 32.09999999962747,
+            "p95LatencyMs": 39.09999999962747,
+            "p99LatencyMs": 39.09999999962747
           }
         },
         {
           "id": "indexeddb:indexeddb_bulk_put_10k",
           "label": "indexeddb / indexeddb_bulk_put_10k",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 10000,
+            "keySize": 16,
+            "valueSize": 256,
+            "batchSize": 10000,
+            "transactionBoundaries": "one IndexedDB readwrite transaction with 10,000 puts",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 6.2956434147924245,
-            "avgLatencyMs": 158.83999999910594,
-            "p50LatencyMs": 158.80000000074506,
-            "p95LatencyMs": 161.39999999850988,
-            "p99LatencyMs": 161.39999999850988
+            "opsPerSec": 6.264094211968177,
+            "avgLatencyMs": 159.64000000022352,
+            "p50LatencyMs": 158.30000000074506,
+            "p95LatencyMs": 163.40000000037253,
+            "p99LatencyMs": 163.40000000037253
           }
         },
         {
           "id": "moyodb:open_empty_db",
           "label": "moyodb / open_empty_db",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 1,
+            "keySize": 0,
+            "valueSize": 0,
+            "batchSize": 1,
+            "transactionBoundaries": "database deletion/setup is outside measurement; timed region opens an empty DB and creates no store",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 30.450669914876293,
-            "avgLatencyMs": 32.83999999985099,
-            "p50LatencyMs": 32.5,
-            "p95LatencyMs": 36.099999997764826,
-            "p99LatencyMs": 36.099999997764826
+            "opsPerSec": 33.44481605309501,
+            "avgLatencyMs": 29.90000000037253,
+            "p50LatencyMs": 29.800000000745058,
+            "p95LatencyMs": 30.799999998882413,
+            "p99LatencyMs": 30.799999998882413
           }
         },
         {
           "id": "indexeddb:open_empty_db",
           "label": "indexeddb / open_empty_db",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 1,
+            "keySize": 0,
+            "valueSize": 0,
+            "batchSize": 1,
+            "transactionBoundaries": "database deletion/setup is outside measurement; timed region opens an empty DB and creates no store",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 1315.789474716147,
-            "avgLatencyMs": 0.7599999994039536,
-            "p50LatencyMs": 0.6999999992549419,
-            "p95LatencyMs": 1,
-            "p99LatencyMs": 1
+            "opsPerSec": 1351.3513516234689,
+            "avgLatencyMs": 0.7399999998509884,
+            "p50LatencyMs": 0.599999999627471,
+            "p95LatencyMs": 1.300000000745058,
+            "p99LatencyMs": 1.300000000745058
           }
         },
         {
           "id": "moyodb:bulk_insert_10k",
           "label": "moyodb / bulk_insert_10k",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 10000,
+            "keySize": 16,
+            "valueSize": 256,
+            "batchSize": 1000,
+            "transactionBoundaries": "one readwrite transaction per batch of 1,000 puts",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 5.108817819521551,
-            "avgLatencyMs": 195.74000000134112,
-            "p50LatencyMs": 194.90000000223517,
-            "p95LatencyMs": 199.60000000149012,
-            "p99LatencyMs": 199.60000000149012
+            "opsPerSec": 22.192632046087287,
+            "avgLatencyMs": 45.06000000014901,
+            "p50LatencyMs": 44.5,
+            "p95LatencyMs": 52.5,
+            "p99LatencyMs": 52.5
           }
         },
         {
           "id": "indexeddb:bulk_insert_10k",
           "label": "indexeddb / bulk_insert_10k",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 10000,
+            "keySize": 16,
+            "valueSize": 256,
+            "batchSize": 1000,
+            "transactionBoundaries": "one readwrite transaction per batch of 1,000 puts",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 6.562541015894185,
-            "avgLatencyMs": 152.37999999970197,
-            "p50LatencyMs": 151.5,
-            "p95LatencyMs": 159.89999999850988,
-            "p99LatencyMs": 159.89999999850988
+            "opsPerSec": 6.49772579597141,
+            "avgLatencyMs": 153.9,
+            "p50LatencyMs": 153,
+            "p95LatencyMs": 160.09999999962747,
+            "p99LatencyMs": 160.09999999962747
           }
         },
         {
           "id": "moyodb:point_get_random_10k",
           "label": "moyodb / point_get_random_10k",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 10000,
+            "keySize": 16,
+            "valueSize": 256,
+            "batchSize": 1000,
+            "transactionBoundaries": "setup/preload outside measurement; one readonly transaction; sequential: each of 10,000 gets is issued only after the previous one resolved",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 1.1537485289718157,
-            "avgLatencyMs": 866.739999999106,
-            "p50LatencyMs": 855.2999999970198,
-            "p95LatencyMs": 908.5,
-            "p99LatencyMs": 908.5
+            "opsPerSec": 2.9802706085692727,
+            "avgLatencyMs": 335.54000000022353,
+            "p50LatencyMs": 336,
+            "p95LatencyMs": 353.69999999925494,
+            "p99LatencyMs": 353.69999999925494
           }
         },
         {
           "id": "indexeddb:point_get_random_10k",
           "label": "indexeddb / point_get_random_10k",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 10000,
+            "keySize": 16,
+            "valueSize": 256,
+            "batchSize": 1000,
+            "transactionBoundaries": "setup/preload outside measurement; one readonly transaction; sequential: each of 10,000 gets is issued only after the previous one resolved",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 2.224397188364903,
-            "avgLatencyMs": 449.55999999940394,
-            "p50LatencyMs": 451.19999999925494,
-            "p95LatencyMs": 466.5,
-            "p99LatencyMs": 466.5
+            "opsPerSec": 2.095557418271625,
+            "avgLatencyMs": 477.20000000037254,
+            "p50LatencyMs": 432,
+            "p95LatencyMs": 638.4000000003725,
+            "p99LatencyMs": 638.4000000003725
           }
         },
         {
           "id": "moyodb:point_get_random_10k_pipelined",
           "label": "moyodb / point_get_random_10k_pipelined",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 10000,
+            "keySize": 16,
+            "valueSize": 256,
+            "batchSize": 1000,
+            "transactionBoundaries": "setup/preload outside measurement; one readonly transaction; pipelined: all 10,000 single-key gets are issued before any result is awaited",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 1.5908873969889097,
-            "avgLatencyMs": 628.5800000004471,
-            "p50LatencyMs": 627.6000000014901,
-            "p95LatencyMs": 635.5,
-            "p99LatencyMs": 635.5
+            "opsPerSec": 14.624159110914862,
+            "avgLatencyMs": 68.37999999970198,
+            "p50LatencyMs": 63.69999999925494,
+            "p95LatencyMs": 78.90000000037253,
+            "p99LatencyMs": 78.90000000037253
           }
         },
         {
           "id": "indexeddb:point_get_random_10k_pipelined",
           "label": "indexeddb / point_get_random_10k_pipelined",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 10000,
+            "keySize": 16,
+            "valueSize": 256,
+            "batchSize": 1000,
+            "transactionBoundaries": "setup/preload outside measurement; one readonly transaction; pipelined: all 10,000 single-key gets are issued before any result is awaited",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 8.15793767337601,
-            "avgLatencyMs": 122.57999999970198,
-            "p50LatencyMs": 123.09999999776483,
-            "p95LatencyMs": 125.69999999925494,
-            "p99LatencyMs": 125.69999999925494
+            "opsPerSec": 7.347538574577517,
+            "avgLatencyMs": 136.1,
+            "p50LatencyMs": 137.5,
+            "p95LatencyMs": 139.59999999962747,
+            "p99LatencyMs": 139.59999999962747
           }
         },
         {
           "id": "moyodb:point_get_random_10k_bulk",
           "label": "moyodb / point_get_random_10k_bulk",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 10000,
+            "keySize": 16,
+            "valueSize": 256,
+            "batchSize": 1000,
+            "transactionBoundaries": "setup/preload outside measurement; measured region performs one getMany over 10,000 random keys",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 1.976284584986057,
-            "avgLatencyMs": 505.9999999985099,
-            "p50LatencyMs": 507.79999999701977,
-            "p95LatencyMs": 510.19999999925494,
-            "p99LatencyMs": 510.19999999925494
+            "opsPerSec": 91.07468124108765,
+            "avgLatencyMs": 10.979999999701977,
+            "p50LatencyMs": 7.199999999254942,
+            "p95LatencyMs": 18.09999999962747,
+            "p99LatencyMs": 18.09999999962747
           }
         },
         {
           "id": "moyodb:range_scan_100",
           "label": "moyodb / range_scan_100",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 10000,
+            "keySize": 16,
+            "valueSize": 256,
+            "batchSize": 1000,
+            "transactionBoundaries": "setup/preload outside measurement; measurement scans 100 contiguous keys",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 735.2941175664946,
-            "avgLatencyMs": 1.3600000001490116,
-            "p50LatencyMs": 1.300000000745058,
-            "p95LatencyMs": 1.5,
-            "p99LatencyMs": 1.5
+            "opsPerSec": 1063.8297869810804,
+            "avgLatencyMs": 0.9400000002235174,
+            "p50LatencyMs": 1,
+            "p95LatencyMs": 1.099999999627471,
+            "p99LatencyMs": 1.099999999627471
           }
         },
         {
           "id": "indexeddb:range_scan_100",
           "label": "indexeddb / range_scan_100",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 10000,
+            "keySize": 16,
+            "valueSize": 256,
+            "batchSize": 1000,
+            "transactionBoundaries": "setup/preload outside measurement; measurement scans 100 contiguous keys",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 1111.111111111111,
-            "avgLatencyMs": 0.9,
-            "p50LatencyMs": 1,
-            "p95LatencyMs": 1,
-            "p99LatencyMs": 1
+            "opsPerSec": 961.5384620206551,
+            "avgLatencyMs": 1.0399999994784594,
+            "p50LatencyMs": 0.7999999988824129,
+            "p95LatencyMs": 2.099999999627471,
+            "p99LatencyMs": 2.099999999627471
           }
         },
         {
           "id": "moyodb:reverse_scan_limit_1",
           "label": "moyodb / reverse_scan_limit_1",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 10000,
+            "keySize": 16,
+            "valueSize": 256,
+            "batchSize": 1000,
+            "transactionBoundaries": "setup/preload outside measurement; measurement reads the last key of the store with a reverse scan limited to one row",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 1666.6666645970608,
-            "avgLatencyMs": 0.6000000007450581,
-            "p50LatencyMs": 0.6000000014901161,
-            "p95LatencyMs": 0.6999999992549419,
-            "p99LatencyMs": 0.6999999992549419
+            "opsPerSec": 1724.1379308130029,
+            "avgLatencyMs": 0.5800000000745058,
+            "p50LatencyMs": 0.599999999627471,
+            "p95LatencyMs": 0.7000000011175871,
+            "p99LatencyMs": 0.7000000011175871
           }
         },
         {
           "id": "indexeddb:reverse_scan_limit_1",
           "label": "indexeddb / reverse_scan_limit_1",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 10000,
+            "keySize": 16,
+            "valueSize": 256,
+            "batchSize": 1000,
+            "transactionBoundaries": "setup/preload outside measurement; measurement reads the last key of the store with a reverse scan limited to one row",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 4166.666669253674,
-            "avgLatencyMs": 0.23999999985098838,
-            "p50LatencyMs": 0.19999999925494194,
-            "p95LatencyMs": 0.30000000074505806,
-            "p99LatencyMs": 0.30000000074505806
+            "opsPerSec": 3571.428565726597,
+            "avgLatencyMs": 0.2800000004470348,
+            "p50LatencyMs": 0.2999999988824129,
+            "p95LatencyMs": 0.40000000037252903,
+            "p99LatencyMs": 0.40000000037252903
           }
         },
         {
           "id": "moyodb:range_scan_1000",
           "label": "moyodb / range_scan_1000",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 10000,
+            "keySize": 16,
+            "valueSize": 256,
+            "batchSize": 1000,
+            "transactionBoundaries": "setup/preload outside measurement; measurement scans 1,000 contiguous keys from a 10k-row DB",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 160.77170415310323,
-            "avgLatencyMs": 6.220000001043081,
-            "p50LatencyMs": 6.100000001490116,
-            "p95LatencyMs": 6.800000000745058,
-            "p99LatencyMs": 6.800000000745058
+            "opsPerSec": 458.7155963145977,
+            "avgLatencyMs": 2.180000000074506,
+            "p50LatencyMs": 2.199999999254942,
+            "p95LatencyMs": 2.300000000745058,
+            "p99LatencyMs": 2.300000000745058
           }
         },
         {
           "id": "indexeddb:range_scan_1000",
           "label": "indexeddb / range_scan_1000",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 10000,
+            "keySize": 16,
+            "valueSize": 256,
+            "batchSize": 1000,
+            "transactionBoundaries": "setup/preload outside measurement; measurement scans 1,000 contiguous keys from a 10k-row DB",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 167.22408029672715,
-            "avgLatencyMs": 5.979999998956918,
-            "p50LatencyMs": 5.699999999254942,
-            "p95LatencyMs": 7,
-            "p99LatencyMs": 7
+            "opsPerSec": 184.50184503366765,
+            "avgLatencyMs": 5.4199999995529655,
+            "p50LatencyMs": 5.400000000372529,
+            "p95LatencyMs": 5.5,
+            "p99LatencyMs": 5.5
           }
         },
         {
           "id": "moyodb:range_scan_10000",
           "label": "moyodb / range_scan_10000",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 10000,
+            "keySize": 16,
+            "valueSize": 256,
+            "batchSize": 1000,
+            "transactionBoundaries": "setup/preload outside measurement; measurement scans 10,000 contiguous keys from a 10k-row DB",
+            "warmupCount": 1,
+            "sampleCount": 3
+          },
           "metrics": {
-            "opsPerSec": 19.157088122878797,
-            "avgLatencyMs": 52.19999999925494,
-            "p50LatencyMs": 52,
-            "p95LatencyMs": 52.80000000074506,
-            "p99LatencyMs": 52.80000000074506
+            "opsPerSec": 71.94244604123736,
+            "avgLatencyMs": 13.900000000372529,
+            "p50LatencyMs": 14,
+            "p95LatencyMs": 14.300000000745058,
+            "p99LatencyMs": 14.300000000745058
           }
         },
         {
           "id": "indexeddb:range_scan_10000",
           "label": "indexeddb / range_scan_10000",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 10000,
+            "keySize": 16,
+            "valueSize": 256,
+            "batchSize": 1000,
+            "transactionBoundaries": "setup/preload outside measurement; measurement scans 10,000 contiguous keys from a 10k-row DB",
+            "warmupCount": 1,
+            "sampleCount": 3
+          },
           "metrics": {
-            "opsPerSec": 23.67797947922369,
-            "avgLatencyMs": 42.23333333308498,
-            "p50LatencyMs": 42.19999999925494,
-            "p95LatencyMs": 43,
-            "p99LatencyMs": 43
+            "opsPerSec": 20.63273727669013,
+            "avgLatencyMs": 48.466666666169964,
+            "p50LatencyMs": 47.40000000037253,
+            "p95LatencyMs": 51.69999999925494,
+            "p99LatencyMs": 51.69999999925494
           }
         },
         {
           "id": "moyodb:small_tx_1000_commits",
           "label": "moyodb / small_tx_1000_commits",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 1000,
+            "keySize": 16,
+            "valueSize": 128,
+            "batchSize": 1,
+            "transactionBoundaries": "1,000 independent readwrite commits; keys/values and empty DB setup outside measurement",
+            "warmupCount": 0,
+            "sampleCount": 1
+          },
           "metrics": {
-            "opsPerSec": 2.0601565718899777,
-            "avgLatencyMs": 485.4000000022352,
-            "p50LatencyMs": 485.4000000022352,
-            "p95LatencyMs": 485.4000000022352,
-            "p99LatencyMs": 485.4000000022352
+            "opsPerSec": 2.3288309268726883,
+            "avgLatencyMs": 429.40000000037253,
+            "p50LatencyMs": 429.40000000037253,
+            "p95LatencyMs": 429.40000000037253,
+            "p99LatencyMs": 429.40000000037253
           }
         },
         {
           "id": "indexeddb:small_tx_1000_commits",
           "label": "indexeddb / small_tx_1000_commits",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 1000,
+            "keySize": 16,
+            "valueSize": 128,
+            "batchSize": 1,
+            "transactionBoundaries": "1,000 independent readwrite commits; keys/values and empty DB setup outside measurement",
+            "warmupCount": 0,
+            "sampleCount": 1
+          },
           "metrics": {
-            "opsPerSec": 8.467400507937194,
-            "avgLatencyMs": 118.10000000149012,
-            "p50LatencyMs": 118.10000000149012,
-            "p95LatencyMs": 118.10000000149012,
-            "p99LatencyMs": 118.10000000149012
+            "opsPerSec": 9.47867298578199,
+            "avgLatencyMs": 105.5,
+            "p50LatencyMs": 105.5,
+            "p95LatencyMs": 105.5,
+            "p99LatencyMs": 105.5
           }
         },
         {
           "id": "moyodb:large_value_64kb",
           "label": "moyodb / large_value_64kb",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 1000,
+            "keySize": 16,
+            "valueSize": 65536,
+            "batchSize": 100,
+            "transactionBoundaries": "one readwrite transaction per 100 large values; data/setup outside measurement",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 0.1001075154716225,
-            "avgLatencyMs": 9989.259999999404,
-            "p50LatencyMs": 10158.099999997765,
-            "p95LatencyMs": 10196.39999999851,
-            "p99LatencyMs": 10196.39999999851
+            "opsPerSec": 1.74617587483275,
+            "avgLatencyMs": 572.6800000004471,
+            "p50LatencyMs": 556,
+            "p95LatencyMs": 618.5,
+            "p99LatencyMs": 618.5
           }
         },
         {
           "id": "indexeddb:large_value_64kb",
           "label": "indexeddb / large_value_64kb",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 1000,
+            "keySize": 16,
+            "valueSize": 65536,
+            "batchSize": 100,
+            "transactionBoundaries": "one readwrite transaction per 100 large values; data/setup outside measurement",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 16.077170418006432,
-            "avgLatencyMs": 62.2,
-            "p50LatencyMs": 64,
-            "p95LatencyMs": 65.89999999850988,
-            "p99LatencyMs": 65.89999999850988
+            "opsPerSec": 14.48435689450699,
+            "avgLatencyMs": 69.04000000022351,
+            "p50LatencyMs": 71.20000000111759,
+            "p95LatencyMs": 72.89999999850988,
+            "p99LatencyMs": 72.89999999850988
           }
         },
         {
           "id": "moyodb:large_value_1mb",
           "label": "moyodb / large_value_1mb",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 64,
+            "keySize": 16,
+            "valueSize": 1048576,
+            "batchSize": 8,
+            "transactionBoundaries": "one readwrite transaction per 8 large values; data/setup outside measurement",
+            "warmupCount": 1,
+            "sampleCount": 3
+          },
           "metrics": {
-            "opsPerSec": 0.11755071333690181,
-            "avgLatencyMs": 8506.966666667411,
-            "p50LatencyMs": 8451.699999999255,
-            "p95LatencyMs": 9153,
-            "p99LatencyMs": 9153
+            "opsPerSec": 1.5204500532146035,
+            "avgLatencyMs": 657.7000000004967,
+            "p50LatencyMs": 644.2999999988824,
+            "p95LatencyMs": 740.6000000014901,
+            "p99LatencyMs": 740.6000000014901
           }
         },
         {
           "id": "indexeddb:large_value_1mb",
           "label": "indexeddb / large_value_1mb",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 64,
+            "keySize": 16,
+            "valueSize": 1048576,
+            "batchSize": 8,
+            "transactionBoundaries": "one readwrite transaction per 8 large values; data/setup outside measurement",
+            "warmupCount": 1,
+            "sampleCount": 3
+          },
           "metrics": {
-            "opsPerSec": 13.617793917569605,
-            "avgLatencyMs": 73.43333333233993,
-            "p50LatencyMs": 69.5,
-            "p95LatencyMs": 81.59999999776483,
-            "p99LatencyMs": 81.59999999776483
+            "opsPerSec": 13.667425968109338,
+            "avgLatencyMs": 73.16666666666667,
+            "p50LatencyMs": 69.80000000074506,
+            "p95LatencyMs": 81.09999999962747,
+            "p99LatencyMs": 81.09999999962747
           }
         },
         {
           "id": "moyodb:recovery_after_dirty_close",
           "label": "moyodb / recovery_after_dirty_close",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 10000,
+            "keySize": 16,
+            "valueSize": 256,
+            "batchSize": 1000,
+            "transactionBoundaries": "MoyoDB debug failpoint after WAL flush; IndexedDB baseline is marked not applicable",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 0.8828774742645863,
-            "avgLatencyMs": 1132.659999999404,
-            "p50LatencyMs": 1136.5,
-            "p95LatencyMs": 1141.6000000014901,
-            "p99LatencyMs": 1141.6000000014901
+            "opsPerSec": 31.969309463220192,
+            "avgLatencyMs": 31.279999999701978,
+            "p50LatencyMs": 30.700000001117587,
+            "p95LatencyMs": 33.19999999925494,
+            "p99LatencyMs": 33.19999999925494
           }
         },
         {
           "id": "moyodb:snapshot_export_import",
           "label": "moyodb / snapshot_export_import",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 10000,
+            "keySize": 16,
+            "valueSize": 256,
+            "batchSize": 1000,
+            "transactionBoundaries": "setup is outside measurement; measurement exports and imports a logical snapshot",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 4.114210483005788,
-            "avgLatencyMs": 243.06000000014902,
-            "p50LatencyMs": 241.5,
-            "p95LatencyMs": 255.39999999850988,
-            "p99LatencyMs": 255.39999999850988
+            "opsPerSec": 15.137753557337938,
+            "avgLatencyMs": 66.06000000014902,
+            "p50LatencyMs": 64.5,
+            "p95LatencyMs": 74.60000000149012,
+            "p99LatencyMs": 74.60000000149012
           }
         },
         {
           "id": "moyodb:worker_roundtrip_overhead",
           "label": "moyodb / worker_roundtrip_overhead",
           "source": "browser-bench-chromium-all-full.json",
+          "comparisonContext": {
+            "profile": "full",
+            "browserName": "HeadlessChrome",
+            "browserVersion": "153",
+            "persistentContext": false,
+            "indexedDbDurability": "strict",
+            "moyoDbDurability": "strict: WAL flushed before commit resolves; bounded checkpoints flush main file and manifest",
+            "sdkBuildMode": "development",
+            "wasmBuildMode": "release",
+            "backendPath": "OPFS SyncAccessHandle in a dedicated Worker",
+            "headless": "unknown",
+            "recordCount": 1000,
+            "keySize": 16,
+            "valueSize": 64,
+            "batchSize": 1,
+            "transactionBoundaries": "measurement calls stats() 1,000 times through the SDK worker boundary",
+            "warmupCount": 1,
+            "sampleCount": 5
+          },
           "metrics": {
-            "opsPerSec": 3.5481124042122203,
-            "avgLatencyMs": 281.83999999910594,
-            "p50LatencyMs": 282.5999999977648,
-            "p95LatencyMs": 295.80000000074506,
-            "p99LatencyMs": 295.80000000074506
+            "opsPerSec": 3.5569467169400655,
+            "avgLatencyMs": 281.139999999851,
+            "p50LatencyMs": 275.7999999988824,
+            "p95LatencyMs": 308.5,
+            "p99LatencyMs": 308.5
           }
         }
       ]
     }
-  ]
+  ],
+  "execution": {
+    "native": {
+      "status": "passed",
+      "caseCount": 27,
+      "rawDirectory": "raw/rust",
+      "rerunAfterFix": 18,
+      "reusedUnaffectedCases": 9
+    },
+    "browser": {
+      "status": "passed",
+      "profile": "full",
+      "workloadCount": 31,
+      "resultCount": 62,
+      "ok": 42,
+      "skipped": 20,
+      "error": 0,
+      "verifiedContentChecksums": 100,
+      "matchingContentParityWorkloads": 10
+    },
+    "verification": {
+      "rustTests": {
+        "passed": 257,
+        "ignored": 2
+      },
+      "rustDocTests": {
+        "passed": 1
+      },
+      "chromiumTests": {
+        "passed": 91,
+        "skipped": 2,
+        "failedCodecCountAssertionFixedAndRetested": true
+      },
+      "rustfmt": "passed",
+      "canonicalClippy": "failed: existing too_many_arguments in btree.rs and page.rs; undocumented_unsafe_blocks in change_feed.rs",
+      "targetedClippy": "passed for library, transactions test and WASM library with too_many_arguments allowed"
+    }
+  }
 }

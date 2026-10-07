@@ -1,4 +1,4 @@
-name: MoyoDB benchmarks
+name: Benchmarks
 
 on:
   workflow_dispatch:
@@ -19,7 +19,7 @@ env:
 
 jobs:
   benchmark:
-    name: MoyoDB benchmark baseline
+    name: Baseline
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     steps:

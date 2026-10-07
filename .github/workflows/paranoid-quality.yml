@@ -1,4 +1,4 @@
-name: MoyoDB paranoid quality
+name: Quality
 
 on:
   workflow_dispatch:
@@ -15,7 +15,7 @@ env:
 
 jobs:
   paranoid-linters:
-    name: MoyoDB paranoid quality and security
+    name: Full
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
