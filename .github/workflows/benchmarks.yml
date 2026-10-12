@@ -31,7 +31,7 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -45,7 +45,7 @@ jobs:
       - name: Run benchmarks and collect baseline
         run: npm run bench:collect -- --out-dir .benchmark/current
       - name: Publish baseline artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: benchmark-baseline
           path: .benchmark/current
@@ -70,7 +70,7 @@ jobs:
       - name: Download previous baseline artifact
         if: steps.previous-run.outputs.run-id != ''
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: benchmark-baseline
           path: .benchmark/previous
@@ -84,7 +84,7 @@ jobs:
             --current .benchmark/current/baseline.json \
             --out-dir .benchmark/comparison
       - name: Publish comparison artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: benchmark-comparison
           path: .benchmark/comparison
